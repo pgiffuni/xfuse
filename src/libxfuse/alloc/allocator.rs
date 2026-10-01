@@ -423,6 +423,14 @@ fn uuid_of(agf: &Agf) -> [u8; 16] {
 ///
 /// They come off the *end* of the run, so the list keeps the order the group
 /// would hand blocks out in.
+/// Say which part of a free a failure came from, since "NoSpace" alone does not.
+fn tag(e: FsError, step: &str) -> FsError {
+    match &e {
+        FsError::NoSpace => FsError::invalid(libc::ENOSPC, format!("{step}: no space")),
+        _ => e,
+    }
+}
+
 fn append_to_the_free_list(
     transaction: &mut Transaction<'_>,
     sb: &Sb,
@@ -449,7 +457,13 @@ fn append_to_the_free_list(
         agf.free_list_last(),
         agf.free_list_count(),
     );
-    let room = agfl.capacity().saturating_sub(window.count).min(run.len);
+    // How much room is left is **not** how many entries the array holds minus how
+    // many are live.  The window's own last decides: the next entry goes in the
+    // slot after it, and that slot has to exist.  Here the window is 1 to 127 in a
+    // 128 entry array -- slot 0 is null -- so the array's size says there are
+    // 128 and there is in fact room for 127, and believing the array made a free
+    // of perfectly good blocks fail with ENOSPC once the list was nearly full.
+    let room = agfl.room_below(&window).saturating_sub(1).min(run.len);
     if room == 0 {
         return Ok(0);
     }
@@ -521,7 +535,8 @@ pub fn free_in_group(
     // than into the trees, because that is what the list is for, and a block on
     // it is in neither of the two places the group's count comes from.  The rest
     // is ordinary free space and goes into the trees as usual.
-    let reserved = append_to_the_free_list(transaction, sb, agno, &mut agf, run)?;
+    let reserved = append_to_the_free_list(transaction, sb, agno, &mut agf, run)
+        .map_err(|e| tag(e, "appending to the free list"))?;
     let to_trees = run.len - reserved;
     let (by_block_root, by_size_root) = {
         let mut store = TransactionBlocks::new(transaction, sb, agno);
@@ -538,7 +553,8 @@ pub fn free_in_group(
                     start: run.start,
                     len:   to_trees,
                 },
-            )?
+            )
+            .map_err(|e| tag(e, "freeing into the trees"))?
         }
     };
 
@@ -1693,18 +1709,8 @@ mod t {
     /// a node.
     ///
     /// What is read out is which counters moved when that entry was consumed.
-    ///
-    /// **Not passing, and the reason is an unresolved boundary rather than
-    /// anything in the filling.**  The list reaches its full count of entries
-    /// and refuses the next one, which `a_full_free_list_refuses_a_returned_block`
-    /// confirms directly.  But with the capacity the header implies, filling it
-    /// this way fails the *free* with `NoSpace` before the list is full, and
-    /// moving the reported capacity down by one makes this pass and the image
-    /// pass `xfs_repair -n`.  A change that makes the symptom go away without
-    /// being understood is not a fix, so the capacity is left as the array size
-    /// and the boundary is written down here instead.
+
     #[test]
-    #[ignore = "filling the list fails with NoSpace one entry before the boundary is known"]
     fn a_split_takes_a_node_from_the_free_list() {
         let Some(golden) = crate::libxfuse::alloc::golden("xfsv4.img") else {
             eprintln!("skipping: no unpacked xfsv4.img");
@@ -1729,25 +1735,22 @@ mod t {
         let device = Arc::new(BlockDevice::open(copy.path(), Access::ReadWrite).unwrap());
         let mut cache = BlockCache::new(BS, 256);
 
-        let read_state = || -> (u32, u32, (u32, u32, u32), u32) {
+        let read_state = || -> (u32, u32, (u32, u32, u32)) {
             let d = std::fs::read(copy.path()).unwrap();
             let af = sb.ag_header_offset(0, Sb::AGF_SECTOR) as usize;
             (
                 be32(&d, af + 52),
                 be32(&d, af + 60),
                 (be32(&d, af + 40), be32(&d, af + 44), be32(&d, af + 48)),
-                be32(&d, 144),
             )
         };
 
         let start = read_state();
         let mut last = start;
-        let mut rounds = 0u32;
-        for i in 0..400u32 {
+        for _ in 0..400u32 {
             let taken = {
                 let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
-                let r = allocate(&mut tx, &sb, 0, 1)
-                    .unwrap_or_else(|e| panic!("round {i}: the group can spare no block: {e:?}"));
+                let r = allocate(&mut tx, &sb, 0, 1).expect("the group can spare a block");
                 tx.commit().unwrap();
                 r
             };
@@ -1756,19 +1759,16 @@ mod t {
                 free_in_group(&mut tx, &sb, 0, taken).expect("free");
                 tx.commit().unwrap();
             }
-            rounds = i + 1;
             last = read_state();
-            if last.3 != start.3 {
-                eprintln!(
-                    "round {i}: the device total moved by {}",
-                    last.3 as i64 - start.3 as i64
-                );
-            }
         }
-        eprintln!("after {rounds} take-and-give-back rounds");
+        eprintln!("after 400 take-and-give-back rounds");
         eprintln!("  agf_freeblks   {} -> {}", start.0, last.0);
         eprintln!("  agf_btreeblks  {} -> {}", start.1, last.1);
         eprintln!("  AGFL window    {:?} -> {:?}", start.2, last.2);
+        assert!(
+            last.2 .2 > start.2 .2,
+            "the list did not fill, so nothing was measured"
+        );
         device.flush().unwrap();
         let Ok(out) = Command::new("xfs_repair")
             .arg("-n")
@@ -1798,7 +1798,7 @@ mod t {
             .collect();
         assert!(
             out.status.success(),
-            "xfs_repair -n rejected the image after {rounds} rounds:\n{}",
+            "xfs_repair -n rejected the image after filling the list:\n{}",
             complaints.join("\n")
         );
     }
