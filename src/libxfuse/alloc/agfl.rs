@@ -182,6 +182,17 @@ impl Agfl {
     }
 
     /// How many block numbers the array can hold.
+    /// How many more entries fit in this list, given where its window is.
+    ///
+    /// The window's *last* names its newest entry, so the next one goes in the
+    /// slot after that, and the slot has to exist.  A window that does not start
+    /// at zero therefore has less room than the array holds: slot 0 of these
+    /// lists is null, so a window of 1 to 127 in a 128 entry array has room for
+    /// 127 and not 128.
+    pub fn room_below(&self, window: &AgflWindow) -> u32 {
+        self.entries.saturating_sub(window.last + 1)
+    }
+
     /// How many entries can be live at once.
     ///
     /// The whole array.  Giving a block back refuses to step past the end, so a

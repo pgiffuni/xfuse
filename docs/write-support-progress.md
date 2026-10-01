@@ -722,21 +722,38 @@ Three things had to be right, and each was wrong on its own first:
   free space grew by the whole run however it was accounted for, so the tests
   count the trees and the list together rather than the trees alone.
 
-### Filling the list, and an unresolved boundary
+### How much room is left in the free list
 
-Four hundred take-and-give-back rounds fill the list, and `xfs_repair -n` accepts
-the result with the capacity reported one entry lower than the array holds -- but
-that lower number is a **coincidence that hides the fault, not a fix**, and the
-reported capacity has been put back.
+The room in a list is **not** the array's size less how many entries are live.
+The window's *last* names its newest entry, so the next one goes in the slot
+after that, and the slot has to exist.  Slot 0 of these lists is null, so a
+window of 1 to 127 in a 128 entry array has room for 127 and not 128, and
+believing the array's size made **a free of perfectly good blocks fail with
+`ENOSPC`** once the list was nearly full.
 
-What is known: a list reaches its full count of entries and refuses the next
-block, which `a_full_free_list_refuses_a_returned_block` now checks by filling
-until one is refused rather than by computing how full "full" is.  What is not
-known: filling the list *through this code's free path* fails with `NoSpace` one
-entry before that boundary, and the only thing that makes it stop failing is
-reporting less capacity than the array has.  That is the definition of a
-symptom being hidden rather than fixed, so it is written down here and the test
-is left ignored.
+That one was nearly hidden the wrong way: reporting the capacity a lower fixed
+the symptom and had nothing to do with the cause.  It was written down as
+unresolved rather than banked, and the actual state was then read out of the
+refusal itself --
+
+```text
+give_back refused: window AgflWindow { first: 1, last: 127, count: 127 } entries=128
+```
+
+-- which names the window's position as the bound.  `room_below` now asks where
+the window is rather than how many entries are live, and filling the list works
+with the capacity left at the array's size:
+
+```text
+after 400 take-and-give-back rounds
+  agf_freeblks   30144 -> 30022
+  agf_btreeblks  0 -> 0
+  AGFL window    (1, 4, 4) -> (1, 126, 126)
+```
+
+`xfs_repair -n` accepts that.  A related test now checks that a full list refuses
+by **filling until one is refused** rather than by computing how full "full" is,
+because computing it is what was wrong.
 
 What filling the list does establish, and it is the useful part:
 
