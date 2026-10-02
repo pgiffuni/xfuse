@@ -441,6 +441,16 @@ impl<'a, 't, 's> GroupBlocks for TransactionBlocks<'a, 't, 's> {
     fn put(&mut self, block: u32, bytes: Box<[u8]>) -> FsResult<()> {
         self.transaction.write_bytes(self.offset_of(block)?, &bytes)
     }
+
+    /// Hand a merge's released node to the group, so that the header stops
+    /// charging for it.
+    ///
+    /// The inherent method answers *where* the block went; the trait cannot
+    /// express that, because a caller inside a tree walk has no use for it and a
+    /// group with a header has no way to be told about it twice.
+    fn give_back_btree_block(&mut self, block: u32) -> FsResult<()> {
+        Self::give_back_btree_block(self, block).map(|_| ())
+    }
 }
 
 /// Where a metadata block that was no longer needed was put.
@@ -545,19 +555,28 @@ pub fn allocate_in_group(
     };
     // The group's own numbers move with its trees, in the same transaction, or
     // the header and the trees would describe different file systems.
+    //
+    // The header is read again before it is written.  A take *can* now reach the
+    // group header in the middle of the tree work, and this is the second time
+    // that has happened.  Taking a record shrinks a leaf rather than adding one,
+    // so it cannot overflow and cannot split -- but a leaf that was already half
+    // empty goes below the occupancy the format accepts, and is merged away, and
+    // that *does* change the tree's roots' height, the free list's window and the
+    // group's b-tree block count.  Writing the copy this function started with
+    // would undo all three, and a header charging for a node no tree holds is a
+    // state `xfs_repair -n` reports.
     let (free, longest) = space.summaries()?;
+    agf = read_agf(transaction, sb, agno)?;
     let free = u32::try_from(free).map_err(|_| FsError::Corrupt {
         what: "a group claims more free blocks than a file system can hold".into(),
     })?;
     agf.set_free_blocks(free);
     agf.set_longest_free(longest);
-    // The b-tree roots are deliberately *not* written here.  A take shrinks a
-    // record rather than adding one, so an allocation cannot overflow a leaf,
-    // cannot split, and cannot move a root or consume a free list entry -- which
-    // is also why this does not need the re-read the free path does.  That is a
-    // property of taking, and it is recorded here rather than assumed: a take
-    // that ever gained a record would need the roots written and the header read
-    // again, and the two changes belong together.
+    // The b-tree roots are deliberately *not* written here: a merge cannot change
+    // them, because a merge removes a node rather than adding one, and a root that
+    // gained or lost a child would be a different operation from the one taking a
+    // record is.  A *split* can move a root, and only a split takes a block off
+    // the free list for a new one, which is the case this comment was written for.
     write_agf(transaction, sb, agno, &mut agf)?;
     Ok(Some(run))
 }
@@ -2089,6 +2108,236 @@ mod t {
     /// charged for and held by no tree, is the one the previous commit established
     /// is not a file system at all.
     ///
+    /// Taking from a leaf that is already half empty makes it want merging, and
+    /// the merge has to leave a tree that is still a tree.
+    ///
+    /// `xfs_repair` refuses a leaf below half, so a take that leaves one there has
+    /// to merge it, and this is the only test that gets there: `xfsv4.img`'s group
+    /// 1 has a bno tree of 29 leaves and one of them holds 31 records, which is
+    /// exactly the occupancy rule's minimum.  One block out of it and it wants
+    /// merging.
+    ///
+    /// What is checked is that the merge happened, that it happened to a coherent
+    /// tree, and that `xfs_repair -n` accepts the result -- which is the only
+    /// authority that has ever been asked whether a merged tree is a tree.
+    ///
+    /// The invariant the merge has to keep is the same one every free space
+    /// operation keeps: both trees hold the same free space, and the group's
+    /// three terms add up.  A merge that moved records into the sibling without
+    /// doing the same to the *other* tree's sibling would leave the two trees
+    /// describing the same blocks in different records, which is the failure this
+    /// suite has caught before.
+    #[test]
+    fn taking_from_a_half_full_leaf_merges_it_away() {
+        let Some(image) = copy_of_golden("xfsv4.img") else {
+            eprintln!("skipping: no xfsv4.img to copy");
+            return;
+        };
+        let sb = sb_of(image.path());
+        let agno = 1u32;
+        let device = Arc::new(BlockDevice::open(image.path(), Access::ReadWrite).unwrap());
+        let mut cache = BlockCache::new(sb.sb_blocksize as usize, 256);
+
+        // The leaf to empty: the one sitting at exactly the minimum, found by
+        // walking rather than assumed, so the test says what it did.
+        let leaves_before = tree_blocks_in_group(image.path(), &sb, agno, true);
+        let thinnest =
+            thinnest_leaf(image.path(), &sb, agno, true).expect("the group's tree has a leaf");
+        eprintln!(
+            "ag{agno} bno tree: {leaves_before} blocks; thinnest leaf has {} records",
+            thinnest.1
+        );
+
+        // Take one block at a time until the tree loses a leaf, which is the
+        // merge, and stop there.  Bounded, because a tree of this size cannot need
+        // more takes than it has records before something has to give.
+        let mut takes = 0u32;
+        let merged_at = loop {
+            takes += 1;
+            assert!(
+                takes < 200,
+                "the tree never merged a leaf, so nothing was tested"
+            );
+            {
+                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let run = allocate(&mut tx, &sb, agno, 1).expect("the group can spare a block");
+                assert_eq!(run.len, 1);
+                tx.commit().expect("commit");
+            }
+            device.flush().unwrap();
+            if tree_blocks_in_group(image.path(), &sb, agno, true) < leaves_before {
+                break takes;
+            }
+        };
+        let leaves_after = tree_blocks_in_group(image.path(), &sb, agno, true);
+        assert_eq!(
+            leaves_after,
+            leaves_before - 1,
+            "a merge takes one node out of the tree, not {leaves_after} of them"
+        );
+
+        // Nothing is left below the occupancy rule, anywhere in the tree.
+        for (block, nrecs) in leaf_occupancies(image.path(), &sb, agno, true) {
+            assert!(
+                nrecs >= 31,
+                "leaf {block} is left with {nrecs} records, below the 31 xfs_repair accepts"
+            );
+        }
+
+        // And the whole group is still coherent, which is the invariant that
+        // matters rather than the shape of the tree.
+        assert_trees_own_what_is_charged(image.path(), &sb, agno, "after a merge");
+        let mut device_total = 0u64;
+        for ag in 0..sb.agcount() {
+            let (f, t, l) = group_terms(image.path(), &sb, ag, "after a merge");
+            device_total += f + t + l;
+        }
+        assert_eq!(
+            device_total,
+            sb_of(image.path()).sb_fdblocks,
+            "the device-wide identity does not hold after a merge"
+        );
+        // The sibling chains as well, which nothing else here would notice: two
+        // trees can hold identical free space with a node still in a chain that no
+        // pointer reaches.  The in-memory tests check this, but on a tree this
+        // code built in memory; this is on an image, after an operation against a
+        // real transaction, which is where a block that went back to the free list
+        // might still be in a chain.
+        for (label, by_block) in [("by-start", true), ("by-length", false)] {
+            assert_sibling_chains_on_image(image.path(), &sb, agno, by_block, label);
+        }
+        eprintln!(
+            "merged at take {merged_at}; the group's bno tree went {leaves_before} -> \
+             {leaves_after} blocks"
+        );
+
+        assert_repair_accepts(image.path(), "after a leaf was merged away");
+    }
+
+    /// Load one of a group's free space trees into memory and check its sibling
+    /// chains, so the check runs against an image rather than only against a tree
+    /// this code assembled itself.
+    fn assert_sibling_chains_on_image(
+        image: &std::path::Path,
+        sb: &Sb,
+        agno: u32,
+        by_block: bool,
+        label: &str,
+    ) {
+        let bs = sb.sb_blocksize as usize;
+        let base = u64::from(agno) * u64::from(sb.sb_agblocks) * bs as u64;
+        let mut header = vec![0u8; bs];
+        std::fs::File::open(image)
+            .unwrap()
+            .read_exact_at(&mut header, sb.ag_header_offset(agno, Sb::AGF_SECTOR))
+            .unwrap();
+        let root = if by_block {
+            be32(&header, 16)
+        } else {
+            be32(&header, 20)
+        };
+        let geometry = GroupGeometry::new(sb.sb_agblocks, sb.has_crc(), by_block);
+        let mut blocks = crate::libxfuse::alloc::free_space::MemoryBlocks::new();
+        let mut stack = vec![root];
+        while let Some(block) = stack.pop() {
+            let mut bytes = vec![0u8; bs];
+            std::fs::File::open(image)
+                .unwrap()
+                .read_exact_at(&mut bytes, base + u64::from(block) * bs as u64)
+                .unwrap();
+            let node = FreeSpaceNode::from_bytes(bytes.clone(), sb.has_crc(), by_block)
+                .unwrap_or_else(|e| panic!("ag{agno} {label} block {block}: {e}"));
+            if !node.is_leaf() {
+                stack.extend(node.children().expect("children"));
+            }
+            blocks.set(block, bytes.into_boxed_slice());
+        }
+        if let Err(e) =
+            crate::libxfuse::alloc::free_space::check_sibling_chains(&mut blocks, root, geometry)
+        {
+            panic!("ag{agno} {label}: the sibling chains are not a tree any more: {e:?}");
+        }
+    }
+
+    /// How many blocks one of a group's free space trees holds.
+    fn tree_blocks_in_group(image: &std::path::Path, sb: &Sb, agno: u32, by_block: bool) -> u32 {
+        let bs = sb.sb_blocksize as usize;
+        let mut header = vec![0u8; bs];
+        std::fs::File::open(image)
+            .unwrap()
+            .read_exact_at(&mut header, sb.ag_header_offset(agno, Sb::AGF_SECTOR))
+            .unwrap();
+        let root = if by_block {
+            be32(&header, 16)
+        } else {
+            be32(&header, 20)
+        };
+        let base = u64::from(agno) * u64::from(sb.sb_agblocks) * bs as u64;
+        let file = std::fs::File::open(image).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![root];
+        while let Some(block) = stack.pop() {
+            assert!(seen.insert(block), "block {block} is in the tree twice");
+            let mut bytes = vec![0u8; bs];
+            file.read_exact_at(&mut bytes, base + u64::from(block) * bs as u64)
+                .unwrap();
+            let node = FreeSpaceNode::from_bytes(bytes, sb.has_crc(), by_block).expect("a node");
+            if !node.is_leaf() {
+                stack.extend(node.children().expect("children"));
+            }
+        }
+        seen.len() as u32
+    }
+
+    /// Every leaf of one of a group's trees with the number of records in it.
+    fn leaf_occupancies(
+        image: &std::path::Path,
+        sb: &Sb,
+        agno: u32,
+        by_block: bool,
+    ) -> Vec<(u32, u16)> {
+        let bs = sb.sb_blocksize as usize;
+        let mut header = vec![0u8; bs];
+        std::fs::File::open(image)
+            .unwrap()
+            .read_exact_at(&mut header, sb.ag_header_offset(agno, Sb::AGF_SECTOR))
+            .unwrap();
+        let root = if by_block {
+            be32(&header, 16)
+        } else {
+            be32(&header, 20)
+        };
+        let base = u64::from(agno) * u64::from(sb.sb_agblocks) * bs as u64;
+        let file = std::fs::File::open(image).unwrap();
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(block) = stack.pop() {
+            let mut bytes = vec![0u8; bs];
+            file.read_exact_at(&mut bytes, base + u64::from(block) * bs as u64)
+                .unwrap();
+            let node = FreeSpaceNode::from_bytes(bytes, sb.has_crc(), by_block).expect("a node");
+            if node.is_leaf() {
+                out.push((block, node.numrecs()));
+            } else {
+                stack.extend(node.children().expect("children"));
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// The block and record count of the emptiest leaf of one of a group's trees.
+    fn thinnest_leaf(
+        image: &std::path::Path,
+        sb: &Sb,
+        agno: u32,
+        by_block: bool,
+    ) -> Option<(u32, u16)> {
+        leaf_occupancies(image, sb, agno, by_block)
+            .into_iter()
+            .min_by_key(|(_, n)| *n)
+    }
+
     /// The occupancy a free space leaf has to keep, measured rather than
     /// inferred from the B+tree literature.
     ///
