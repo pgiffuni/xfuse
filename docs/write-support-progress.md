@@ -1057,6 +1057,41 @@ because it describes the same free space in more records than it needs to -- whi
 is the two trees disagreeing.  A record that already covers the range says so, so
 the range is left alone.
 
+### The inode number is the address
+
+There is no table of inode chunks to blocks anywhere in the format, and there was
+no such table to find.  An inode number *is* its address, split into three
+fields by the superblock's own geometry:
+
+```text
+agno   = ino >> (sb_agblklog + sb_inopblog)
+agino  = ino  & ((1 << (sb_agblklog + sb_inopblog)) - 1)
+agbno  = agino >> sb_inopblog
+slot   = agino  & ((1 << sb_inopblog) - 1)
+```
+
+for this image `sb_inopblock = 2`, `sb_inopblog = 1`, `sb_agblklog = 15` -- two inodes
+a block, and 65536 inode numbers a group.
+
+Two things are worth writing down because the arithmetic does not say them:
+
+* **The block the number carries is counted from the start of its group**, headers
+  and all.  The root, inode 32, is at group block 16 while the headers occupy
+  blocks 0 to 3, and nothing is subtracted: the numbers that would land on the
+  headers are the reserved ones, which are never allocated and so never have a
+  chunk to be read from.  My first version skipped the headers and landed on the
+  wrong block.
+* **Which chunk a number belongs to is not arithmetic.**  These images space
+  their used inode records 160 inodes apart rather than 64, so there are holes
+  between chunks and a rounded-up block number would be wrong.  The group's tree
+  of used inode numbers answers that, which is exactly the distinction the number
+  alone cannot make.
+
+Checked against the image rather than against this code's own idea of it: walking
+every inode number the geometry can name in group 0 finds **2688 inodes among
+65536 numbers**, and 2688 is what the group header says the group has.  A wrong
+`sb_inopblog` or `sb_agblklog` cannot produce that.
+
 ### Sibling links are structure, not navigation
 
 A B+tree block names the block on its left and the block on its right, and those
