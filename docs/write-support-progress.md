@@ -722,6 +722,27 @@ Three things had to be right, and each was wrong on its own first:
   free space grew by the whole run however it was accounted for, so the tests
   count the trees and the list together rather than the trees alone.
 
+### Reaching a leaf overflow, and what it exposed
+
+The second row of the transition table looked unreachable: the blocks a take gives
+back are **contiguous**, so consecutive frees join into one growing record and a
+leaf's record count never rises.  Giving back **single blocks from inside** a
+taken run fixes that, and is what a file giving up its middle does -- so the row
+is reachable after all.
+
+Reaching it exposed a fault rather than answering the question:
+
+```text
+free: Corrupt { what: "the group free list has a null block in its live window" }
+```
+
+**Consuming a list entry can leave a null inside the window the header names**,
+and taking the next entry then refuses.  So the window and the array come out of
+step after a consumption, which is the second row's own transition and is the
+thing to look at next: what `take_front` does to the window, and what the header
+is told about it afterwards.  The test is left ignored with that on it, and it is
+the concrete next step for **Blocker B**.
+
 ### How much room is left in the free list
 
 The room in a list is **not** the array's size less how many entries are live.
