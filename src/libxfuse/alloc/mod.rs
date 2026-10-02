@@ -94,8 +94,15 @@
 #[cfg(test)]
 pub(crate) fn golden(name: &str) -> Option<std::path::PathBuf> {
     let image = format!("target/tmp/{name}");
+    // Check what is already unpacked rather than trusting that it exists: a
+    // half-finished unpack leaves a file that looks current to an existence
+    // check, and every test then reads it -- as three separate and quite
+    // baffling failures did.
     if std::path::Path::new(&image).exists() {
-        return Some(image.into());
+        match looks_like_an_image(std::path::Path::new(&image)) {
+            Ok(()) => return Some(image.into()),
+            Err(why) => eprintln!("re-unpacking {image}: {why}"),
+        }
     }
     let compressed = format!("resources/{name}.zst");
     if !std::path::Path::new(&compressed).exists() {
@@ -111,11 +118,48 @@ pub(crate) fn golden(name: &str) -> Option<std::path::PathBuf> {
         .arg(&compressed)
         .output();
     match status {
-        Ok(out) if out.status.success() && std::path::Path::new(&image).exists() => {
-            Some(image.into())
-        }
-        _ => None,
+        Ok(out) if out.status.success() && std::path::Path::new(&image).exists() => {}
+        _ => return None,
     }
+    // And check what the unpack landed, for the same reason.  The superblock's
+    // own block count and size are the only check that catches an unpack which
+    // stops short, because a truncated file still begins with a valid
+    // superblock.
+    match looks_like_an_image(std::path::Path::new(&image)) {
+        Ok(()) => Some(image.into()),
+        Err(why) => {
+            eprintln!("the unpacked {image} is not usable: {why}");
+            let _ = std::fs::remove_file(&image);
+            None
+        }
+    }
+}
+
+/// Whether a file is a whole XFS image: its superblock present, and at least as
+/// long as the superblock says the device is.
+fn looks_like_an_image(path: &std::path::Path) -> Result<(), String> {
+    use std::io::Read as _;
+    let len = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    let mut head = [0u8; 16];
+    std::fs::File::open(path)
+        .map_err(|e| e.to_string())?
+        .read_exact(&mut head)
+        .map_err(|e| e.to_string())?;
+    let be32 = |b: &[u8]| u32::from_be_bytes(b.try_into().unwrap());
+    let be64 = |b: &[u8]| u64::from_be_bytes(b.try_into().unwrap());
+    if be32(&head[0..4]) != 0x5846_5342 {
+        return Err("it does not begin with a superblock".into());
+    }
+    let blocksize = u64::from(be32(&head[4..8]));
+    let dblocks = be64(&head[8..16]);
+    if blocksize == 0 {
+        return Err("the superblock says the block size is zero".into());
+    }
+    let want = dblocks * blocksize;
+    if (len as u64) < want {
+        return Err(format!("it is {len} bytes and the superblock says {want}"));
+    }
+    Ok(())
 }
 
 /// Whether the tools the tests check themselves against are here.

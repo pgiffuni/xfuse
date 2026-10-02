@@ -736,12 +736,24 @@ Reaching it exposed a fault rather than answering the question:
 free: Corrupt { what: "the group free list has a null block in its live window" }
 ```
 
-**Consuming a list entry can leave a null inside the window the header names**,
-and taking the next entry then refuses.  So the window and the array come out of
-step after a consumption, which is the second row's own transition and is the
-thing to look at next: what `take_front` does to the window, and what the header
-is told about it afterwards.  The test is left ignored with that on it, and it is
-the concrete next step for **Blocker B**.
+The cause is not `take_front`, which is correct.  It is that **the group header is
+written twice in one free**: the free reads it at the start and writes it at the
+end, and a split in between takes an entry off the list and moves the header's
+window to match -- so the final write put the window back over a slot that is now
+null, and taking the next entry then refused.
+
+The header is shared by everything that touches a group, so it is now **read again
+before it is written**; and the window a reserve sets is written *before* the
+tree work, so a split sees the entries just appended and can move the window on
+from there.  Both halves are needed -- fixing only the re-read produced the
+opposite failure, with the reserve's own window discarded and the superblock's
+count going wrong instead.
+
+The leaf still does not overflow by this route, and `xfs_repair` cannot judge it,
+because the blocks it frees were handed out by the allocator and belong to no
+file.  Overflowing a leaf for real needs a file giving up its middle, which is
+the truncate that is not built -- so **Blocker B** is still open, but it is open
+on the truncate rather than on the free-space machinery.
 
 ### How much room is left in the free list
 
