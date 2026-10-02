@@ -162,6 +162,14 @@ truncate that is not built.
 
 What is left in order:
 
+0. **An image `mkfs.xfs` built that has consumed a list entry.**  Not code: no
+   test can build one, the environment cannot mount a file system, and every image
+   here that a file system made has never consumed an entry.  It is the thing that
+   would settle the free list's own transition question — see
+   [that section](#the-agfl--ordinary-free-space-question-is-unmeasured) — and
+   until it exists, a couple of questions below are blocked on evidence rather than
+   on anything to write.
+
 1. **Linking a node in.**  A block taken for a node is charged for the group
    before it belongs to any tree, and `xfs_repair -n` refuses that state:
 
@@ -180,16 +188,7 @@ What is left in order:
    code resets, which keeps the model closed — a window that advanced past the end
    of the array would name a slot that is not there — and the choice is made in
    one place so it can be changed when it is established.
-3. **A free list block going back to ordinary free space.**  This is the one
-   blocking the empty-window test's repair check, and it is the mirror of the
-   operation that does exist.  The direction that exists takes a block off the
-   list and gives it to the trees; what is missing is taking a block *out of the
-   trees* into the free space when the list is not where it should go — and the
-   one case that needs it here is emptying a list that already holds something,
-   which is what a file system does when its free space is reorganised and this
-   code has no way to say.
-
-4. **Root collapse.**  Leaf merging works — see below — but a root left with a
+3. **Root collapse.**  Leaf merging works — see below — but a root left with a
    single child is not collapsed into it.  It cannot be reached yet, which is why
    it is not built: a parent always holds at least two children, the merge branch
    refuses to take the last one, and nothing else removes a node, so no interior
@@ -474,13 +473,14 @@ Concretely, in order:
 2. ~~**The AGFL empty-window regression test.**~~  Done, on a real image, and now
    a round trip: two blocks taken out of ordinary free space, written as nodes,
    and given back, with the trees, the list and the identity all checked.  The
-   repair check is the one claim still outstanding, and working out why took some
-   finding out: **it needs an operation this code does not have — a block coming
-   off the free list and going into ordinary free space.**  Every path from a group
-   to its own free space goes through `free_in_group`, whose policy is to put a
-   freed block on the list *first*, so a test cannot manufacture an honestly empty
-   list on an image whose list had something in it.  That is item 5 below, and it
-   is now the blocking one.
+   repair check is the one claim still outstanding, and it is outstanding for a
+   reason that turned out to be about the evidence rather than about the code —
+   see [The AGFL → ordinary free space question](#the-agfl--ordinary-free-space-question-is-unmeasured).
+   Short version: clearing a stocked list's window orphans the blocks it was
+   holding, and there is no *established* operation that puts them back, so there
+   is no honest way to build the state on an image whose list had something in
+   it.  The gap is asserted exactly (`sb_fdblocks − 2`, not `− 4`) so neither of
+   the two errors hides behind the other.
 
 3. ~~**The measured AGFL → b-tree transition.**~~  Done, for both of the places
    a block can come from, with the counters asserted.  See
@@ -560,6 +560,57 @@ Concretely, in order:
 9. **BMBT growth, truncate, directories**, in that order.
 
 ---
+
+## The AGFL → ordinary free space question is unmeasured
+
+The plan asks what the "AGFL → ordinary free space" transition is: what happens
+when a metadata block is released and the list cannot accept it.  The way to
+answer a question about a transition is to find an image that has been through
+it, and all three images here have a list whose window does not start at slot 0 —
+`xfsv4.img`'s groups 1 and 3 sit at 85 and 26 — which looks like a long record of
+blocks the list has handed out.  Running it says something different:
+
+```text
+image             group  window        slots outside   a b-tree node   free space
+xfsv4.img          1     (85, 90, 6)         84               62            14
+xfsv4.img          3     (26, 33, 8)        120              119             0
+xfs_writable.img   all   (1, 4, 4)           0                -             -
+xfs_4kn.img        all   (1, 4, 4)           0                -             -
+```
+
+The two images `mkfs.xfs` produced have **never consumed a list entry at all**,
+in any of their eight groups: every window is at slot 1 with four entries and
+nothing outside it, which is the state a freshly made file system is in.  So
+there is no evidence from them of what a consumed entry becomes.
+
+The only trace is in `xfsv4.img`, which is **hand-built** by `scripts/mkimg.sh`
+rather than made by a file system.  Its fourteen free-space blocks are as likely
+to be the script's doing as a file system's, and this suite cannot settle which.
+Calling those fourteen observations of the transition would be reading a number
+as an answer.
+
+So the transition is **unmeasured**, and that is the finding.  It has one
+consequence worth stating plainly, because it looks like work and is not: **do not
+build an "AGFL → ordinary free space" operation on the strength of the plan's
+question.**  There is a good chance XFS has no such operation — a block on the
+list is reserved for the group's b-trees, and a block that leaves it has become a
+node, which is what the 62 and 119 above are.  What would settle it is an image
+with a consumed list entry that `mkfs.xfs` built, and this environment cannot
+mount one.
+
+### One difference from XFS, recorded because it was measured
+
+**The slots a list has passed over still hold their block numbers.**  In group 1
+of `xfsv4.img`, 84 of the 128 slots are non-null outside a six-entry window, and
+62 of them name blocks that are b-tree nodes at this moment.  `Agfl::take_front`
+nulls the slot it takes; XFS evidently does not.
+
+Both are safe, and for the same reason: the group header says which slots are
+live, so a value outside the window is a leftover and not an offer.  That is what
+`Agfl::window_holds` assumes when it refuses a duplicate, and why nothing in this
+code scans the array.  Nulling is kept, because it makes a blank slot
+distinguishable from a stale one for anything that ever reads the array without
+the header — which is the mistake that this codebase has already made once.
 
 ## Phase history
 

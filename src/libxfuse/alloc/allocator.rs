@@ -2443,6 +2443,154 @@ mod t {
             .min_by_key(|(_, n)| *n)
     }
 
+    /// Every block one of a group's free space trees occupies, as a set.
+    fn tree_block_set_in_group(
+        image: &std::path::Path,
+        sb: &Sb,
+        agno: u32,
+        by_block: bool,
+    ) -> std::collections::HashSet<u32> {
+        let bs = sb.sb_blocksize as usize;
+        let mut header = vec![0u8; bs];
+        std::fs::File::open(image)
+            .unwrap()
+            .read_exact_at(&mut header, sb.ag_header_offset(agno, Sb::AGF_SECTOR))
+            .unwrap();
+        let root = if by_block {
+            be32(&header, 16)
+        } else {
+            be32(&header, 20)
+        };
+        let base = u64::from(agno) * u64::from(sb.sb_agblocks) * bs as u64;
+        let file = std::fs::File::open(image).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![root];
+        while let Some(block) = stack.pop() {
+            assert!(seen.insert(block), "block {block} is in the tree twice");
+            let mut bytes = vec![0u8; bs];
+            file.read_exact_at(&mut bytes, base + u64::from(block) * bs as u64)
+                .unwrap();
+            let node = FreeSpaceNode::from_bytes(bytes, sb.has_crc(), by_block).expect("a node");
+            if !node.is_leaf() {
+                stack.extend(node.children().expect("children"));
+            }
+        }
+        seen
+    }
+
+    /// Whether anything is known about what a block that left the free list
+    /// became — which is the "AGFL → ordinary free space" question the write
+    /// support plan asks — and the answer is: **almost nothing, and less than
+    /// the images look like they say.**
+    ///
+    /// The way to answer a question about a transition is to find an image that has
+    /// been through it.  All three images have a list whose window does not start
+    /// at slot 0 — group 1 of `xfsv4.img` sits at 85, group 3 at 26 — which looks
+    /// like a long record of blocks the list has handed out, and slots outside the
+    /// window name blocks that are mostly b-tree nodes.  That reads like an answer.
+    ///
+    /// It is not one, and running it is what shows why:
+    ///
+    /// ```text
+    /// xfsv4.img        ag1  window (85,90,6)  84 slots outside  62 a node  14 free space
+    /// xfsv4.img        ag3  window (26,33,8) 120 slots outside 119 a node   0 free space
+    /// xfs_writable.img  all groups  window (1,4,4)   0 slots outside
+    /// xfs_4kn.img       all groups  window (1,4,4)   0 slots outside
+    /// ```
+    ///
+    /// The two images `mkfs.xfs` produced — `xfs_writable.img` and
+    /// `xfs_4kn.img` — have **never consumed a list entry at all**, in any of
+    /// their eight groups.  Their windows are all at slot 1 with four entries and
+    /// nothing outside them, which is the state a freshly made file system is in.
+    /// So there is no evidence here of what a consumed entry becomes.
+    ///
+    /// The only trace is in `xfsv4.img`, and that image is **hand-built** by
+    /// `scripts/mkimg.sh` rather than made by a file system.  Its 14 free-space
+    /// blocks are as likely to be the script's doing as a file system's, and the
+    /// difference is not something this suite can settle.  Calling that 14
+    /// observations of the transition would be reading a number as an answer,
+    /// which is the exact mistake the plan warns about.
+    ///
+    /// What *is* solid, across all twelve groups of all three images, and is
+    /// asserted here: **a live entry is never block 0, never the null block, and
+    /// never also free space.**  That is the invariant the allocator depends on,
+    /// and it is not in question.
+    ///
+    /// What is also solid, and worth recording because it is a difference from
+    /// this implementation: **the slots a list has passed over still hold their
+    /// block numbers.**  In group 1 of `xfsv4.img`, 84 of the 128 slots are
+    /// non-null outside a six-entry window, and 62 of them name blocks that are
+    /// b-tree nodes right now.  `Agfl::take_front` nulls the slot it takes,
+    /// which XFS evidently does not.  Both are safe, and for the same reason: the
+    /// group header says which slots are live, so a value outside the window is a
+    /// leftover and not an offer — which is exactly what `Agfl::window_holds`
+    /// assumes when it refuses a duplicate, and exactly why nothing here scans the
+    /// array.  Nulling is kept because it makes a blank slot distinguishable from a
+    /// stale one for anything that ever reads the array without the header.
+    ///
+    /// So: the transition remains **unmeasured**, and this is the record of why.
+    /// The consequence for the empty-window test is in its own comment.
+    #[test]
+    fn where_a_block_that_left_the_free_list_went() {
+        let mut checked = 0usize;
+        for name in ["xfsv4.img", "xfs_writable.img", "xfs_4kn.img"] {
+            let Some(path) = crate::libxfuse::alloc::golden(name) else {
+                eprintln!("skipping {name}: not unpacked");
+                continue;
+            };
+            let sb = sb_of(&path);
+            let slots = sb.sb_blocksize as usize / 4;
+            for agno in 0..sb.agcount() {
+                // Every slot of the array, and where the header says the live
+                // ones are.
+                let mut bytes = vec![0u8; sb.sb_blocksize as usize];
+                std::fs::File::open(&path)
+                    .unwrap()
+                    .read_exact_at(&mut bytes, sb.ag_header_offset(agno, Sb::AGFL_SECTOR))
+                    .unwrap();
+                let list = Agfl::from_bytes(bytes, sb.has_crc()).expect("a free list block");
+                let window = free_list_window(&path, &sb, agno);
+                let (first, last, count) = (window.0, window.1, window.2);
+                let free_set = free_blocks_in_group(&path, &sb, agno, true);
+                let mut tree_blocks = std::collections::HashSet::new();
+                for by_block in [true, false] {
+                    tree_blocks.extend(tree_block_set_in_group(&path, &sb, agno, by_block));
+                }
+
+                let mut outside = Vec::new();
+                for i in 0..slots.min(list.capacity() as usize) as u32 {
+                    let block = list.entry(i);
+                    if block == crate::libxfuse::alloc::agf::NULL_AGBLOCK {
+                        continue;
+                    }
+                    if count > 0 && first <= i && i <= last {
+                        // A live entry is reserved: never free space, never block 0.
+                        assert!(block != 0, "{name} ag{agno}: the list offers block 0");
+                        assert!(
+                            !free_set.contains(&block),
+                            "{name} ag{agno}: block {block} is reserved on the list and free space"
+                        );
+                        continue;
+                    }
+                    outside.push(block);
+                }
+                let mut distinct = outside.clone();
+                distinct.sort_unstable();
+                distinct.dedup();
+                let nodes = outside.iter().filter(|b| tree_blocks.contains(b)).count();
+                let free = outside.iter().filter(|b| free_set.contains(b)).count();
+                let held = outside.len();
+                eprintln!(
+                    "{name} ag{agno}: window ({first},{last},{count}); {held} slots outside it, \
+                     {} distinct; {nodes} name a b-tree block, {free} name free space",
+                    distinct.len()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no image was unpacked, so nothing was checked");
+    }
+
     /// The occupancy a free space leaf has to keep, measured rather than
     /// inferred from the B+tree literature.
     ///
