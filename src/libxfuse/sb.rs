@@ -569,18 +569,29 @@ impl Sb {
             what: format!("the file system claims {now} free inodes and {lower_by} went"),
         })?;
         BigEndian::write_u64(&mut bytes[Self::IFREE..Self::IFREE + 8], next);
-        if bytes.len() >= Self::BCRC + 4 && BigEndian::read_u32(&bytes[0..]) == XFS_SB_MAGIC {
-            let bcrc = Self::BCRC;
-            bytes[bcrc..bcrc + 4].fill(0);
-            const CASTAGNOLI: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
-            let mut digest = CASTAGNOLI.digest();
-            digest.update(&bytes[..bcrc]);
-            digest.update(&[0u8; 4]);
-            if bytes.len() > bcrc + 4 {
-                digest.update(&bytes[bcrc + 4..]);
-            }
-            LittleEndian::write_u32(&mut bytes[bcrc..], digest.finalize());
+        // A file system without checksums has a *zero* in the checksum field, and
+        // writing one there is a corruption of its own: repair objects to the
+        // unused part of the superblock, and it is right to.  So the gate is the
+        // same one the block count uses -- the feature bit, not the magic.
+        if bytes.len() < Self::FEATURES2 + 4 {
+            return Ok(next);
         }
+        let features2 = BigEndian::read_u32(&bytes[Self::FEATURES2..]);
+        if features2 & constants::XFS_SB_VERSION2_CRCBIT == 0 {
+            return Ok(next);
+        }
+        let sectsize = usize::from(BigEndian::read_u16(&bytes[102..]));
+        let bcrc = Self::BCRC;
+        bytes[bcrc..bcrc + 4].fill(0);
+        const CASTAGNOLI: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
+        let mut digest = CASTAGNOLI.digest();
+        digest.update(&bytes[..bcrc]);
+        digest.update(&[0u8; 4]);
+        let tail = bytes.len().min(sectsize);
+        if tail > bcrc + 4 {
+            digest.update(&bytes[bcrc + 4..tail]);
+        }
+        LittleEndian::write_u32(&mut bytes[bcrc..], digest.finalize());
         Ok(next)
     }
 
