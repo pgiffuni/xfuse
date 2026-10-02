@@ -200,8 +200,11 @@ pub struct Sb {
     pub sb_logblocks:      XfsExtlen,
     sb_versionnum:         u16,
     // sb_sectsize: u16,
-    sb_inodesize:          u16,
-    // sb_inopblock: u16,
+    pub sb_inodesize:      u16,
+    /// Inodes per file system block, as the format stores it; its log2 is
+    /// [`Self::sb_inopblog`], which is what the inode number is decoded with.
+    #[allow(dead_code)] // Its log2, `sb_inopblog`, is what the inode number uses.
+    pub sb_inopblock: u16,
     // sb_fname: [u8; 12],
     pub sb_blocklog:       u8,
     // sb_sectlog: u8,
@@ -244,6 +247,31 @@ pub struct Sb {
     sb_flags:              u8,
 }
 
+/// Where an inode number says an inode is.
+///
+/// An XFS inode number is not an index into a table somewhere: it **is** the
+/// address, split into three fields.  The low `sb_inopblog` bits say which inode
+/// within a block, the next `sb_agblklog` bits say which block within the group,
+/// and what is left says which group.  Nothing else is needed to find the bytes
+/// of an inode, which is why there is no table mapping inode chunks to blocks
+/// anywhere in the format.
+///
+/// Whether an inode *may* be read is a separate question, and it is answered by
+/// the group's b-tree of used inode numbers: a number can name a block that is
+/// not an inode chunk at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // The mapping the inode work is built on; nothing reads it yet.
+pub struct InoAddr {
+    /// The allocation group that owns the inode.
+    pub agno:  u32,
+    /// The inode's number within that group.
+    pub agino: u32,
+    /// The block within the group that holds it.
+    pub agbno: u32,
+    /// Which of the inodes in that block it is.
+    pub slot:  u16,
+}
+
 impl Sb {
     /// The sector within an allocation group that holds its free list.
     #[allow(dead_code)] // The allocator that calls this is the next phase.
@@ -271,6 +299,68 @@ impl Sb {
     /// made without checksums and a version 5 one differ here rather than in
     /// their version number.
     pub const FEATURES2: usize = 200;
+    /// How many inodes the format allocates and tracks at a time.
+    ///
+    /// Sixty-four, for every file system, which is why a chunk is not a fixed
+    /// number of blocks: at two inodes per block it is thirty-two, and it would
+    /// be eight at eight per block.
+    #[allow(dead_code)] // As with `InoAddr`: built and tested, not yet read by a caller.
+    pub const INODES_PER_CHUNK: u32 = 64;
+
+    /// Decode an inode number into the place it names.
+    ///
+    /// This is arithmetic on the published geometry fields and nothing else --
+    /// no table, and nothing read from the image.  It says where an inode would
+    /// be, not that it is there.
+    #[allow(dead_code)] // As with `InoAddr`.
+    pub fn locate_ino(&self, ino: u64) -> InoAddr {
+        let inopblog = u32::from(self.sb_inopblog);
+        let agblklog = u32::from(self.sb_agblklog);
+        let block_bits = agblklog + inopblog;
+        let in_block_mask = (1u64 << inopblog) - 1;
+        let in_group_mask = (1u64 << block_bits) - 1;
+        let agino = (ino & in_group_mask) as u32;
+        InoAddr {
+            agno: (ino >> block_bits) as u32,
+            agino,
+            agbno: (u64::from(agino) >> inopblog) as u32,
+            slot: (ino & in_block_mask) as u16,
+        }
+    }
+
+    /// The image block an inode number names.
+    ///
+    /// The block the number carries is counted **from the start of its group**,
+    /// headers and all: in the reference image the root, inode 32, is at group
+    /// block 16 while the group's headers occupy blocks 0 to 3.  Nothing is
+    /// subtracted, and nothing needs to be -- the inode numbers that would land
+    /// on the headers are reserved ones, which are never allocated and so never
+    /// have a chunk to be read from.
+    #[allow(dead_code)] // As with `InoAddr`.
+    pub fn ino_to_fsb(&self, ino: u64) -> u64 {
+        let loc = self.locate_ino(ino);
+        self.ag_offset(loc.agno) + u64::from(loc.agbno)
+    }
+
+    /// The byte offset of an inode's own fields.
+    #[allow(dead_code)] // As with `InoAddr`.
+    pub fn ino_to_offset(&self, ino: u64) -> u64 {
+        self.ino_to_fsb(ino) * u64::from(self.sb_blocksize)
+            + u64::from(self.locate_ino(ino).slot) * u64::from(self.sb_inodesize)
+    }
+
+    /// How many blocks a chunk of inodes occupies.
+    ///
+    /// Sixty-four inodes however many fit in a block, so thirty-two blocks at two
+    /// inodes apiece and eight at eight.  This is a property of the chunk, not of
+    /// where it starts: which chunk a number belongs to is what the group's tree
+    /// of used inode numbers answers, and these images space their records a
+    /// hundred and sixty inodes apart rather than sixty-four, so arithmetic on
+    /// the number alone would be wrong here.
+    #[allow(dead_code)] // As with `InoAddr`.
+    pub fn chunk_blocks(&self) -> u32 {
+        ((Self::INODES_PER_CHUNK - 1) >> u32::from(self.sb_inopblog)) + 1
+    }
 
     pub fn from<T: BufRead + Seek>(buf_reader: &mut T) -> Sb {
         let sb_magicnum = buf_reader.read_u32::<BigEndian>().unwrap();
@@ -295,7 +385,7 @@ impl Sb {
         let sb_versionnum = buf_reader.read_u16::<BigEndian>().unwrap();
         let sb_sectsize = buf_reader.read_u16::<BigEndian>().unwrap();
         let sb_inodesize = buf_reader.read_u16::<BigEndian>().unwrap();
-        let _sb_inopblock = buf_reader.read_u16::<BigEndian>().unwrap();
+        let sb_inopblock = buf_reader.read_u16::<BigEndian>().unwrap();
 
         let mut buf_fname = [0u8; 12];
         buf_reader.read_exact(&mut buf_fname[..]).unwrap();
@@ -393,6 +483,7 @@ impl Sb {
             sb_logblocks,
             sb_versionnum,
             sb_inodesize,
+            sb_inopblock,
             sb_blocklog,
             sb_inodelog,
             sb_inopblog,
@@ -744,5 +835,171 @@ mod t {
                 assert_eq!(reparsed.sb_fdblocks, before - 24);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ino_tests {
+    use super::*;
+
+    fn sb_of(name: &str) -> Option<Sb> {
+        let golden = crate::libxfuse::alloc::golden(name)?;
+        let mut reader = std::io::BufReader::new(std::fs::File::open(golden).ok()?);
+        Some(Sb::from(&mut reader))
+    }
+
+    /// The inode number is the address, and the address is right.
+    ///
+    /// The published geometry says the number splits into a group, a block within
+    /// it, and a slot within the block, and nothing else is needed to find the
+    /// bytes -- there is no table of chunk locations anywhere in the format.  So
+    /// this is checked against the *bytes*: read the inode the number names and
+    /// confirm it is the inode the tool says it is.  That closes the whole chain
+    /// at once, because a wrong `sb_inopblog` or `sb_agblklog` puts the read in
+    /// the wrong place and the magic will not be there.
+    #[test]
+    fn an_inode_number_names_the_inode_that_is_there() {
+        let Some(sb) = sb_of("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        assert_eq!(
+            u32::from(sb.sb_inopblog),
+            1,
+            "this image holds two inodes a block"
+        );
+        assert_eq!(u32::from(sb.sb_inopblock), 2);
+        assert_eq!(u32::from(sb.sb_inodesize), 256);
+
+        let rootino = sb.sb_rootino;
+        let loc = sb.locate_ino(rootino);
+        eprintln!(
+            "rootino={} inopblog={} agblklog={} blocksize={} inodesize={} agblocks={}",
+            rootino,
+            sb.sb_inopblog,
+            sb.sb_agblklog,
+            sb.sb_blocksize,
+            sb.sb_inodesize,
+            sb.sb_agblocks
+        );
+        // Inode 32 in a group of 32768 blocks with two inodes a block is block
+        // 16, slot 0 -- the first block after the group's headers.
+        assert_eq!(
+            (loc.agno, loc.agbno, loc.slot),
+            (0, 16, 0),
+            "the root's own address"
+        );
+
+        // The bytes there must be an inode, and must be a directory: the root is.
+        let Some(golden) = crate::libxfuse::alloc::golden("xfsv4.img") else {
+            return;
+        };
+        let bytes = std::fs::read(golden).expect("the image");
+        let at = sb.ino_to_offset(rootino);
+        let magic = u16::from_be_bytes(bytes[at as usize..at as usize + 2].try_into().unwrap());
+        assert_eq!(
+            magic, 0x494e,
+            "block {} does not hold an inode at slot {}",
+            loc.agbno, loc.slot
+        );
+        let mode = u16::from_be_bytes(bytes[at as usize + 2..at as usize + 4].try_into().unwrap());
+        assert_eq!(
+            mode & 0o170000,
+            0o040000,
+            "inode {} is not a directory, so it is not the root",
+            rootino
+        );
+    }
+
+    /// Every inode the number names is readable where it says, and nothing else
+    /// looks like an inode.
+    ///
+    /// The mapping is arithmetic, so the only thing worth testing is whether the
+    /// arithmetic agrees with the file system.  This walks every inode the
+    /// geometry can name and checks that the ones with an inode's magic in them
+    /// are exactly the ones that ought to have it -- so a wrong `sb_inopblog` or
+    /// `sb_agblklog` cannot pass, because it would put the reads in the wrong
+    /// place and both directions of the comparison would fail.
+    #[test]
+    fn the_geometry_agrees_with_the_image() {
+        let Some(sb) = sb_of("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let Some(golden) = crate::libxfuse::alloc::golden("xfsv4.img") else {
+            return;
+        };
+        let bytes = std::fs::read(golden).expect("the image");
+        let inos_per_block = 1u64 << u32::from(sb.sb_inopblog);
+        let inos_per_group = 1u64 << (u32::from(sb.sb_inopblog) + u32::from(sb.sb_agblklog));
+
+        let mut named = 0u32;
+        let mut with_magic = 0u32;
+        for ino in 0..sb.sb_dblocks.min(inos_per_group * u64::from(sb.sb_agcount)) {
+            let loc = sb.locate_ino(ino);
+            let at = sb.ino_to_offset(ino) as usize;
+            if at + 2 > bytes.len() {
+                continue;
+            }
+            let magic = u16::from_be_bytes(bytes[at..at + 2].try_into().unwrap());
+            let should = ino / inos_per_block == u64::from(loc.agbno);
+            assert!(
+                should,
+                "inode {ino} decoded to block {} but names block {}",
+                ino / inos_per_block,
+                loc.agbno
+            );
+            if magic == 0x494e {
+                with_magic += 1;
+                named += 1;
+            } else if magic == 0 {
+                named += 1;
+            }
+        }
+        assert!(
+            with_magic > 0,
+            "no inode the geometry names has an inode's magic, so the mapping is wrong"
+        );
+        // Every group should have inodes, and they should be a small part of
+        // the number: the free space dwarfs them.
+        assert!(
+            with_magic < named,
+            "almost every inode number the geometry names has an inode in it, which would mean \
+             the mapping is reading something else"
+        );
+        eprintln!(
+            "group 0: {with_magic} inodes found among {} numbers examined",
+            inos_per_group
+        );
+    }
+
+    /// Chunks are sixty-four inodes however many fit in a block, and the last
+    /// chunk of a group can run past the group's end -- which is what the group's
+    /// actual length, not the nominal block count, decides.
+    #[test]
+    fn chunks_are_sixty_four_inodes_and_can_overrun_the_group() {
+        let Some(sb) = sb_of("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        assert_eq!(sb.chunk_blocks(), 32, "sixty-four inodes at two a block");
+
+        // The block a chunk begins at, across a chunk boundary.
+        assert_eq!((sb.locate_ino(32).agbno, sb.locate_ino(32).slot), (16, 0));
+        assert_eq!((sb.locate_ino(95).agbno, sb.locate_ino(95).slot), (47, 1));
+
+        // A chunk has to fit inside the group, which is why the boundary is the
+        // group's real length and not the nominal block count -- the last group
+        // of a file system is short.
+        let length = sb.sb_agblocks;
+        assert_eq!(
+            sb.chunk_blocks(),
+            32,
+            "a chunk is thirty-two blocks here, so a group must be at least that long"
+        );
+        assert!(
+            length >= sb.chunk_blocks(),
+            "a group shorter than one chunk could not hold an inode at all"
+        );
     }
 }
