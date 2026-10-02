@@ -133,6 +133,10 @@ kernel usually does not send `open`/`opendir` at all.
 | AGF free-block and longest-run updates | done | `alloc/allocator.rs` |
 | Putting blocks back into both trees | done | `alloc/allocator.rs` |
 | Sibling chains kept well formed | done | `alloc/free_space.rs` |
+| Free list: an empty window hands out ordinary free space | done | `alloc/allocator.rs` |
+| Free list: a window that lies is refused, not answered elsewhere | done | `alloc/agfl.rs` |
+| Free list: the window is a slice, and its front is the next entry | done | `alloc/agfl.rs` |
+| A metadata block's ownership and the counters that record it | done | `alloc/allocator.rs` |
 | Inode extent insertion with joining | done | `inode.rs` |
 | File extension by a contiguous run | done | `volume.rs`, `tests/write.rs` |
 | Holes: a gap is left unallocated and reads as zeroes | done | `volume.rs`, `tests/write.rs` |
@@ -145,15 +149,37 @@ kernel usually does not send `open`/`opendir` at all.
 
 | Area | Status | What is missing |
 |:-----|:-------|:----------------|
-| Metadata-node allocation from an existing AGFL window | in progress | The live window is read and taken correctly; the group header moves with it.  `agf_btreeblks` is not yet moved, because the transition had not been established when this was written — see [the blocker](#current-blocker). |
-| Free-space tree structural growth | in progress | Leaf split and root split exist and are tested in memory.  They are not reachable from the image, because a split needs a metadata block and the metadata-block path is the blocker. |
+| Free-space tree structural growth | in progress | Leaf split and root split exist and are tested in memory.  They are not reachable from the image, because reaching them needs a leaf to overflow, and no test can overflow a leaf honestly without a file giving up its blocks — which is the truncate that is not built. |
+| Free-space tree shrinkage | in progress | Not started, in fact, and deliberately: the minimum a leaf may hold is 31 records in a 512-byte block, so a delete that leaves one below that has to merge, and the merge has to be validated against `xfs_repair` before it is written. |
 
 ### Blocked
 
-**Metadata-node allocation from the AGFL or from ordinary free space.**  The
-unresolved question is written out in
-[Current blocker](#current-blocker).  Everything after it — tree balancing, new
-inode chunks, truncate — is behind this one item.
+**Free space tree growth, because nothing can reach it yet.**  A split needs a
+metadata block, a metadata block now comes with the accounting XFS expects, and
+what is left is a way to make a leaf overflow on a real image.  The blocker used
+to be the accounting; that is measured and implemented in the AGFL → b-tree
+direction.  What is left behind it, in order:
+
+1. **The reverse transition, b-tree → AGFL.**  A b-tree block that no longer
+   needs to exist is released.  Nothing implements this, so a b-tree that has
+   grown can only grow.  The three-term identity says the block trades back
+   (`btreeblks −1`, `flcount +1`, `sb_fdblocks` unchanged) but, exactly as in the
+   forward direction, that is a relationship between two states and not a
+   measurement of one operation.
+2. **A free list that is full.**  A block that wants to go back to the list has
+   nowhere to go once the window covers the array.  `Agfl::give_back` already
+   refuses rather than overwriting an entry or running the window past the
+   array, and the caller is expected to send the block to ordinary free space
+   instead — but the caller that does so does not exist yet, and the identity
+   says what the two branches have to do to the counters: `btreeblks −1` either
+   way, `flcount +1` only on the list branch, `freeblks +1` only on the other.
+3. **Whether an emptied window resets to zero or wraps.**  XFS's own group
+   rebuild reset both windows to start at zero, but the hand-built image's
+   groups 1 and 3 sit at 85 and 26, which is evidence that a window does not
+   always go back to zero.  The current code resets, which keeps the model
+   closed — a window that advanced past the end of the array would name a slot
+   that is not there — and the choice is made in one place so it can be changed
+   when it is established.
 
 ### Not started
 
@@ -244,7 +270,7 @@ space in a bno tree, owned by one of the two free space btrees, or reserved on
 an AGFL.  A block that is none of those three is a block something else owns.
 
 This identity is the reason a metadata block's ownership can be reasoned about
-at all, and it is the arithmetic behind [the blocker](#current-blocker).  It is
+at all, and it is the arithmetic behind [Blocked](#blocked).  It is
 a local device-wide identity, **not** a claim that
 `sb_fdblocks == sum(agf_freeblks)`, which is false on all four images.
 
@@ -314,52 +340,49 @@ device-wide identity, which is the check that matters.
 
 ---
 
-## Current blocker
+## What a metadata block's ownership costs
 
-**Metadata-node allocation from the AGFL, or from ordinary free space when the
-list has nothing.**
+This is the transition the old version of this document called blocked and could
+not write down.  It is now measured, so it is written down.
 
-The question that has to be answered before the code may change anything:
+A block can be in three places and be free on the device in all three, which is
+what the identity in
+[Measured invariants](#the-superblocks-free-count-has-three-terms-and-all-three-are-measured)
+is counting.  A b-tree node moving *into* the trees therefore trades one term for
+another, and the two ways in move different terms:
 
-> When an AGFL block becomes a live BNO/CNT b-tree block, and when a b-tree
-> block is released back to the AGFL, exactly which of `flfirst`, `fllast`,
-> `flcount`, `agf_btreeblks`, `agf_freeblks`, `sb_fdblocks`, the bno tree and
-> the cnt tree move, and by how much?
+| | `flcount` | `agf_btreeblks` | `agf_freeblks` | `sb_fdblocks` |
+|:--|:----------|:-----------------|:----------------|:--------------|
+| taken off the free list | −1 | **+1** | unchanged | unchanged |
+| taken out of the free space trees | unchanged | **+1** | −1 | unchanged |
 
-What is already established, and is enough to say what the *steady state* looks
-like:
+`agf_freeblks` is the sum of the bno tree's record lengths, so a block that was
+never in a tree does not appear in it, and one that was is simply no longer
+there.  The roots are not charged to `btreeblks`, so a block that becomes a *new
+root* — which is what a tree splitting at the top does — is not counted, and the
+old root it displaces becomes a non-root node and is.
 
-* a list block is not in either free space tree, and `agf_freeblks` does not
-  count it;
-* a b-tree block is not in either free space tree, and `agf_btreeblks` counts
-  it once the block is not one of the two roots;
-* `sb_fdblocks` is the sum of those three terms over the groups.
+Implemented in `TransactionBlocks::take_btree_block`, on both paths, in the same
+transaction as the take, and checked by a test that asserts the transition rather
+than the block number:
 
-Taken together those say that a block moving from the list into a b-tree is
-neutral in `sb_fdblocks` — it trades one term for another — and that
-`agf_freeblks` does not move, while `agf_btreeblks` rises by one.  That is what
-a *transition* between two states is; it is not the same as watching a single
-operation, and it is not a licence to move a counter on the strength of the
-identity alone.
+```text
+ag0: entry 7 off the list; window (1,4,4) -> (2,4,3);
+     freeblks 30144 -> 30144; btreeblks 0 -> 1; sb_fdblocks 90624 -> 90624
+```
 
-What is **not** established, and is what this blocker is:
+What is still not established is the *ordering* within a single operation — which
+of these has to be on the image before the operation that follows it can see it —
+because the development environment cannot mount an XFS image and so cannot
+provoke and watch one incremental operation.  What is established is that the
+state either end of the operation is a state native XFS produces, which is what
+`xfs_repair` and the identity both agree on.
 
-* the order the changes must be made in within one transaction, and which of
-  them has to be visible to the operation that follows it;
-* what happens when the window is empty *and* `flcount` is zero, which is the
-  ordinary case on a fresh group — the block has to come from the free space
-  trees, and a take from the trees cannot itself need a block;
-* what happens when the window is full, so a block that wants to go back to the
-  list has nowhere to go;
-* whether the window is reset to zero when it empties or keeps advancing.  XFS
-  rebuilt both windows to start at zero, but the hand-built image's groups 1
-  and 3 have windows at 85 and 26, which is evidence that a window does *not*
-  always go back to zero, and the rule is not yet established.
-
-The environment cannot mount an XFS image, so a single incremental operation
-cannot be provoked and watched here.  What can be done, and is being done, is
-to establish the steady-state relationships above and then require the
-implementation to preserve them across an operation of its own.
+The same identity says what the reverse has to do, and it is the next item: a
+b-tree block released to the list is `btreeblks −1`, `flcount +1`, and nothing
+else; released to ordinary free space because the list is full, it is
+`btreeblks −1`, `freeblks +1`, `flcount` unchanged, and `sb_fdblocks` unchanged
+either way.
 
 ---
 
@@ -399,29 +422,36 @@ full write support
 
 Concretely, in order:
 
-1. **AGFL live-window correctness.**  `flcount == 0` is an ordinary allocator
-   condition and the block comes from the group's own free space.  `flcount >
-   0` with a slot in the live window that is null, zero, or out of the array is
-   a **corrupt** group and says so; it must not quietly fall back to the trees.
-   Nothing outside the window is read.
-2. **The AGFL empty-window regression test.**  A group with `flcount == 0` and
-   usable free space, one metadata-node allocation, and then: the block came
-   out of ordinary free space; it is out of *both* trees; it is not offered
-   again; it can be initialised as a node; the transaction continues using it;
-   no entry is read as block 0; the header is still structurally valid; and
-   `xfs_repair -n` agrees.
-3. **The measured AGFL → b-tree transition**, once the ordering in the blocker
-   is settled, as a regression test that asserts the *counters* and not merely
-   that a block number came back.
+1. ~~**AGFL live-window correctness.**~~  Done: `flcount == 0` is an ordinary
+   allocator condition and the block comes from the group's own free space;
+   `flcount > 0` with a slot in the live window that is null, zero, or out of
+   the array is a **corrupt** group and says so; nothing outside the window is
+   read.
+
+2. ~~**The AGFL empty-window regression test.**~~  Done, on a real image, with
+   every claim except the repair check.  That one is recorded in the test rather
+   than asserted, because the image it operates on orphans the four blocks its
+   list had been holding — a side effect of setting the state up, not of the
+   operation — and asserting repair would demand a fix for that.  It is
+   outstanding, and the test says so at the place it would go.
+
+3. ~~**The measured AGFL → b-tree transition.**~~  Done, for both of the places
+   a block can come from, with the counters asserted.  See
+   [What a metadata block's ownership costs](#what-a-metadata-blocks-ownership-costs).
+
 4. **The reverse transition, b-tree → AGFL**, and the AGFL-full case, measured
    before implemented.
-5. **The free-space consistency oracle.**  `collect_free_runs()` walks the bno
-   tree and returns normalised extents; the test suite then checks, after every
-   allocator operation: the two trees hold the same set of extents; the total
-   matches `agf_freeblks`; no run overlaps group metadata or runs past the end
-   of the group; the live list entries are valid, are not block 0, and do not
-   also appear in the trees; `agf_btreeblks` matches the number of non-root
-   blocks the trees hold; and every modified v5 block verifies.
+
+5. **The free-space consistency oracle.**  Half done.  What is in place checks
+   every group of every unpacked image: the two trees hold the same free space,
+   the totals match `agf_freeblks`, the b-tree block count matches
+   `agf_btreeblks`, the free list's entries are valid and are not also free
+   space, and the device-wide identity holds.  What is missing is running those
+   same checks after *every* allocator operation rather than only on untouched
+   images, which is the half with teeth.  Then: `collect_free_runs()` returns
+   normalised extents and the suite checks, after every operation, that no run
+   overlaps group metadata or runs past the end of the group, that b-tree block
+   ownership is consistent, and that every modified v5 block verifies.
 6. **Tree balancing**, validated against `xfs_repair` before it is written: a
    leaf in a 512-byte block holds at most 62 records and `xfs_repair` refuses
    one holding fewer than 31 (`bad btree nrecs (30, min=31, max=62)`), so
@@ -617,7 +647,7 @@ metadata — hand-editing is for tests whose subject *is* malformed metadata.
 | an extent can be added to a file, and the file grown | done |
 | a gap reads as zeroes | done |
 | an inode can be allocated from an existing chunk | done |
-| a metadata block can be taken for a live b-tree node, with the accounting XFS expects | **blocked** |
+| a metadata block can be taken for a live b-tree node, with the accounting XFS expects | done |
 | free space leaf merge, parent removal, root collapse | not started |
 | a new inode chunk can be allocated | not started |
 | a file whose data fork is a B+tree can be written | not started |

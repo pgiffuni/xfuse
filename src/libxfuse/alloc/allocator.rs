@@ -226,11 +226,30 @@ impl<'a, 't, 's> GroupBlocks for TransactionBlocks<'a, 't, 's> {
         // block 0 -- the superblock.  So the test for a usable slot is whether
         // it holds a block number that is neither the null block nor zero, and
         // not whether the block opens with a magic number: a free list in a
-        // version 4 file system is a bare array with no header at all, and
-        // asking whether one has been *written* would say no to a list that is
-        // full of usable blocks.  All four of this repository's images have
-        // written arrays; what they lack is a magic number, which is not the
-        // same thing.
+        // version 4 file system is a bare array with no header to lack one.
+        // All four of this repository's images have written arrays; what they
+        // lack is a magic number, which is not the same thing.
+        //
+        // Either way the block is about to be a node, so `agf_btreeblks` moves
+        // by one -- and it moves here, in this transaction, rather than being
+        // left to the caller, because the caller may be a split deep inside a
+        // tree walk and has no way to know that a block changed hands.  What
+        // moves with it is different on the two paths, and both differences come
+        // from the identity `sb_fdblocks == sum(freeblks + btreeblks + flcount)`,
+        // measured per group on every image here and confirmed independently by
+        // `xfs_repair`:
+        //
+        // ```text
+        // off the list:   flcount -1, btreeblks +1, freeblks   unchanged, fdblocks unchanged
+        // out of the trees: flcount unchanged, btreeblks +1, freeblks -1, fdblocks unchanged
+        // ```
+        //
+        // The superblock's total is unmoved either way, which is the point of
+        // the identity: the block trades one term for another rather than
+        // ceasing to be accounted for.  `agf_freeblks` on the second path is
+        // the caller's to set, because it recomputes the group's free space from
+        // the trees once its own work on them is done; it has to do that anyway
+        // for whatever the operation freed.
         if !window.is_empty() {
             let block = agfl.take_front(&mut window)?;
             if u64::from(block) >= u64::from(self.sb.sb_agblocks) {
@@ -242,6 +261,7 @@ impl<'a, 't, 's> GroupBlocks for TransactionBlocks<'a, 't, 's> {
             agfl.update_crc();
             self.transaction.write_bytes(at, agfl.as_bytes())?;
             agf.set_free_list_window(window.first, window.last, window.count);
+            agf.set_btree_blocks(agf.btree_blocks() + 1);
             write_agf(self.transaction, self.sb, self.agno, &mut agf)?;
             return Ok(block);
         }
@@ -257,17 +277,12 @@ impl<'a, 't, 's> GroupBlocks for TransactionBlocks<'a, 't, 's> {
         // mutation that follows is right -- and it is what the bno tree, which
         // is ordered by start block, makes easiest to find.  What is *not* a
         // choice, and is not done here, is guessing at which blocks the file
-        // system would have preferred: that is the accounting transition this
-        // whole path is blocked on, and until it is established this picks a
-        // block and says plainly that it picked one.
+        // system would have preferred.
         //
-        // The counters this moves are the blocked ones, so they are not moved
-        // here.  Measured against native XFS, a block that is in a free space
-        // tree and becomes a b-tree node is `-1` on `agf_freeblks` and `+1` on
-        // `agf_btreeblks`, with the superblock's total unmoved -- the block
-        // trades one of the three terms of the device-wide identity for
-        // another.  Neither counter is touched by this function, and the caller
-        // that rebuilds them from the trees is the one that has to get it right.
+        // The roots are not written here.  Removing a block shrinks a record
+        // rather than adding one, so a take cannot overflow a leaf, cannot
+        // split, and cannot move a root; the new roots are the caller's to
+        // write along with the height it reads back off the new root.
         let geometry = GroupGeometry::new(self.sb.sb_agblocks, self.sb.has_crc(), true);
         let by_length = GroupGeometry::new(self.sb.sb_agblocks, self.sb.has_crc(), false);
         let block_tree = first_run_from(agf.block_btree_root(), geometry, 0, |b| self.get(b))?
@@ -285,6 +300,8 @@ impl<'a, 't, 's> GroupBlocks for TransactionBlocks<'a, 't, 's> {
             block_tree.start,
             1,
         )?;
+        agf.set_btree_blocks(agf.btree_blocks() + 1);
+        write_agf(self.transaction, self.sb, self.agno, &mut agf)?;
         Ok(block_tree.start)
     }
 
@@ -1762,6 +1779,147 @@ mod t {
         }
     }
 
+    /// An entry taken off the free list is a block the trees now own, and every
+    /// counter that says where a free block is has to say so.
+    ///
+    /// Returning the right block is the easy half.  An allocator can take entry
+    /// 7 off the list, hand it back as a perfectly plausible block number, and
+    /// leave the header claiming the block is still reserved -- and nothing about
+    /// the return value shows that.  So this test asserts the *transition*:
+    ///
+    /// ```text
+    ///                     before      after
+    /// flfirst/last/count   (1, 4, 4)  (2, 4, 3)
+    /// agf_freeblks         30144      30144     unchanged
+    /// agf_btreeblks        0          1         +1
+    /// sb_fdblocks          90624      90624     unchanged
+    /// the list's entries   7,8,9,10   8,9,10
+    /// ```
+    ///
+    /// The unchanged lines are the ones worth having.  A list block was never in
+    /// a free space tree and was never in `agf_freeblks`, so taking it does not
+    /// change the group's free space; and it was counted in `sb_fdblocks`
+    /// through the `flcount` term, and it is counted now through `btreeblks`, so
+    /// the superblock's total does not move either.  A block that becomes a
+    /// b-tree node trades one term of
+    /// `sb_fdblocks == sum(freeblks + btreeblks + flcount)` for another.
+    ///
+    /// The block is written as a node and the entry is *not* returned afterwards,
+    /// because returning it is the reverse transition and a different test; what
+    /// is checked here is the state the block becomes a node in.
+    #[test]
+    fn taking_a_list_entry_moves_the_header_to_the_trees() {
+        let Some(image) = copy_of_golden("xfsv4.img") else {
+            eprintln!("skipping: no xfsv4.img to copy");
+            return;
+        };
+        let sb = sb_of(image.path());
+        let agno = 0u32;
+        let device = Arc::new(BlockDevice::open(image.path(), Access::ReadWrite).unwrap());
+        let mut cache = BlockCache::new(sb.sb_blocksize as usize, 256);
+
+        let before = {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let agf = read_agf(&mut tx, &sb, agno).expect("a group header");
+            (
+                agf.free_list_first(),
+                agf.free_list_last(),
+                agf.free_list_count(),
+                agf.free_blocks(),
+                agf.btree_blocks(),
+            )
+        };
+        let (first, last, count, free_before, tree_before) = before;
+        assert!(
+            count > 0,
+            "the image's list is empty, so there is nothing to take"
+        );
+        let fdblocks_before = sb.sb_fdblocks;
+
+        let taken = {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
+            let taken = store.take_btree_block().expect("the list has an entry");
+            // It becomes a node.  The point is not that this parses but that the
+            // block is now owned by a tree rather than reserved, and the
+            // counters below are the whole of that claim.
+            store
+                .put(
+                    taken,
+                    leaf(XFS_ABTB_MAGIC, &[(first, 1)]).into_boxed_slice(),
+                )
+                .expect("write the node");
+            tx.commit().expect("commit");
+            taken
+        };
+        device.flush().unwrap();
+
+        // The window moved past the slot, and the slot it moved past is empty, so
+        // the same block cannot be taken twice.
+        let (f, l, c, entries) = free_list_window(image.path(), &sb, agno);
+        assert_eq!(
+            (f, l, c),
+            (first + 1, last, count - 1),
+            "the window did not move past the entry that was taken"
+        );
+        assert_eq!(
+            free_list_slot(image.path(), &sb, agno, first),
+            crate::libxfuse::alloc::agf::NULL_AGBLOCK,
+            "the slot the entry was taken from was not emptied"
+        );
+        assert!(
+            !entries.contains(&taken),
+            "the list still offers the block it just gave away: {entries:?}"
+        );
+
+        let free_set_before = free_blocks_in_group(image.path(), &sb, agno, true);
+        assert_eq!(
+            free_set_before,
+            free_blocks_in_group(image.path(), &sb, agno, false)
+        );
+
+        let after = {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let agf = read_agf(&mut tx, &sb, agno).expect("a group header after the take");
+            (agf.free_blocks(), agf.btree_blocks())
+        };
+        assert_eq!(
+            after.0, free_before,
+            "a list block was never free space, so the group's free count must not move"
+        );
+        assert_eq!(
+            after.1,
+            tree_before + 1,
+            "a block that became a node is one more block the trees own"
+        );
+        assert_eq!(
+            u64::from(after.0) + u64::from(after.1) + u64::from(c),
+            u64::from(free_before) + u64::from(tree_before) + u64::from(count),
+            "the group's three terms must sum to the same total as before"
+        );
+
+        // The superblock's total is unchanged, and the whole image still adds up.
+        assert_eq!(
+            sb_of(image.path()).sb_fdblocks,
+            fdblocks_before,
+            "the block traded one term of the device-wide identity for another, so the total is \
+             the same"
+        );
+        // And the block is not in either tree, because the node it was written as
+        // has not been linked in: it is a node that is not yet part of a tree,
+        // which is what a split holds between taking a block and linking it.
+        let in_trees = free_set_before.contains(&taken);
+        assert!(
+            !in_trees,
+            "block {taken} is a node and is still free space in a tree"
+        );
+        eprintln!(
+            "ag{agno}: entry {taken} off the list; window ({first},{last},{count}) -> \
+             ({f},{l},{c}); freeblks {free_before} -> {}; btreeblks {tree_before} -> {}",
+            after.0, after.1
+        );
+    }
+
     /// The live free list window of a group, as the header and the list block
     /// together record it: the three header fields, and the blocks the window
     /// names.
@@ -1794,6 +1952,22 @@ mod t {
             (first..=last).map(|i| list.entry(i)).collect()
         };
         (first, last, count, entries)
+    }
+
+    /// One slot of a group's free list, read by slot number.
+    ///
+    /// Reading a slot the window no longer covers is the point: the slot an
+    /// entry was taken from is outside the window afterwards, and "the window
+    /// shrank" and "the slot was emptied" are different claims.
+    fn free_list_slot(image: &std::path::Path, sb: &Sb, agno: u32, slot: u32) -> u32 {
+        let mut bytes = vec![0u8; sb.sb_blocksize as usize];
+        std::fs::File::open(image)
+            .unwrap()
+            .read_exact_at(&mut bytes, sb.ag_header_offset(agno, Sb::AGFL_SECTOR))
+            .unwrap();
+        Agfl::from_bytes(bytes, sb.has_crc())
+            .expect("a free list block")
+            .entry(slot)
     }
 
     /// Every block a group's two free space trees occupy, counted once each.

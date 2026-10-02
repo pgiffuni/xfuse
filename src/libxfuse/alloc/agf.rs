@@ -294,8 +294,30 @@ impl Agf {
 
     /// How many blocks the group's own btrees occupy, which is a count of
     /// blocks charged to the group file itself rather than to any file.
+    ///
+    /// Measured, per group, on this repository's images and on one `xfs_repair`
+    /// rebuilt: it is the number of blocks **both free space trees hold, less
+    /// their two root blocks**.  The roots are named by this header already, so
+    /// they are not charged to the count; a group whose two trees are a single
+    /// root each -- blocks 4 and 5 in `xfsv4.img` -- has a count of zero, and
+    /// one with a level-2 tree of 30 blocks has 58.  See
+    /// `count_free_space_btree_blocks` in the allocator's tests, which checks the
+    /// relationship against what a walk of the trees actually finds.
+    ///
+    /// It is a *count of blocks*, not a count of trees or of levels, so a block
+    /// that becomes a b-tree node adds one and a tree that grows a level adds
+    /// the nodes of that level.
     pub fn btree_blocks(&self) -> u32 {
         self.u32_at(offset::BTREEBLKS)
+    }
+
+    /// Record how many blocks the group's btrees occupy.
+    ///
+    /// Only ever moved by the operation that changed the trees, and in the same
+    /// transaction as that change, so a header and its trees can never describe
+    /// different file systems.
+    pub fn set_btree_blocks(&mut self, blocks: u32) {
+        self.set_u32_at(offset::BTREEBLKS, blocks);
     }
 
     /// The file system's identifier, which the header carries so that a block
