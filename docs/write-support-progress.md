@@ -758,6 +758,20 @@ Reading one's own writes back through the same mount would test the kernel's
 page cache rather than the image, and an early version of one of these tests
 passed while the write path was dropping the offset within a block.
 
+The allocator's own tests run against **`xfsv4.img` for everything that modifies
+an image**, which has no checksums and short b-tree headers.  So the version 5
+write path — 56-byte block headers, the owner and identifier inside them, the
+checksum on every block this code rewrites, and the free list's own header and
+checksum — was separately unexercised against a real image.  It is now, on
+`xfs_4kn.img`: the same sequence the version 4 test runs (allocate, give a run
+back, take a b-tree node and put it back, cut a hole in a run) with the
+accounting oracle asked after each step, and `xfs_repair -n` asked at the end.
+
+That test was confirmed to fail when the checksum path is broken on purpose,
+which is the only way to know a check of that kind is doing anything: disabling
+`Agf::update_crc` makes it fail on the group header, and leaving a b-tree node's
+checksum stale makes it fail on the node.
+
 `tests/write.rs` currently covers: overwrite of a byte; overwrite surviving a
 remount; partial-block writes with the surrounding bytes checked; whole-block
 and unaligned writes at seven offsets; writes to files of several shapes; the
@@ -789,6 +803,7 @@ metadata — hand-editing is for tests whose subject *is* malformed metadata.
 | writable mount can be explicitly requested | done |
 | unsupported XFS features cause a read-write mount rejection | done |
 | existing allocated file data can be overwritten | done |
+| the allocator's write path verified on a version 5 image with checksums | done |
 | a group header, free list, inode header and used-inode tree can be read and written | done |
 | a free space btree can be walked, searched and mutated at the leaf | done |
 | blocks can be allocated and given back, through a transaction | done |
