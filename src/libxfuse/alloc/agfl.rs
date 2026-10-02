@@ -212,10 +212,6 @@ impl Agfl {
         BigEndian::read_u32(&self.bytes[offset::MAGIC..]) == XFS_AGFL_MAGIC
     }
 
-    /// Write the header that says this block is a free list.
-    ///
-    /// The array is blanked to the null block at the same time, so that a block
-    /// that used to hold something else cannot be read as free blocks.
     /// Write the header that says this block is a free list, and empty it.
     ///
     /// A block that has no header gets no header written to it.  The array is the
@@ -343,6 +339,27 @@ impl Agfl {
     ///
     /// Returns the window that is left.  As with taking a block, the caller
     /// writes the window to the group header in the same transaction.
+    ///
+    /// A block the list is already holding is refused, and so is block 0.  Both
+    /// are the mirror of what [`Agfl::take_front`] guards and neither is
+    /// hypothetical:
+    ///
+    /// * A block on the list is a block the file system has taken out of its
+    ///   free space, so putting it on the list twice is what makes the same block
+    ///   be handed out twice -- once as a node and once as free space, from two
+    ///   different branches of a split that ran at different times.  The
+    ///   duplicate would be invisible afterwards: both entries are valid, in
+    ///   different slots.
+    /// * Block 0 is the superblock in group 0 and a group's own headers
+    ///   everywhere.  `take_front` refuses it because a blank list reads as a run
+    ///   of zeroes; refusing it here closes the other end of the same hole,
+    ///   because a zero written into the array is indistinguishable from a blank
+    ///   one.
+    ///
+    /// `ENOSPC` means the array has no room left *after the window's last*, which
+    /// is a real answer and not a failure: the list is full, and a caller that
+    /// can put the block somewhere else should.  Nothing is written when it is
+    /// returned.
     pub fn give_back(
         &mut self,
         window: &mut AgflWindow,
@@ -354,11 +371,30 @@ impl Agfl {
                 "the null block is not a block to free",
             ));
         }
+        if block == 0 {
+            return Err(FsError::invalid(
+                libc::EINVAL,
+                "block 0 is not a block to put on the free list",
+            ));
+        }
+        if self.window_holds(window, block) {
+            return Err(FsError::corrupt(format!(
+                "the group free list already holds block {block}"
+            )));
+        }
         if window.count == 0 {
             // An empty window starts over at the bottom of the array: there is
             // no reason to keep a window that has been emptied by taking, and
             // reusing the array from its start is how the group gets its free
             // list back after a burst of allocation.
+            //
+            // Whether an emptied window should instead *wrap* around the array is
+            // not established.  XFS rebuilt both windows of `xfsv4.img` to start
+            // at zero, but two of that image's groups sit at 85 and 26, so a
+            // window does not always go back to zero.  Resetting is the choice
+            // that keeps the model closed -- a window that advanced past the end
+            // of the array would name a slot that is not there -- and it is made
+            // here, in one place, so it can be changed when it is established.
             window.first = 0;
             window.last = 0;
         } else if window.last + 1 >= self.entries {
@@ -372,6 +408,17 @@ impl Agfl {
         self.set_entry(window.last, block);
         window.count += 1;
         Ok(*window)
+    }
+
+    /// Whether the live window is already holding `block`.
+    ///
+    /// Only the window is consulted.  A slot outside it is stale: the header says
+    /// the file system no longer owns what is there, so the same block number
+    /// outside the window is not a duplicate but a leftover.
+    pub fn window_holds(&self, window: &AgflWindow, block: XfsAgblock) -> bool {
+        (window.first..=window.last)
+            .map(|i| self.entry(i))
+            .any(|held| held == block)
     }
 
     /// Is the free list's checksum correct?
@@ -587,7 +634,6 @@ mod t {
 
     /// An empty window and a window naming nothing usable are different states,
     /// and only one of them is the caller's to answer.
-    ///
     /// A count of zero is a list with nothing in it, and the allocator answers
     /// that from the group's free space.  A count that is not zero with a slot
     /// at the front that is not a block is a group whose header and whose free
@@ -741,6 +787,65 @@ mod t {
         agfl.give_back(&mut empty, 4097).unwrap();
         assert_eq!(empty, agfl.window(0, 0, 1));
         assert_eq!(agfl.entry(0), 4097);
+    }
+
+    /// The other end of the block-zero hole, and the other end of a duplicate.
+    ///
+    /// `take_front` refuses a slot holding zero because a list block that has
+    /// never been written is a run of zeroes and zero is block 0 -- the
+    /// superblock.  A zero written into the array is indistinguishable from a
+    /// blank one, so `give_back` has to refuse it too or the hole is open in both
+    /// directions at once.
+    ///
+    /// A block already in the window is the same defect one step on: the list is
+    /// where a block goes to be taken *out* of free space, so the same block on
+    /// it twice is handed out twice, once as a node and once as free space.  Two
+    /// valid entries in two slots, and nothing afterwards to tell.
+    #[test]
+    fn giving_back_refuses_block_zero_and_a_duplicate() {
+        let mut agfl = Agfl::from_bytes(block_of(V5_AGFL, 4096), true).unwrap();
+        let mut window = agfl.window(1, 4, 4);
+
+        let err = agfl.give_back(&mut window, 0).unwrap_err();
+        assert_eq!(
+            err.errno(),
+            libc::EINVAL,
+            "block 0 must not go on the free list"
+        );
+        assert_eq!(
+            (window.first, window.last, window.count),
+            (1, 4, 4),
+            "a refused block changed the window"
+        );
+
+        // Slot 1 is empty on this image, so 0 is the only thing at the bottom of
+        // the array; the rest of the window is taken and must not be doubled.
+        for already in [9u32, 10, 11, 12] {
+            let err = agfl.give_back(&mut window, already).unwrap_err();
+            assert_eq!(
+                err.errno(),
+                crate::libxfuse::EUCLEAN,
+                "block {already} is already on the list and must not go on it again"
+            );
+        }
+        assert_eq!(
+            agfl.window_blocks(&window),
+            vec![9, 10, 11, 12],
+            "a refused duplicate changed what the list holds"
+        );
+
+        // A slot outside the window is stale rather than a duplicate: the header
+        // says the file system no longer owns what is there.
+        let mut after_take = window;
+        agfl.take_front(&mut after_take).unwrap();
+        assert_eq!(after_take, agfl.window(2, 4, 3));
+        agfl.give_back(&mut after_take, 9)
+            .expect("a block the list has let go of can come back");
+        assert_eq!(
+            agfl.window_blocks(&after_take),
+            vec![10, 11, 12, 9],
+            "the block went back on at the back of the queue"
+        );
     }
 
     /// The array is a fixed size, and a full free list has to refuse a returned
