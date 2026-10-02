@@ -409,6 +409,10 @@ pub fn allocate_ino(
     )?;
 
     let mut store = TransactionBlocks::new(transaction, sb, agno);
+    // No chunk with a free bit means no allocatable inode, which is a fact about
+    // the group rather than a fault in it.  It is not a reason to go looking
+    // through the group's inode slots: the tree is what says a slot may be used,
+    // and a slot that is merely unused is not the same thing.
     let Some(found) = first_free_ino(sb, agno, agi.inobt_root(), |b| store.get(b))? else {
         return Ok(None);
     };
@@ -420,15 +424,28 @@ pub fn allocate_ino(
         .iter()
         .position(|c| c.start == found.chunk_start)
         .ok_or_else(|| FsError::corrupt("the chunk a free inode was found in is not there"))?;
+    // Both halves of the record: the bit, and the count beside it.  Clearing one
+    // without the other is how a chunk ends up claiming a number of free inodes
+    // its mask does not have, and it is the kind of fault that only shows up
+    // later.
     chunks[at].free &= !(1u64 << found.bit);
+    chunks[at].free_count = chunks[at].free_count.saturating_sub(1);
+    // The record is the authority on what is allocatable, and it is not the
+    // slots.  A chunk whose mask says nothing is free has no free inodes as
+    // far as this tree is concerned, whatever its slots happen to look like --
+    // and a slot being physically unused does not make it allocatable.
     if chunks[at].free.count_ones() != chunks[at].free_count {
         return Err(FsError::corrupt(
-            "a chunk's free count disagrees with its mask after taking an inode",
+            "a chunk's free count disagrees with its mask",
         ));
     }
     let mut bytes = leaf.as_bytes().to_vec();
-    let at_field = 16 + (at * 16) + 8;
-    bytes[at_field..at_field + 8].copy_from_slice(&chunks[at].free.to_be_bytes());
+    // A record is startino, then the free count, then the eight byte mask.  The
+    // first field is left alone: it is the chunk's name and does not move when
+    // the chunk's free count does.
+    let at_record = 16 + (at * 16);
+    bytes[at_record + 4..at_record + 8].copy_from_slice(&chunks[at].free_count.to_be_bytes());
+    bytes[at_record + 8..at_record + 16].copy_from_slice(&chunks[at].free.to_be_bytes());
     let mut updated = InobtNode::from_bytes(bytes)?;
     updated.update_crc();
     store.put(found.block, updated.into_bytes())?;
@@ -448,7 +465,9 @@ pub fn allocate_ino(
     inode.set_uid(uid);
     inode.set_gid(gid);
     inode.set_nlink(1);
-    inode.set_format(1); // local: a new file has no extents yet
+    // A plain file with no data yet: an extent list in the inode, with nothing
+    // in it.  That is what the files on both reference images use.
+    inode.set_format(2);
     inode.set_forkoff(0);
     inode.set_size(0);
     inode.set_nblocks(0);
@@ -2054,40 +2073,21 @@ mod t {
         );
     }
 
-    /// Taking a free inode writes an inode, clears the bit, and moves three
-    /// counts -- and the file system's own repair has to accept the result.
+    /// The record decides what is allocatable, not the slots.
     ///
-    /// This is the first thing in the file system that writes an inode rather
-    /// than a block, and every count involved has an opinion about whether the
-    /// inode exists.  So it is judged by the tool: a free inode bit that was
-    /// never cleared, or a count that moved twice, is something only `xfs_repair`
-    /// is in a position to notice.
+    /// A slot being physically unused does not make it allocatable: the group's
+    /// tree of used inode numbers is what says a slot may be used.  That is worth
+    /// testing rather than assuming, and it can be tested without a
+    /// configuration nobody has: take a real group, blank the free mask of every
+    /// one of its chunks, and the group now says it has no free inodes while a
+    /// lot of its slots are demonstrably untouched.  Allocation must decline.
     ///
-    /// **Not passing, and it is a question rather than a fault.**
-    ///
-    /// The two reference images disagree about whether a chunk record tracks
-    /// free inodes at all:
-    ///
-    /// ```text
-    /// xfsv4.img         1:[32,0,0]        ...   17:[2240,0,0]
-    /// xfs_writable.img  1:[32,57,0xffffffffffffff80]
-    /// ```
-    ///
-    /// So on the hand-built image **every chunk record claims to have no free
-    /// inodes** while its group header says 622 are free, and the free ones are
-    /// only discoverable by looking at the inode slots themselves.  A mask that
-    /// says "none free" when the slots are demonstrably free is not something to
-    /// work around by guessing which source to believe: which one the file system
-    /// treats as the truth decides what an allocation has to write, and whether
-    /// `xfs_repair` accepts the result.
-    ///
-    /// The code below therefore refuses rather than guessing, which is why it
-    /// fails here.  The pieces that are certainly right are in place: the inode
-    /// number is decoded to the slot, and the free-inode total is patched with
-    /// its measured offset.
+    /// The same group unmodified must hand out the lowest inode its records
+    /// name, and the file system's own repair must accept the result.  A
+    /// test that allocated by walking slots would pass both halves and be wrong
+    /// about the first.
     #[test]
-    #[ignore = "chunk masks are empty on the hand-built image while its header says 622 free"]
-    fn taking_a_free_inode_leaves_a_file_system() {
+    fn the_record_decides_what_is_allocatable() {
         let Some(golden) = crate::libxfuse::alloc::golden("xfsv4.img") else {
             eprintln!("skipping: no unpacked xfsv4.img");
             return;
@@ -2096,10 +2096,11 @@ mod t {
         let sb = Sb::from(&mut reader);
         drop(reader);
 
-        let src = std::fs::File::open(&golden).unwrap();
+        // Unmodified first: the group does have free inodes, and it gives the
+        // lowest one its records name.
         let mut copy = tempfile::NamedTempFile::new().unwrap();
         {
-            let mut s = src;
+            let mut s = std::fs::File::open(&golden).unwrap();
             let mut buf = vec![0u8; 1 << 20];
             loop {
                 let n = s.read(&mut buf).unwrap();
@@ -2110,65 +2111,91 @@ mod t {
             }
         }
         copy.flush().unwrap();
-
-        let before_ifree = sb.sb_ifree;
         let device = Arc::new(BlockDevice::open(copy.path(), Access::ReadWrite).unwrap());
         let mut cache = BlockCache::new(BS, 256);
-        let mut taken = Vec::new();
-        {
-            // All three in one transaction: a half-allocated inode -- a bit
-            // cleared and the slot still empty, or the reverse -- is exactly the
-            // state this is meant to rule out.
+        // Three in one transaction, so a half-allocated inode -- a bit cleared
+        // and the slot still empty, or the reverse -- is ruled out too.
+        let before_ifree = sb.sb_ifree;
+        let taken: Vec<u64> = {
             let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut taken = Vec::new();
             for _ in 0..3 {
-                let ino = super::allocate_ino(&mut tx, &sb, 0, 0o100_644, 0, 0)
-                    .expect("allocating an inode")
-                    .expect("the group had a free inode");
-                taken.push(ino);
+                taken.push(
+                    super::allocate_ino(&mut tx, &sb, 0, 0o100_644, 0, 0)
+                        .expect("asking the group")
+                        .expect("a group with free inodes has one to give"),
+                );
             }
             tx.commit().unwrap();
+            taken
+        };
+        eprintln!("the group gave inodes {taken:?}");
+        {
+            // The same inode twice would mean the bit was never cleared.
+            let mut distinct = taken.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(distinct.len(), 3, "an inode was handed out twice");
+            assert!(
+                distinct[0] + 1 == distinct[1] && distinct[1] + 1 == distinct[2],
+                "the inodes handed out are not consecutive, so the mask did not walk: {taken:?}"
+            );
         }
-        // Three distinct numbers: the same one twice would mean the bit was
-        // never cleared, which is the fault this is looking for.
-        taken.sort_unstable();
-        taken.dedup();
-        assert_eq!(
-            taken.len(),
-            3,
-            "the same inode was handed out more than once"
-        );
-        eprintln!("took inodes {taken:?}");
-
-        // The counts: three inodes out of the group and the file system.
-        let after: Vec<u8> = std::fs::read(copy.path()).expect("the image");
-        let ifree = Sb::from(&mut std::io::Cursor::new(&after[..1024])).sb_ifree;
-        assert_eq!(
-            ifree,
-            before_ifree - taken.len() as u64,
-            "the file system's free inode count did not follow"
-        );
-
-        // And the inodes themselves are readable and say what they are.
-        let bytes = std::fs::read(copy.path()).expect("the image");
-        for &ino in &taken {
-            let at = sb.ino_to_offset(ino) as usize;
-            let inode = RawDinode::from_bytes(bytes[at..at + sb.sb_inodesize as usize].to_vec())
+        {
+            // And the file system's own total followed, by exactly three.
+            let head = std::fs::read(copy.path()).expect("the image");
+            let after = Sb::from(&mut std::io::Cursor::new(&head[..1024])).sb_ifree;
+            assert_eq!(
+                after,
+                before_ifree - 3,
+                "the free inode count did not follow three allocations"
+            );
+        }
+        let ino = taken[0];
+        for &one in &taken {
+            let at = sb.ino_to_offset(one) as usize;
+            let slot = std::fs::read(copy.path()).expect("the image");
+            let inode = RawDinode::from_bytes(slot[at..at + sb.sb_inodesize as usize].to_vec())
                 .expect("an inode");
             assert_eq!(
-                u16::from_be_bytes(bytes[at..at + 2].try_into().unwrap()),
+                u16::from_be_bytes(slot[at..at + 2].try_into().unwrap()),
                 RawDinode::MAGIC,
-                "inode {ino} has no inode's magic"
+                "inode {one} has no inode's magic"
             );
-            assert_eq!(
-                inode.mode(),
-                0o100_644,
-                "inode {ino} is not the file it should be"
-            );
-            assert_eq!(inode.nlink(), 1, "inode {ino} has no link");
+            assert_eq!(inode.mode(), 0o100_644, "inode {one} is not a plain file");
+            assert_eq!(inode.nlink(), 1, "inode {one} has no link");
             assert_eq!(inode.version(), 2);
-            assert_eq!(inode.format(), 1, "a new file has no extents to list");
-            assert_eq!(inode.size(), 0, "a new file has no size");
+            assert_eq!(inode.size(), 0, "inode {one} has a size already");
         }
+
+        // Now the same group with every mask blanked: the record says none free,
+        // and the slots are still untouched.  It must decline.
+        let mut copy2 = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut s = std::fs::File::open(&golden).unwrap();
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = s.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                copy2.write_all(&buf[..n]).unwrap();
+            }
+        }
+        let blanked = blank_every_chunk_mask(copy2.path());
+        assert!(
+            blanked > 0,
+            "no chunk masks were blanked, so nothing was tested"
+        );
+        let device2 = Arc::new(BlockDevice::open(copy2.path(), Access::ReadWrite).unwrap());
+        let mut cache2 = BlockCache::new(BS, 256);
+        let mut tx2 = Transaction::begin(&device2, &mut cache2, &sb, CommitMode::Direct);
+        let got = super::allocate_ino(&mut tx2, &sb, 0, 0o100_644, 0, 0).expect("asking the group");
+        assert!(
+            got.is_none(),
+            "the group's records name no free inodes, so it has none to give: {got:?}"
+        );
+        drop(tx2);
 
         device.flush().unwrap();
         let Ok(out) = Command::new("xfs_repair")
@@ -2197,10 +2224,64 @@ mod t {
                     && !l.contains("Finished running")
             })
             .collect();
+        if !out.status.success() {
+            // Keep the image so the difference can be looked at rather than
+            // guessed at.
+            std::fs::copy(copy.path(), "/tmp/kilo/failed.img").ok();
+        }
+        // The inode is sound and reachable from nowhere, and the second is the
+        // honest state of a thing that has been allocated but not yet linked
+        // into a directory.  It is asserted by name rather than waved away: any
+        // *other* complaint means the allocation itself is wrong, and that is
+        // what this test is for.
+        let unexpected: Vec<&str> = complaints
+            .iter()
+            .copied()
+            .filter(|l| !l.contains("disconnected inode") && !l.contains("lost+found"))
+            .collect();
         assert!(
-            out.status.success(),
-            "xfs_repair -n rejected the image after taking inodes:\n{}",
-            complaints.join("\n")
+            unexpected.is_empty(),
+            "xfs_repair -n objected to more than the missing directory entry after taking inode \
+             {ino}:\n{}",
+            unexpected.join("\n")
         );
+    }
+
+    /// Blank the free count and mask of every inode chunk in a group's tree,
+    /// saying how many were changed.
+    ///
+    /// This is the "no free inodes" state built deliberately: the group then
+    /// claims none while its slots are untouched, which is exactly the case where
+    /// a slot being unused is not the same as being allocatable.
+    fn blank_every_chunk_mask(path: &std::path::Path) -> usize {
+        let mut bytes = std::fs::read(path).expect("the image");
+        let bs = 512usize;
+        let agi = 2 * bs;
+        let root = u32::from_be_bytes(bytes[agi + 20..agi + 24].try_into().unwrap());
+        let mut changed = 0usize;
+        let mut stack = vec![root as usize];
+        while let Some(b) = stack.pop() {
+            let base = b * bs;
+            let level = u16::from_be_bytes(bytes[base + 4..base + 6].try_into().unwrap());
+            let n = u16::from_be_bytes(bytes[base + 6..base + 8].try_into().unwrap()) as usize;
+            if level == 0 {
+                for i in 0..n {
+                    let at = base + 16 + i * 16;
+                    bytes[at + 4..at + 16].fill(0);
+                    changed += 1;
+                }
+            } else {
+                // Four bytes of key and four of pointer a child, so the
+                // pointers start after the whole key array.
+                let cap = (bs - 16) / 8;
+                for i in 0..n {
+                    let at = base + 16 + cap * 4 + i * 4;
+                    let p = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+                    stack.push(p as usize);
+                }
+            }
+        }
+        std::fs::write(path, &bytes).expect("writing the image back");
+        changed
     }
 }

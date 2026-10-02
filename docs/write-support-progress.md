@@ -1128,33 +1128,45 @@ the leaf it is in -- and `agi_newino` does not move, because it names the chunk
 most recently *allocated as a chunk* rather than the inode most recently handed
 out.
 
-### The two images disagree about whether a chunk tracks its free inodes
+### The record decides what is allocatable, not the slots
 
-The inode b-tree's chunk record is `startino`, a free count, and a sixty-four bit
-mask of which of the chunk's inodes are free.  Both reference images have such
-records, and they say different things:
+A slot being physically unused does not make it allocatable: the group's tree of
+used inode numbers is what says a slot may be used.  The distinction is worth
+testing rather than assuming, and it can be tested without a configuration
+nobody has -- take a real group, blank the free mask of every chunk, and it now
+says it has no free inodes while a lot of its slots are demonstrably untouched.
+Allocation must decline.  The same group unmodified must hand out the lowest
+inode its records name, and repair must accept the result.  A test that allocated
+by walking slots would pass both halves and be wrong about the first.
 
-```text
-xfsv4.img         1:[32,0,0]              ...  17:[2240,0,0]
-xfs_writable.img  1:[32,57,0xffffffffffffff80]
-```
+What an allocation does, all in one transaction:
 
-On the freshly made one the mask is there and its population count is the free
-count, which is the invariant checked throughout.  On the hand-built one **every
-chunk record claims to have no free inodes** while its group header says 622 are
-free, and the free ones are only discoverable by looking at the inode slots
-themselves.
+* clear the lowest set bit of the chunk's mask, and take the **count beside it**
+  down by one -- clearing one without the other leaves a chunk claiming a number
+  of free inodes its mask does not have, which is the kind of fault that only
+  shows up later;
+* take the group's free inode count down by one, and the file system's total,
+  which is the sum of those and was checked exactly on both reference images;
+* write an inode: magic, version, format, generation, and a link.  A slot that
+  has never been used is all zeroes, so every field is set rather than assumed,
+  and four setters for it did not exist;
+* and leave `agi_newino` alone, because it names the chunk most recently
+  *allocated as a chunk* rather than the inode most recently handed out.
 
-That is not something to work around by deciding which source to believe.  Which
-one the file system treats as the truth decides what an allocation has to write,
-and whether `xfs_repair` accepts the answer -- and the two images disagree, so one
-of them is telling us about a configuration the other is not.  The allocator
-therefore refuses rather than guessing, and the test that would judge the write
-with `xfs_repair` is ignored with this on it.
+Checked against the file system rather than against this code's opinion: three
+inodes in one transaction, consecutive, each a plain file with a link, the free
+inode count down by exactly three -- and `xfs_repair` objecting to exactly one
+thing, `disconnected inode 4457, would move to lost+found`, which is the honest
+state of an inode that has been allocated and not yet linked into a directory.
+That one is asserted by name: any *other* complaint means the allocation itself
+is wrong, and that is the whole point of having the tool judge it.
 
-What is settled either way, and measured: the inode number decodes to the slot
-(`INO` + 136 for the free inode total, read out of the image rather than counted
-from a neighbouring field, which had been eight bytes out).
+Three things the tool caught that reading the code would not have.  A new file
+written with the local format is rejected, where every file on these images uses
+an extent list.  Writing the free inode total recomputed the superblock's
+checksum into a field that is **zero** on a file system without checksums, and
+repair objects to the unused part of the superblock quite rightly.  And the count
+beside the mask has to move with the mask.
 
 ### Sibling links are structure, not navigation
 
