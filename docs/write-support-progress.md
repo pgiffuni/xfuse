@@ -561,6 +561,75 @@ Concretely, in order:
 
 ---
 
+## What a new inode chunk would have to get right
+
+The next feature in the dependency order is allocating a new inode chunk, and two
+of its prerequisites turned out to be worth measuring before writing any of it.
+Both are measurements of the images, and both contradict something the code or the
+documentation previously said.
+
+### The chunk spacing is not the nominal geometry, and not one number
+
+`xfsv4.img`'s group 1 holds **257 chunks**, from inode 32 to inode 35008, with
+spacings of **128, 160 and 192** inodes.  A nominal chunk is 64 inodes, so no two
+chunks are adjacent and no spacing is the nominal one.  128 is two chunks back to
+back; 160 and 192 are gaps of one and two chunks' worth.
+
+The documentation already said these images space their records 160 apart rather
+than 64, which was the thing that made the group's tree authoritative over
+arithmetic on the inode number.  The measurement is sharper than that: the spacing
+varies *within* a group, so there is no constant to correct by either.  A new
+chunk therefore cannot be placed by any formula at all — it has to be searched
+for, and what it has to be searched against is the group's own free space and its
+own metadata.
+
+### A free inode's slot is entirely zero
+
+`xfsv4.img`'s group 1 has 52 free inodes, and **every one of their slots is a run
+of zeroes — magic included**.  The inodes in use in the same group carry `494e`
+at the head of their slot followed by a mode of `81a4`, so the difference is
+between a slot XFS has written and one it has not.
+
+Two things follow, and the second is the one that matters:
+
+* All-zero is a state XFS leaves behind and `xfs_repair -n` accepts, on an image
+  with 52 of them.
+* **What XFS writes when it creates a new chunk is unmeasured.**  No chunk in any
+  image here was created by an operation this suite can watch.  All-zero is
+  consistent with the evidence and is the obvious thing to try, but "consistent
+  with the slots XFS happened not to write" is not the same as "what XFS writes",
+  and the difference is exactly the kind this project has been wrong about before.
+
+That also corrects a comment in `allocate_ino`, which says "a slot that has never
+been used is all zeroes, so every field has to be set rather than assumed".  That
+is right about a *used* inode, where every field has to be written.  For a *free*
+one it is the other way round: there is nothing to read and nothing to assume, and
+an all-zero slot is a legal thing to find and a legal thing to write.
+
+### What the subtree therefore needs
+
+1. A chunk start searched for, not computed: candidate inode numbers at nominal
+   chunk boundaries, rejected unless all 32 of the chunk's blocks are free in the
+   bno tree and are not the group's own metadata.
+2. 32 blocks allocated from the group's free space, through the ordinary
+   transaction, so the group's counts follow.
+3. 64 slots written in the layout above — which is a choice, not a measurement,
+   and the documentation says so at the place it is made.
+4. An INOBT record with `startino`, `freecount = 64` and all 64 mask bits set,
+   inserted in key order, with `freecount == popcount(free_mask)` checked before
+   and after as the plan requires.
+5. The group's inode header: `count += 64`, `freecount += 64`, `ino_blocks += 32`,
+   and `newino` set to the new chunk's start — the one place `newino` moves, which
+   is what makes it a hint about *chunks* rather than about the last inode handed
+   out.
+6. `sb_ifree += 64`.
+7. `xfs_repair -n` as the judge, because everything above is a claim about a file
+   system and nothing else here can check one.
+
+The substrate exists and is repair-clean: `xfs_writable.img`'s groups 1, 2 and 3
+have an **empty** inode tree (`count = 0`, `freecount = 0`, one leaf with no
+records), so a first chunk in a group is a case with no overlap hazards in it.
+
 ## The AGFL → ordinary free space question is unmeasured
 
 The plan asks what the "AGFL → ordinary free space" transition is: what happens
