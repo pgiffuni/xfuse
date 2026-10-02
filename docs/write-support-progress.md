@@ -202,7 +202,6 @@ What is left in order:
 |:-----|
 | Leaf merge and parent removal |
 | Root collapse |
-| New inode chunk allocation |
 | BMBT growth (inode btree interior nodes) |
 | Truncate, and freeing a file's data |
 | `create`, `unlink`, directory and namespace mutation |
@@ -554,7 +553,11 @@ Concretely, in order:
      by everything that touches a group, so a copy taken before the work is a copy
      taken too early.
 
-7. **New inode chunks**, only when a test needs one.
+7. ~~**New inode chunks.**~~  Done, on a group with an empty inode tree, with
+   `xfs_repair -n` accepting the result.  Two things are still missing and are
+   listed above: inserting into a tree that is more than a single leaf needs a
+   split, which is refused rather than half-written; and the free slots' layout is
+   measured against repair rather than observed in an image XFS built.
 8. **File extension and holes** — both already work for the contiguous case;
    what remains is making them survive the allocator work above.
 9. **BMBT growth, truncate, directories**, in that order.
@@ -879,11 +882,12 @@ metadata — hand-editing is for tests whose subject *is* malformed metadata.
 | an extent can be added to a file, and the file grown | done |
 | a gap reads as zeroes | done |
 | an inode can be allocated from an existing chunk | done |
+| a new inode chunk can be allocated in a group that has none | done |
 | a metadata block can be taken for a live b-tree node, with the accounting XFS expects | done |
 | a metadata block that is no longer needed can be given back, to the list or to free space | done |
 | free space leaf merge and parent removal | done |
 | free space root collapse | not started |
-| a new inode chunk can be allocated | not started |
+| a new inode chunk can be allocated | done |
 | a file whose data fork is a B+tree can be written | not started |
 | files can be truncated and their blocks returned | not started |
 | files can be created, unlinked and renamed | not started |
