@@ -180,7 +180,16 @@ What is left in order:
    code resets, which keeps the model closed — a window that advanced past the end
    of the array would name a slot that is not there — and the choice is made in
    one place so it can be changed when it is established.
-3. **Root collapse.**  Leaf merging works — see below — but a root left with a
+3. **A free list block going back to ordinary free space.**  This is the one
+   blocking the empty-window test's repair check, and it is the mirror of the
+   operation that does exist.  The direction that exists takes a block off the
+   list and gives it to the trees; what is missing is taking a block *out of the
+   trees* into the free space when the list is not where it should go — and the
+   one case that needs it here is emptying a list that already holds something,
+   which is what a file system does when its free space is reorganised and this
+   code has no way to say.
+
+4. **Root collapse.**  Leaf merging works — see below — but a root left with a
    single child is not collapsed into it.  It cannot be reached yet, which is why
    it is not built: a parent always holds at least two children, the merge branch
    refuses to take the last one, and nothing else removes a node, so no interior
@@ -462,12 +471,16 @@ Concretely, in order:
    the array is a **corrupt** group and says so; nothing outside the window is
    read.
 
-2. ~~**The AGFL empty-window regression test.**~~  Done, on a real image, with
-   every claim except the repair check.  That one is recorded in the test rather
-   than asserted, because the image it operates on orphans the four blocks its
-   list had been holding — a side effect of setting the state up, not of the
-   operation — and asserting repair would demand a fix for that.  It is
-   outstanding, and the test says so at the place it would go.
+2. ~~**The AGFL empty-window regression test.**~~  Done, on a real image, and now
+   a round trip: two blocks taken out of ordinary free space, written as nodes,
+   and given back, with the trees, the list and the identity all checked.  The
+   repair check is the one claim still outstanding, and working out why took some
+   finding out: **it needs an operation this code does not have — a block coming
+   off the free list and going into ordinary free space.**  Every path from a group
+   to its own free space goes through `free_in_group`, whose policy is to put a
+   freed block on the list *first*, so a test cannot manufacture an honestly empty
+   list on an image whose list had something in it.  That is item 5 below, and it
+   is now the blocking one.
 
 3. ~~**The measured AGFL → b-tree transition.**~~  Done, for both of the places
    a block can come from, with the counters asserted.  See
@@ -489,8 +502,9 @@ Concretely, in order:
    a block that has been taken for a node but not yet linked into a tree is a
    state `xfs_repair` refuses, so "charged for" and "held by a tree" have to move
    in the same transaction, not one after the other.
-6. **Tree balancing.**  The occupancy rule is now measured rather than assumed,
-   by shrinking a real leaf and asking `xfs_repair`:
+6. ~~**Tree balancing.**~~  Done for the case that arises.  The occupancy rule is
+   measured rather than assumed, by shrinking a real leaf and asking
+   `xfs_repair`:
 
    ```text
    group 1's first bno leaf, 31 records, set to 30:

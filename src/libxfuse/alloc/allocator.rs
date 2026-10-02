@@ -1835,34 +1835,139 @@ mod t {
             assert_eq!(agf.length(), sb.sb_agblocks, "the header changed shape");
         }
 
-        // 8. `xfs_repair -n` -- the eighth thing this test has to prove -- is the
-        //    next piece of work and is not asserted yet, because it cannot be.
-        //    What it says about the image at this point is worth recording:
+        // 8. And the two blocks go back, which is what makes this a round trip
+        //    rather than a half-finished operation.
+        //
+        //    They go on the free list, because the list is empty and so has room:
+        //    they came out of the trees, and a release puts them back on the list
+        //    rather than into the trees.  So the trees are two blocks shorter than
+        //    they were and the list holds two more, and the group's three terms add
+        //    up to what they added up to before -- which is the whole of what "back
+        //    where it started" means for a block that has changed hands twice.
+        for block in [taken, second] {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
+            store
+                .give_back_btree_block(block)
+                .expect("the block goes back");
+            tx.commit().expect("commit");
+        }
+        device.flush().unwrap();
+
+        for (label, by_block) in [("by-start", true), ("by-length", false)] {
+            assert_eq!(
+                free_blocks_in_group(image.path(), &sb, agno, by_block),
+                free_before
+                    .iter()
+                    .copied()
+                    .filter(|b| *b != taken && *b != second)
+                    .collect::<std::collections::HashSet<u32>>(),
+                "the {label} tree is not the free space it held, less the two blocks that came \
+                 out of it"
+            );
+        }
+        let (first, _, count, entries) = free_list_window(image.path(), &sb, agno);
+        assert_eq!(
+            entries,
+            vec![taken, second],
+            "the two blocks are not both on the free list, which is where an empty list with room \
+             puts them"
+        );
+        assert_eq!(
+            (first, count),
+            (0, 2),
+            "the list's window does not hold them"
+        );
+
+        // `xfs_repair -n` is the eighth thing this test has to prove and is still
+        // not asserted.  What it says at this point is worth keeping, and so is
+        // the reason it cannot be made to say anything else:
         //
         //    ```text
         //    agf_freeblks 30144, counted 30142 in ag 0
         //    sb_fdblocks 90624, counted 90618
         //    ```
         //
-        //    Read against the device-wide identity, `sb_fdblocks` is the sum over
-        //    the groups of free blocks, blocks the two free space trees own other
-        //    than their roots, and blocks reserved on a free list -- so the
-        //    90618 is 90275 + 325 + 18, where 90275 is the group's free blocks
-        //    with two taken out, 325 is the trees' block count, and 18 is the
-        //    lists' live entries with this group's four cleared.  Repair is
-        //    counting the same three terms this document measured, which is a
-        //    third independent confirmation of the identity.
+        // Read against `sb_fdblocks == sum(freeblks + btreeblks + flcount)`, the
+        // 90618 is 90275 + 325 + 18: the groups' free blocks with two taken out,
+        // the trees' block count, and the lists' live entries with this group's
+        // four cleared.  Repair counting the same three terms is a third
+        // confirmation, from the one tool that is neither this project nor the
+        // parser the numbers were first read with.
         //
-        //    So the image is inconsistent for two reasons, and only the first is
-        //    a defect in the code: the group took a block out of its trees and
-        //    left `agf_freeblks` alone, which is the ownership transition this
-        //    test is one step ahead of; and clearing the window orphaned the four
-        //    blocks the list had been holding, which is an artefact of setting
-        //    the state up and would not happen in a file system that had
-        //    reached the state honestly.  Asserting repair here would either
-        //    freeze the first or demand a repair for the second, so neither is
-        //    asserted; both are fixed or removed by the accounting change, and
-        //    this test is what will hold it to them.
+        // Two things stand between this image and a repair that accepts it, and
+        // neither is the empty-window path:
+        //
+        //   * `agf_freeblks` is the caller's to refresh.  `allocate_in_group` and
+        //     `free_in_group` both recompute a group's free space from its trees
+        //     once their own work on them is done; this test asks one question of
+        //     the allocator and is not a caller of anything, so the number is
+        //     still the one it started at.
+        //
+        //   * The four blocks the window was cleared over are in **no** term at
+        //     all.  They were reserved on the list, and the test took the
+        //     reservation away without giving them back, so the superblock's total
+        //     is four more than the sum of the terms -- and that is the whole of
+        //     the 90624 against 90620.  A file system that reached an empty list
+        //     honestly would have those four blocks back in its free space.
+        //
+        // Putting them back needs an operation this code does not have: **a block
+        // coming off the free list and going into ordinary free space**.  Every
+        // path from a group to its own free space goes through `free_in_group`,
+        // whose policy is to put a freed block on the list *first*, so there is
+        // nothing to ask that would move a block the other way.  That is the next
+        // item in the write-support plan, and until it exists a test cannot
+        // manufacture an honestly empty list on an image whose list had something
+        // in it.
+        // And the identity, read off the headers rather than through
+        // `group_terms`, because that helper also insists the group's free count
+        // matches its tree's -- which is exactly the counter this test is not
+        // refreshing, and insisting on it here would be asserting the thing this
+        // comment says is not this test's business.
+        let bs = sb.sb_blocksize as usize;
+        let mut device_total = 0u64;
+        for ag in 0..sb.agcount() {
+            let mut header = vec![0u8; bs];
+            std::fs::File::open(image.path())
+                .unwrap()
+                .read_exact_at(&mut header, sb.ag_header_offset(ag, Sb::AGF_SECTOR))
+                .unwrap();
+            let (first, last, count) = (be32(&header, 40), be32(&header, 44), be32(&header, 48));
+            if count > 0 {
+                assert!(
+                    first <= last,
+                    "ag{ag}: window {first}..={last} is inside out"
+                );
+            }
+            device_total +=
+                u64::from(be32(&header, 52)) + u64::from(be32(&header, 60)) + u64::from(count);
+        }
+        assert_eq!(
+            device_total,
+            sb_of(image.path()).sb_fdblocks - 2,
+            "the three terms do not add up to the superblock minus what this test knows it broke"
+        );
+        // The gap is 2, and it is worth being exact about why, because 4 is the
+        // number one would expect and getting this wrong by two would hide a
+        // second mistake.  Two things are wrong, and they have opposite signs:
+        //
+        //   * the four blocks the window was cleared over are in no term at all,
+        //     which takes 4 off;
+        //   * `agf_freeblks` still counts the two blocks that are now on the list,
+        //     which puts 2 back.
+        //
+        // Refresh the summary a caller refreshes and the 2 goes away, leaving
+        // exactly the 4.  Both are the two things listed above, and neither is
+        // the empty-window path.
+        let tree_total: u32 = free_runs_in_group(image.path(), &sb, agno, true)
+            .iter()
+            .map(|r| r.len)
+            .sum();
+        assert_eq!(
+            tree_total, 30142,
+            "the group's tree is not two blocks shorter than it started, which is what the two \\
+             takes and no refresh would leave"
+        );
     }
 
     /// A window that claims entries the list does not hold is a corrupt group,
