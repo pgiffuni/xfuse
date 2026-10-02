@@ -98,9 +98,11 @@ kernel usually does not send `open`/`opendir` at all.
    journal.  There is no recovery from a torn write.
 2. A file's data fork must be a list of extents in the inode.  A file whose
    fork is a B+tree is refused with a message that says so.
-3. Only overwriting and extending are implemented.  There is no `create`, so a
-   write never has to make a new directory entry, and no `unlink`, so a write
-   never has to take a block away from a file.
+3. Overwriting, extending and truncating are implemented.  There is no `create`,
+   so a write never has to make a new directory entry, and no `unlink`, so a write
+   never has to take a whole file's blocks away at once.  `setattr` is honoured
+   only for a file's size; anything else it is asked to change is refused with
+   `ENOTSUP` rather than acknowledged and ignored.
 4. The reverse mapping tree, the reference count tree, the inode allocation
    group's new-chunk counters, and the log are not maintained.  A read-write
    mount refuses images that have features it cannot keep up to date.
@@ -203,7 +205,6 @@ What is left in order:
 | Leaf merge and parent removal |
 | Root collapse |
 | BMBT growth (inode btree interior nodes) |
-| Truncate, and freeing a file's data |
 | `create`, `unlink`, directory and namespace mutation |
 | Journal, log recovery, crash safety |
 | Real-time device allocation |
@@ -560,7 +561,26 @@ Concretely, in order:
    measured against repair rather than observed in an image XFS built.
 8. **File extension and holes** — both already work for the contiguous case;
    what remains is making them survive the allocator work above.
-9. **BMBT growth, truncate, directories**, in that order.
+9. **BMBT growth and directories**, in that order.  Truncate is done: a file made
+   shorter gives its blocks back, and `xfs_repair -n` accepts the image, which is
+   the first operation here judged end to end on a file the rest of the file
+   system can still find.
+
+   Two things it found, both of them things a shorter file gets wrong quietly:
+
+   * **A straddling extent has to be trimmed, not merely kept.**  The extent that
+     contains the new end loses its top; taking "where the file keeps to" as
+     `min(extent start, new end)` makes it the extent's *start*, so nothing is
+     trimmed and the whole extent goes back to the group — including the block the
+     file still reads from.  The file then names a block something else has been
+     given, and it looks fine: an extent longer than the file's size is legal, so
+     `xfs_repair` does not object either.
+
+   * **The test has to truncate strictly inside a run to catch it.**  Cutting back
+     to the file's original length lands the new end exactly on an extent
+     boundary, where nothing straddles and the bug above is invisible.  The first
+     version of the test did that, and passed with the bug in place.  Cutting to a
+     point inside the run the append added is what makes it fail.
 
 ---
 
@@ -885,11 +905,12 @@ metadata — hand-editing is for tests whose subject *is* malformed metadata.
 | a new inode chunk can be allocated in a group that has none | done |
 | a metadata block can be taken for a live b-tree node, with the accounting XFS expects | done |
 | a metadata block that is no longer needed can be given back, to the list or to free space | done |
+| a file can be made shorter, giving its blocks back | done |
 | free space leaf merge and parent removal | done |
 | free space root collapse | not started |
 | a new inode chunk can be allocated | done |
 | a file whose data fork is a B+tree can be written | not started |
-| files can be truncated and their blocks returned | not started |
+| files can be truncated and their blocks returned | done |
 | files can be created, unlinked and renamed | not started |
 | directories can be created and removed | not started |
 | the journal works, and recovery from a torn write | not started |

@@ -806,6 +806,66 @@ impl RawDinode {
         self.set_core_extents(&extents)
     }
 
+    /// Drop every part of the file's extents above `last_block`, and say which
+    /// image blocks are no longer the file's.
+    ///
+    /// This is the other half of [`RawDinode::add_extent`] and it is here rather
+    /// than in the caller for the same reason that one is: the extent list's
+    /// invariants live with the code that maintains them, and a caller that rebuilt
+    /// the records itself would have to know the shape of one to do it.
+    ///
+    /// Returns `(start block, length)` in **image** blocks, because that is what
+    /// the records name and what the caller has to hand back to the allocator --
+    /// and the caller is the only one that knows how a block number becomes a
+    /// group's.  An extent that straddles the boundary is trimmed rather than
+    /// dropped, and its kept part keeps the block it started at, because the file's
+    /// data does not move.
+    ///
+    /// Nothing is written: the caller decides when the new list is written, and it
+    /// writes the freed blocks before it does, so that an image on which the
+    /// transaction was abandoned is one in which nothing was given away.
+    pub fn drop_extents_above(&mut self, last_block: u64) -> FsResult<Vec<(u64, u32)>> {
+        let Some(extents) = self.core_extents() else {
+            return Err(FsError::invalid(
+                libc::ENOTSUP,
+                "a file whose extents are not in its inode",
+            ));
+        };
+        let mut kept: Vec<BmbtRec> = Vec::new();
+        let mut freed: Vec<(u64, u32)> = Vec::new();
+        for e in extents {
+            let end = e.br_startoff + e.br_blockcount;
+            if end <= last_block {
+                kept.push(e);
+                continue;
+            }
+            // How much of this extent is still the file's, and how much is not.
+            //
+            // Both come from the same number, and getting them from different ones
+            // is a bug worth naming: taking "where the file keeps to" as
+            // `min(start, last_block)` makes it the extent's *start* for a
+            // straddling extent, so nothing is trimmed off the front and the whole
+            // extent is given back -- including the block the file still reads
+            // from.  The file then goes on naming a block that something else has
+            // been given.
+            let kept_blocks = last_block.saturating_sub(e.br_startoff);
+            if kept_blocks > 0 {
+                let mut trimmed = e;
+                trimmed.br_blockcount = kept_blocks;
+                kept.push(trimmed);
+            }
+            let len = e.br_blockcount - kept_blocks;
+            if len > 0 {
+                freed.push((e.br_startblock + kept_blocks, len as u32));
+            }
+        }
+        if freed.is_empty() {
+            return Ok(freed);
+        }
+        self.set_core_extents(&kept)?;
+        Ok(freed)
+    }
+
     /// Where the attribute fork begins, in bytes, if there is one.
     pub fn attribute_fork_offset(&self) -> Option<usize> {
         match self.forkoff() {

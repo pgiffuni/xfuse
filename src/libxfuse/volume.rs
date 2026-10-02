@@ -75,6 +75,7 @@ use super::{
     sb::Sb,
     transaction::{CommitMode, Transaction, TransactionContext},
 };
+use crate::libxfuse::alloc::free_space::FreeRun;
 
 /// We must store the Superblock in a global variable.  This is unfortunate, and limits us to only
 /// opening one disk image at a time, but it's necessary in order to use information from the
@@ -136,6 +137,19 @@ impl Volume {
     /// is the right trade for a file system that is still experimental: being
     /// right is worth more here than being quick.
     const TTL_RW: Duration = Duration::ZERO;
+
+    /// Answer with the attributes of an inode the kernel has already looked up,
+    /// for the paths that have changed one and must say what it now is.
+    fn reply_attr_of(&mut self, ino: u64, reply: ReplyAttr) {
+        let ttl = self.ttl();
+        match self.open_files.get(&ino) {
+            Some(oi) => match oi.dinode.di_core.stat(ino) {
+                Ok(attr) => reply.attr(&ttl, &attr),
+                Err(e) => reply.error(e),
+            },
+            None => reply.error(libc::ENOENT),
+        }
+    }
 
     /// Open an image.
     ///
@@ -498,6 +512,136 @@ impl Volume {
         Ok(data.len() as u32)
     }
 
+    /// Shorten a file, giving the blocks it no longer covers back to the group
+    /// they came from.
+    ///
+    /// Growing is a different operation and not this one: a file made longer is
+    /// made longer by being written to, and a `truncate` that made it longer would
+    /// be inventing zeroed blocks nobody asked for.  So a request for a size at
+    /// or above the current one only moves the size, and the space between the old
+    /// end and the new one reads as zeroes because there is nothing there.
+    ///
+    /// Which is also the whole of what a sparse file is, so growing this way is
+    /// right rather than a shortcut: the blocks are not allocated and the extents
+    /// are not extended.
+    ///
+    /// The blocks that are given back are the ones whose *whole* extent is above
+    /// the new end, plus the tail of the extent that straddles it.  Which blocks
+    /// those are is decided from the inode's own extents, not from anything the
+    /// caller says, and the two spaces an extent names are converted carefully:
+    /// a file names image blocks and the allocator names blocks within a group,
+    /// and one used where the other belongs points at the right block in the
+    /// wrong group.
+    ///
+    /// Every count moves in the same transaction: the extents, the size, the
+    /// block count and the times, and the group's free space.  An inode that has
+    /// lost its extents but not its block count is what `xfs_repair` reports as
+    /// `bad nblocks`, and an inode that still lists an extent whose blocks have
+    /// been handed to something else is a file that reads another file's data.
+    fn truncate(&mut self, ino: u64, new_size: u64) -> FsResult<u32> {
+        use crate::libxfuse::alloc::allocator::free_in_group;
+        if !self.writable {
+            return Err(FsError::read_only("truncate"));
+        }
+        let sb = self.sb;
+        let blocksize = u64::from(sb.sb_blocksize);
+        let inode_size = sb.inode_size();
+        let xfs_ino = self.xfs_ino(ino);
+        let inode_offset = sb.inode_offset(xfs_ino);
+        let size = {
+            let oi = self
+                .open_files
+                .get_mut(&ino)
+                .ok_or_else(|| no_entry(b"an inode the kernel has not looked up"))?;
+            let dinode = &oi.dinode;
+            if !matches!(dinode.di_core.di_format, XfsDinodeFmt::Extents) {
+                return Err(FsError::invalid(
+                    libc::ENOTSUP,
+                    format!(
+                        "truncating a file whose extents are in a B+tree (data fork format {:?})",
+                        dinode.di_core.di_format
+                    ),
+                ));
+            }
+            u64::try_from(oi.dinode.fsize()).map_err(FsError::from)?
+        };
+        if new_size == size {
+            return Ok(0);
+        }
+        // A file made longer reads as zeroes past its old end and occupies no
+        // blocks for the space it does not have: nothing to do but the size.
+        if new_size > size {
+            let now = std::time::SystemTime::now();
+            let mut tx = self.begin();
+            let mut raw = RawDinode::from_bytes(tx.read_bytes(inode_offset, inode_size)?)?;
+            raw.set_size(new_size as i64);
+            raw.set_mtime(now);
+            raw.set_ctime(now);
+            raw.finalise();
+            tx.write_bytes(inode_offset, raw.as_bytes())?;
+            tx.commit()?;
+            self.device.invalidate();
+            let dinode = Dinode::from(self.device.by_ref(), &sb, xfs_ino);
+            if let Some(oi) = self.open_files.get_mut(&ino) {
+                oi.dinode = dinode;
+            }
+            return Ok(0);
+        }
+        let now = std::time::SystemTime::now();
+        let mut tx = self.begin();
+        let mut raw = RawDinode::from_bytes(tx.read_bytes(inode_offset, sb.inode_size())?)?;
+
+        // The last file block that still exists.  A file whose new size ends
+        // exactly on a block boundary has no last block, and `div_ceil` says so.
+        let last_block = new_size.div_ceil(blocksize);
+
+        // The extents above the new end go, and the blocks they named come back.
+        // `drop_extents_above` does the surgery and says which blocks that was,
+        // because the extent list's shape is not the caller's business.
+        //
+        // The two spaces an extent names are converted carefully: a file names
+        // image blocks and the allocator names blocks within a group, and a
+        // group-relative number used as an absolute one points at the right block
+        // in the *wrong group*.
+        let freed = raw.drop_extents_above(last_block)?;
+        let mask = u64::from(1u32 << sb.sb_agblklog) - 1;
+        let freed: Vec<(u32, FreeRun)> = freed
+            .into_iter()
+            .map(|(fsb, len)| {
+                (
+                    (fsb >> sb.sb_agblklog) as u32,
+                    FreeRun {
+                        start: (fsb & mask) as u32,
+                        len,
+                    },
+                )
+            })
+            .collect();
+
+        for (ag, run) in freed {
+            free_in_group(&mut tx, &sb, ag, run)?;
+        }
+        let blocks: u64 = raw
+            .core_extents()
+            .map(|extents| extents.iter().map(|e| e.br_blockcount).sum())
+            .unwrap_or(0);
+        raw.set_nblocks(blocks);
+        raw.set_size(new_size as i64);
+        raw.set_mtime(now);
+        raw.set_ctime(now);
+        raw.finalise();
+        tx.write_bytes(inode_offset, raw.as_bytes())?;
+        tx.commit()?;
+
+        self.device.invalidate();
+        self.device.set_bufsize(inode_size);
+        let dinode = Dinode::from(self.device.by_ref(), &sb, xfs_ino);
+        if let Some(oi) = self.open_files.get_mut(&ino) {
+            oi.dinode = dinode;
+        }
+        Ok(0)
+    }
+
     fn write_data(&mut self, ino: u64, offset: u64, data: &[u8]) -> FsResult<u32> {
         if !self.writable {
             return Err(FsError::read_only("write"));
@@ -801,6 +945,80 @@ impl Filesystem for Volume {
                 reply.error(e.errno())
             }
         }
+    }
+
+    /// Change a file's attributes.
+    ///
+    /// Only the size is honoured, and only as a truncation or a sparse extension:
+    /// everything else in a `setattr` -- the mode, the owner, the times -- is a
+    /// thing this file system does not do yet, and saying so is better than
+    /// acknowledging the call and changing nothing.
+    ///
+    /// It answers `ENOTSUP` rather than `EOPNOTSUPP`'s more specific siblings so
+    /// that a caller which does not ask for anything specific is told plainly that
+    /// the operation is not available, rather than being left to guess which part
+    /// of it was refused.
+    fn setattr(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<std::time::SystemTime>,
+        fh: Option<u64>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
+        flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        // The kernel sends only the fields the caller actually asked to change, so
+        // a request that mentions one of them is a request for it.  Anything this
+        // file system does not do yet is refused rather than acknowledged and
+        // ignored, which would leave the caller believing something it did not get.
+        let mut refused = Vec::new();
+        for (asked, what) in [
+            (mode.is_some(), "the mode"),
+            (uid.is_some(), "the owner"),
+            (gid.is_some(), "the group"),
+            (flags.is_some(), "the flags"),
+            (atime.is_some(), "the access time"),
+            (mtime.is_some(), "the modification time"),
+            (_ctime.is_some(), "the status change time"),
+            (_crtime.is_some(), "the creation time"),
+            (_chgtime.is_some(), "the attribute change time"),
+            (_bkuptime.is_some(), "the backup time"),
+        ] {
+            if asked {
+                refused.push(what);
+            }
+        }
+        if !refused.is_empty() {
+            warn!(
+                "inode {ino}: cannot set {} yet; refusing the request",
+                refused.join(", ")
+            );
+            return reply.error(libc::ENOTSUP);
+        }
+        let Some(wanted) = size else {
+            let _ = fh;
+            return self.reply_attr_of(ino, reply);
+        };
+        let current = match self.open_files.get_mut(&ino) {
+            Some(oi) => oi.dinode.fsize() as u64,
+            None => return reply.error(libc::ENOENT),
+        };
+        if wanted != current {
+            if let Err(e) = self.truncate(ino, wanted) {
+                warn!("truncating inode {ino} to {wanted} failed: {e}");
+                return reply.error(e.errno());
+            }
+        }
+        self.reply_attr_of(ino, reply)
     }
 
     /// Called on every close of a file descriptor.  Nothing is left to do: each
