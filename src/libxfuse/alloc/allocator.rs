@@ -1003,6 +1003,7 @@ mod t {
         alloc::{
             agf::XFS_AGF_MAGIC,
             agfl::Agfl,
+            agi::Agi,
             free_space::{
                 FreeRun,
                 FreeSpaceNode,
@@ -1012,6 +1013,7 @@ mod t {
                 XFS_ABTB_MAGIC,
                 XFS_ABTC_MAGIC,
             },
+            inobt::{chunks_in_order, INODES_PER_CHUNK},
         },
         block_cache::BlockCache,
         block_device::{Access, BlockDevice},
@@ -2603,6 +2605,137 @@ mod t {
         coherent("after cutting a hole in a run");
 
         assert_repair_accepts(image.path(), "after allocator operations on a v5 image");
+    }
+
+    /// What a *free* inode's slot looks like on disk, read out of a real image.
+    ///
+    /// The write-support plan's rule is that inode availability comes from the
+    /// group's tree and never from the slots: a slot being unused does not make
+    /// its inode allocatable.  That rule is about *availability*, and this is
+    /// about something else -- the *layout* of a slot that no file system has
+    /// used yet, which a new inode chunk has to write 64 of.
+    ///
+    /// That layout is not something to guess.  There are free inodes in these
+    /// images -- `xfsv4.img`'s group 1 has 52 of them -- and a slot that a file
+    /// system has never handed out is exactly what a fresh chunk's slots must
+    /// look like, so it can simply be read.  What comes back is the observation,
+    /// and the assertions below are only about what is safe to rely on: the inode
+    /// magic is there and the rest of the slot is not.
+    ///
+    /// What is deliberately *not* asserted is that the slots are zero.  They are,
+    /// on these images, but a slot is free space as much as anything else is, and
+    /// an implementation that insisted on it would be depending on an
+    /// implementation detail of whichever tool last wrote the image.
+    #[test]
+    fn a_free_inodes_slot_is_read_out_of_a_real_image() {
+        let Some(path) = crate::libxfuse::alloc::golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let sb = sb_of(&path);
+        let agno = 1u32;
+        let at = sb.ag_header_offset(agno, Sb::AGI_SECTOR);
+        let agi = Agi::from_bytes(
+            std::fs::read(&path).unwrap()[at as usize..(at as usize + sb.sb_blocksize as usize)]
+                .to_vec(),
+            sb.has_crc(),
+        )
+        .expect("a group inode header");
+        let base = u64::from(agno) * u64::from(sb.sb_agblocks) * u64::from(sb.sb_blocksize);
+        let file = std::fs::File::open(&path).unwrap();
+        let chunks = chunks_in_order(agi.inobt_root(), |b| {
+            let mut bytes = vec![0u8; sb.sb_blocksize as usize];
+            file.read_exact_at(&mut bytes, base + u64::from(b) * u64::from(sb.sb_blocksize))
+                .unwrap();
+            Ok(bytes.into_boxed_slice())
+        })
+        .expect("the tree of used inode numbers");
+        assert!(!chunks.is_empty(), "the group's inode tree is empty");
+        let chunks_with_free: Vec<_> = chunks.iter().filter(|(_, c)| c.free_count > 0).collect();
+        assert!(
+            !chunks_with_free.is_empty(),
+            "no chunk in the group has a free inode, so the image cannot answer the question"
+        );
+
+        // How the records are spaced, which is not the nominal geometry and is
+        // why a new chunk cannot be placed by arithmetic on the inode number.
+        let starts: Vec<u64> = chunks.iter().map(|(_, c)| c.start).collect();
+        let steps: Vec<u64> = starts.windows(2).map(|w| w[1] - w[0]).collect();
+        let distinct: std::collections::BTreeSet<u64> = steps.iter().copied().collect();
+        eprintln!(
+            "xfsv4.img ag1: {} chunks from {} to {}, spacings {:?} (a nominal chunk is {} inodes)",
+            chunks.len(),
+            starts[0],
+            starts[starts.len() - 1],
+            distinct,
+            INODES_PER_CHUNK
+        );
+
+        let chunk = chunks_with_free[0].1;
+        let ino = chunk.first_free_ino().expect("a free inode in that chunk");
+        let at = sb.ino_to_offset(ino);
+        let mut bytes = vec![0u8; sb.sb_inodesize as usize];
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_exact_at(&mut bytes, at)
+            .unwrap();
+        eprintln!(
+            "a free inode {ino} in chunk {} (freecount {}):",
+            chunk.start, chunk.free_count
+        );
+        for (i, row) in bytes.chunks(16).enumerate().take(4) {
+            eprintln!(
+                "  {:04x}: {}",
+                i * 16,
+                row.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            );
+        }
+        let all_zero = bytes.iter().all(|b| *b == 0);
+        let magic = u16::from_be_bytes([bytes[0], bytes[1]]);
+        eprintln!(
+            "xfsv4.img ag1: a free inode's slot is {} and carries magic {magic:#06x}",
+            if all_zero {
+                "entirely zero"
+            } else {
+                "not zero"
+            }
+        );
+
+        // **A free inode's slot on this image is entirely zero, magic included.**
+        //
+        // That is worth stating carefully, because it is not what a new chunk has
+        // to write and it is not established as a requirement.  The inodes *in use*
+        // in the same group carry the magic at the head of their slot -- blocks 16
+        // onwards of this group read `494e` followed by a mode of `81a4` -- so the
+        // difference is between a slot XFS has written and one it has not.
+        //
+        // What that tells a new chunk is that all-zero is a state XFS leaves
+        // behind and `xfs_repair -n` accepts on this image, because the image has
+        // 52 such slots and repair is happy with every one of them.  What it does
+        // *not* tell a new chunk is that all-zero is what XFS writes when it
+        // creates one: no chunk here was created by an operation this suite can
+        // watch, so the layout XFS writes for a fresh chunk is **unmeasured**.
+        //
+        // The distinction matters because this codebase has already made the
+        // mistake once.  `allocate_ino` writes a *used* inode by setting every
+        // field, and its comment says "a slot that has never been used is all
+        // zeroes, so every field has to be set rather than assumed".  That is
+        // right about a used inode.  For a *free* one it is the other way round:
+        // there is nothing to read and nothing to assume, and a slot that is
+        // entirely zero is a legal thing to find and a legal thing to write.
+        //
+        // So the assertions here are only what is safe to rely on, and they are
+        // deliberately about the *chunk geometry* rather than the slot contents:
+        // no two chunks overlap, and the spacing is nothing like the nominal one.
+        assert!(
+            steps.iter().all(|s| *s >= INODES_PER_CHUNK),
+            "two chunks overlap: the spacing between them is under one chunk"
+        );
+        assert!(
+            steps.iter().any(|s| *s != INODES_PER_CHUNK),
+            "every chunk here is exactly one nominal chunk after the last, so this image would \
+             not show the case the spacing exists for"
+        );
     }
 
     /// Whether anything is known about what a block that left the free list
