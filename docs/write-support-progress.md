@@ -1128,6 +1128,34 @@ the leaf it is in -- and `agi_newino` does not move, because it names the chunk
 most recently *allocated as a chunk* rather than the inode most recently handed
 out.
 
+### The two images disagree about whether a chunk tracks its free inodes
+
+The inode b-tree's chunk record is `startino`, a free count, and a sixty-four bit
+mask of which of the chunk's inodes are free.  Both reference images have such
+records, and they say different things:
+
+```text
+xfsv4.img         1:[32,0,0]              ...  17:[2240,0,0]
+xfs_writable.img  1:[32,57,0xffffffffffffff80]
+```
+
+On the freshly made one the mask is there and its population count is the free
+count, which is the invariant checked throughout.  On the hand-built one **every
+chunk record claims to have no free inodes** while its group header says 622 are
+free, and the free ones are only discoverable by looking at the inode slots
+themselves.
+
+That is not something to work around by deciding which source to believe.  Which
+one the file system treats as the truth decides what an allocation has to write,
+and whether `xfs_repair` accepts the answer -- and the two images disagree, so one
+of them is telling us about a configuration the other is not.  The allocator
+therefore refuses rather than guessing, and the test that would judge the write
+with `xfs_repair` is ignored with this on it.
+
+What is settled either way, and measured: the inode number decodes to the slot
+(`INO` + 136 for the free inode total, read out of the image rather than counted
+from a neighbouring field, which had been eight bytes out).
+
 ### Sibling links are structure, not navigation
 
 A B+tree block names the block on its left and the block on its right, and those

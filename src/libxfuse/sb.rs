@@ -299,6 +299,21 @@ impl Sb {
     /// made without checksums and a version 5 one differ here rather than in
     /// their version number.
     pub const FEATURES2: usize = 200;
+    /// Write a new count of the free blocks on the data device into the
+    /// superblock's bytes, fixing the checksum if this file system has one.
+    ///
+    /// The bytes are patched, not rebuilt.  The superblock is the first sector
+    /// of a block that the first group's headers share, and the parse above
+    /// deliberately threw away most of the fields it walked past, so writing
+    /// back what was parsed would mean writing back a superblock with the parts
+    /// nobody kept missing from it.  Patching one field in bytes that were read
+    /// off the image cannot do that.
+    /// Where the count of free inodes sits in the superblock's bytes.
+    ///
+    /// Measured rather than counted: the field's place in the parse and the
+    /// field's place in the bytes are two different things, and counting from a
+    /// neighbouring field put it eight bytes out on both reference images.
+    pub const IFREE: usize = 136;
     /// How many inodes the format allocates and tracks at a time.
     ///
     /// Sixty-four, for every file system, which is why a chunk is not a fixed
@@ -534,15 +549,41 @@ impl Sb {
         self.sb_flags & constants::XFS_SBF_READONLY != 0
     }
 
-    /// Write a new count of the free blocks on the data device into the
-    /// superblock's bytes, fixing the checksum if this file system has one.
+    /// Move the count of free inodes down by a number of allocations.
     ///
-    /// The bytes are patched, not rebuilt.  The superblock is the first sector
-    /// of a block that the first group's headers share, and the parse above
-    /// deliberately threw away most of the fields it walked past, so writing
-    /// back what was parsed would mean writing back a superblock with the parts
-    /// nobody kept missing from it.  Patching one field in bytes that were read
-    /// off the image cannot do that.
+    /// This is the sum of the groups' free inode counts, checked exactly on both
+    /// reference images, so it moves when a group does and there is no separate
+    /// term to decide on -- unlike the free *block* total, which does not match
+    /// the sum of its groups and is recorded as unresolved.
+    ///
+    /// Patched in the bytes rather than rebuilt from the struct, for the same
+    /// reason as the block count: the struct threw away most of what it read.
+    pub fn patch_ifree(bytes: &mut [u8], lower_by: u64) -> FsResult<u64> {
+        if bytes.len() < Self::IFREE + 8 {
+            return Err(FsError::Corrupt {
+                what: "the superblock is too short to hold a free inode count".into(),
+            });
+        }
+        let now = BigEndian::read_u64(&bytes[Self::IFREE..Self::IFREE + 8]);
+        let next = now.checked_sub(lower_by).ok_or_else(|| FsError::Corrupt {
+            what: format!("the file system claims {now} free inodes and {lower_by} went"),
+        })?;
+        BigEndian::write_u64(&mut bytes[Self::IFREE..Self::IFREE + 8], next);
+        if bytes.len() >= Self::BCRC + 4 && BigEndian::read_u32(&bytes[0..]) == XFS_SB_MAGIC {
+            let bcrc = Self::BCRC;
+            bytes[bcrc..bcrc + 4].fill(0);
+            const CASTAGNOLI: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
+            let mut digest = CASTAGNOLI.digest();
+            digest.update(&bytes[..bcrc]);
+            digest.update(&[0u8; 4]);
+            if bytes.len() > bcrc + 4 {
+                digest.update(&bytes[bcrc + 4..]);
+            }
+            LittleEndian::write_u32(&mut bytes[bcrc..], digest.finalize());
+        }
+        Ok(next)
+    }
+
     pub fn patch_fdblocks(bytes: &mut [u8], free: u64) -> FsResult<()> {
         if bytes.len() < Self::BCRC + 4 {
             return Err(FsError::Corrupt {
