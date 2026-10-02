@@ -2478,6 +2478,133 @@ mod t {
         seen
     }
 
+    /// The same operations, on a version 5 image with checksums.
+    ///
+    /// Every other mutating test here works on `xfsv4.img`, which has no
+    /// checksums and short b-tree headers.  So the version 5 write path — the
+    /// 56-byte block headers, the owner and the file system identifier inside
+    /// them, the checksum recomputation on every block this code rewrites, and the
+    /// free list's own header and checksum — has never been run against a real
+    /// image, let alone against `xfs_repair`.  A v5 image this code wrote could be
+    /// wrong in a dozen ways and nothing would have noticed, because the image
+    /// that every mutating test touches cannot express any of them.
+    ///
+    /// `xfs_4kn.img` is exactly the missing case: 4 KiB blocks, so a different
+    /// record capacity from the 512-byte image everything else uses, *and* the
+    /// checksum feature on.  The sequence is the one the version 4 test runs, so
+    /// the two are directly comparable: allocate, give a run back, take a b-tree
+    /// node, cut a hole in a run, with the accounting oracle asked after each step
+    /// and repair asked at the end.
+    ///
+    /// The fourth step frees the block it just allocated rather than one it found,
+    /// so that nothing here is a free of a block a file still owns — which repair
+    /// notices, and which the version 4 test has to work around by never freeing
+    /// anything it did not allocate.
+    #[test]
+    fn the_same_operations_on_a_version_5_image_with_checksums() {
+        let Some(image) = copy_of_golden("xfs_4kn.img") else {
+            eprintln!("skipping: no unpacked xfs_4kn.img");
+            return;
+        };
+        let sb = sb_of(image.path());
+        assert!(
+            sb.has_crc(),
+            "this test is about the checksum path and the image has the feature off"
+        );
+        assert_eq!(
+            sb.sb_blocksize, 4096,
+            "and about a block size nothing else uses"
+        );
+        let agno = 0u32;
+        let device = Arc::new(BlockDevice::open(image.path(), Access::ReadWrite).unwrap());
+        let mut cache = BlockCache::new(sb.sb_blocksize as usize, 256);
+
+        let coherent = |what: &str| {
+            let mut total = 0u64;
+            for ag in 0..sb.agcount() {
+                let (f, t, l) = group_terms(image.path(), &sb, ag, what);
+                total += f + t + l;
+            }
+            assert_eq!(
+                total,
+                sb_of(image.path()).sb_fdblocks,
+                "{what}: the device-wide identity does not hold"
+            );
+        };
+
+        coherent("before anything");
+
+        // 1. A run for a file, and back again: the allocation and its reverse,
+        //    on a file system where every rewritten block carries a checksum.
+        let run = {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let run = allocate(&mut tx, &sb, agno, 8).expect("the group can spare eight blocks");
+            tx.commit().expect("commit");
+            run
+        };
+        device.flush().unwrap();
+        coherent("after allocating eight blocks");
+
+        {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            free_in_group(&mut tx, &sb, agno, run).expect("give the run back");
+            tx.commit().expect("commit");
+        }
+        device.flush().unwrap();
+        coherent("after giving the run back");
+
+        // 2. A b-tree node off the free list, and then back onto it.  This writes
+        //    the free list and the group header twice over, both of which have
+        //    checksums, and the node itself is a b-tree block, which has one too.
+        //    It is given back because a node that has been taken and not linked is
+        //    not a file system: `xfs_repair` says `agf_btreeblks 1, counted 0`, the
+        //    header charging for a block no tree holds.
+        {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
+            let block = store.take_btree_block().expect("the list has an entry");
+            store
+                .put(
+                    block,
+                    leaf(XFS_ABTB_MAGIC, &[(block, 1)]).into_boxed_slice(),
+                )
+                .expect("write the node");
+            tx.commit().expect("commit");
+            device.flush().unwrap();
+            coherent("with a b-tree node taken and not yet linked");
+
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
+            let went = store
+                .give_back_btree_block(block)
+                .expect("the block goes back");
+            tx.commit().expect("commit");
+            assert_eq!(
+                went,
+                WhereTheBlockWent::ToTheFreeList,
+                "the list had room, so the block went back onto it"
+            );
+        }
+        device.flush().unwrap();
+        coherent("after taking a b-tree node off the list and putting it back");
+
+        // 3. Cut a hole in a run, which is the operation most likely to split a
+        //    leaf and so the most likely to write a block whose checksum matters.
+        {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let block = allocate(&mut tx, &sb, agno, 1).expect("a block to free");
+            tx.commit().expect("commit");
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            free_in_group(&mut tx, &sb, agno, block).expect("free it again");
+            tx.commit().expect("commit");
+            eprintln!("freed {block:?} back out of the run it came from");
+        }
+        device.flush().unwrap();
+        coherent("after cutting a hole in a run");
+
+        assert_repair_accepts(image.path(), "after allocator operations on a v5 image");
+    }
+
     /// Whether anything is known about what a block that left the free list
     /// became — which is the "AGFL → ordinary free space" question the write
     /// support plan asks — and the answer is: **almost nothing, and less than
