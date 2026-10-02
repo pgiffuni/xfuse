@@ -125,6 +125,132 @@ impl<'a, 't, 's> TransactionBlocks<'a, 't, 's> {
                 FsError::invalid(libc::EFBIG, "a block number past the end of the image")
             })
     }
+
+    /// Give a block that was taken for a b-tree node back, to the free list if
+    /// the list has room and to the group's own free space if it does not.
+    ///
+    /// This is [`take_btree_block`](Self::take_btree_block) backwards, and the
+    /// caller is the same: a leaf that has been merged away, leaving a block that
+    /// is no longer part of any tree.  The caller has already unlinked it, so what
+    /// this decides is only *where it goes*, and the two answers move different
+    /// counters:
+    ///
+    /// | where it goes | `flcount` | `agf_btreeblks` | `agf_freeblks` | `sb_fdblocks` |
+    /// |:--------------|:----------|:-----------------|:----------------|:--------------|
+    /// | the free list  | +1 | **−1** | unchanged | unchanged |
+    /// | ordinary space | unchanged | **−1** | +1 | unchanged |
+    ///
+    /// `agf_btreeblks` comes down either way, because either way the block is no
+    /// longer one the trees hold.  Which of the other two moves depends on whether
+    /// the list had room, and that is the only question this asks the list -- it
+    /// does not decide the block's destination by preference.  The superblock's
+    /// total is unmoved on both branches, because the block trades the b-tree term
+    /// for the list's or for the free space term and never leaves the identity.
+    ///
+    /// ## Why the fallback is not free of consequences
+    ///
+    /// Putting a block into the free space trees can *add* a record, and adding a
+    /// record to a full leaf needs a new node -- which is the thing that has just
+    /// been given back.  Taking a block could not recurse for exactly that reason,
+    /// and this can.  In practice it does not, because the list is stocked with
+    /// blocks being freed before it is ever emptied -- that is what
+    /// [`free_in_group`] does -- so the branch below is reached only by a group
+    /// whose list is full, which is a group whose list was stocked and then
+    /// consumed by a great many splits.  That is a real constraint rather than a
+    /// solved problem: a group that reaches this branch and then needs a node has
+    /// nothing left to take one from, and the honest answer there is `ENOSPC`
+    /// rather than a recursion.
+    ///
+    /// Returns where the block went, so a caller that has to say so can.
+    pub fn give_back_btree_block(&mut self, block: u32) -> FsResult<WhereTheBlockWent> {
+        let mut agf = read_agf(self.transaction, self.sb, self.agno)?;
+        if u64::from(block) >= u64::from(self.sb.sb_agblocks) {
+            return Err(FsError::corrupt(format!(
+                "block {block} cannot belong to group {}",
+                self.agno
+            )));
+        }
+        let at = self.sb.ag_header_offset(self.agno, Sb::AGFL_SECTOR);
+        let mut agfl = Agfl::from_bytes(
+            self.transaction
+                .read_bytes(at, self.blocksize)
+                .map_err(|_| FsError::corrupt("the group free list could not be read"))?,
+            self.sb.has_crc(),
+        )?;
+        let mut window = agfl.window(
+            agf.free_list_first(),
+            agf.free_list_last(),
+            agf.free_list_count(),
+        );
+        let charged = agf.btree_blocks();
+        if charged == 0 {
+            return Err(FsError::corrupt(format!(
+                "group {} is charged no b-tree blocks, so block {block} is not one of its nodes",
+                self.agno
+            )));
+        }
+        agf.set_btree_blocks(charged - 1);
+
+        match agfl.give_back(&mut window, block) {
+            Ok(window) => {
+                // On the list.  Nothing enters the free space trees, so
+                // `agf_freeblks` does not move and neither does the superblock's
+                // total: the block is accounted for by the list's term now
+                // instead of the b-tree term.
+                agfl.update_crc();
+                self.transaction.write_bytes(at, agfl.as_bytes())?;
+                agf.set_free_list_window(window.first, window.last, window.count);
+                write_agf(self.transaction, self.sb, self.agno, &mut agf)?;
+                Ok(WhereTheBlockWent::ToTheFreeList)
+            }
+            Err(FsError::NoSpace) => {
+                // The list is full.  The block goes back to ordinary free space
+                // instead, which moves the free space term rather than the list's.
+                //
+                // Nothing was written to the list when it refused, so it needs no
+                // undoing.  The header is written once, at the end, with the
+                // window the list reports -- which is the one thing the caller
+                // must not carry a stale copy of, because a split between here and
+                // wherever this is called from may have moved it.
+                let geometry = GroupGeometry::new(self.sb.sb_agblocks, self.sb.has_crc(), true);
+                let by_length = GroupGeometry::new(self.sb.sb_agblocks, self.sb.has_crc(), false);
+                let (by_block_root, by_size_root) = free_in_both_trees(
+                    self,
+                    geometry,
+                    agf.block_btree_root(),
+                    by_length,
+                    agf.extent_btree_root(),
+                    FreeRun {
+                        start: block,
+                        len:   1,
+                    },
+                )?;
+                let mut space = FreeSpace::new(self, geometry, by_block_root, by_size_root);
+                let (free, longest) = space.summaries()?;
+                // The heights are read back off the new roots rather than assumed,
+                // so the header records what the trees are.
+                let block_level = u32::from(
+                    crate::libxfuse::alloc::free_space::read_node(self, geometry, by_block_root)?
+                        .level(),
+                ) + 1;
+                let size_level = u32::from(
+                    crate::libxfuse::alloc::free_space::read_node(self, by_length, by_size_root)?
+                        .level(),
+                ) + 1;
+                let free = u32::try_from(free).map_err(|_| FsError::Corrupt {
+                    what: "a group claims more free blocks than a file system can hold".into(),
+                })?;
+                agf.set_free_blocks(free);
+                agf.set_longest_free(longest);
+                agf.set_block_btree(by_block_root, block_level);
+                agf.set_extent_btree(by_size_root, size_level);
+                agf.set_free_list_window(window.first, window.last, window.count);
+                write_agf(self.transaction, self.sb, self.agno, &mut agf)?;
+                Ok(WhereTheBlockWent::ToFreeSpace)
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl<'a, 't, 's> GroupBlocks for TransactionBlocks<'a, 't, 's> {
@@ -314,6 +440,29 @@ impl<'a, 't, 's> GroupBlocks for TransactionBlocks<'a, 't, 's> {
 
     fn put(&mut self, block: u32, bytes: Box<[u8]>) -> FsResult<()> {
         self.transaction.write_bytes(self.offset_of(block)?, &bytes)
+    }
+}
+
+/// Where a metadata block that was no longer needed was put.
+///
+/// The free list is not an infinite queue, so a released block has two possible
+/// destinations and the caller sometimes has to know which was taken -- to say so
+/// in an error, or because the two of them are not interchangeable afterwards.
+/// See [`TransactionBlocks::give_back_btree_block`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WhereTheBlockWent {
+    /// On the group's free list, which has room.
+    ToTheFreeList,
+    /// Into the group's ordinary free space, because the list was full.
+    ToFreeSpace,
+}
+
+impl std::fmt::Display for WhereTheBlockWent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WhereTheBlockWent::ToTheFreeList => f.write_str("the group free list"),
+            WhereTheBlockWent::ToFreeSpace => f.write_str("the group's own free space"),
+        }
     }
 }
 
@@ -829,6 +978,7 @@ mod t {
         GroupBlocks,
         GroupGeometry,
         TransactionBlocks,
+        WhereTheBlockWent,
     };
     use crate::libxfuse::{
         alloc::{
@@ -1917,6 +2067,325 @@ mod t {
             "ag{agno}: entry {taken} off the list; window ({first},{last},{count}) -> \
              ({f},{l},{c}); freeblks {free_before} -> {}; btreeblks {tree_before} -> {}",
             after.0, after.1
+        );
+    }
+
+    /// Where a metadata block that was taken for a node goes back to, on a real
+    /// image, and what the counters do.
+    ///
+    /// The reverse of `taking_a_list_entry_moves_the_header_to_the_trees`, and
+    /// the two answers move different counters, which is the whole reason the
+    /// free list is not an infinite queue:
+    ///
+    /// | where it goes | `flcount` | `agf_btreeblks` | `agf_freeblks` | `sb_fdblocks` |
+    /// |:--------------|:----------|:-----------------|:----------------|:--------------|
+    /// | the free list  | +1 | −1 | unchanged | unchanged |
+    /// | ordinary space | unchanged | −1 | +1 | unchanged |
+    ///
+    /// Both branches are checked as a round trip -- take a block for a node, then
+    /// give it back -- because that is the only way to end in a state a file
+    /// system can be *left* in, and a state a file system can be left in is the
+    /// only one `xfs_repair` will accept.  The intermediate state, a node that is
+    /// charged for and held by no tree, is the one the previous commit established
+    /// is not a file system at all.
+    ///
+    /// The second branch is reached by filling the list, which is done the way the
+    /// group does it -- by freeing blocks, so the list is stocked with blocks the
+    /// group is honestly offering.
+    #[test]
+    fn a_node_released_goes_to_the_list_or_to_free_space() {
+        let Some(image) = copy_of_golden("xfsv4.img") else {
+            eprintln!("skipping: no xfsv4.img to copy");
+            return;
+        };
+        let sb = sb_of(image.path());
+        let agno = 0u32;
+        let device = Arc::new(BlockDevice::open(image.path(), Access::ReadWrite).unwrap());
+        let mut cache = BlockCache::new(sb.sb_blocksize as usize, 256);
+
+        // This group's own three terms, and the whole image's, since the
+        // identity is device wide and only one group is being changed.
+        let terms = |what: &str| {
+            let mut device_total = 0u64;
+            for ag in 0..sb.agcount() {
+                let (f, t, l) = group_terms(image.path(), &sb, ag, what);
+                device_total += f + t + l;
+            }
+            assert_eq!(
+                device_total,
+                sb_of(image.path()).sb_fdblocks,
+                "{what}: the device-wide identity does not hold"
+            );
+            let (f, t, l) = group_terms(image.path(), &sb, agno, what);
+            (f, t, l)
+        };
+
+        // The stronger claim, that the trees hold exactly what the header is
+        // charged for, is asked only of the states a file system can be *left*
+        // in: not of the one with a node taken and not yet linked, which is a
+        // real intermediate state of a split and not a file system.
+        let coherent = |what: &str| {
+            assert_trees_own_what_is_charged(image.path(), &sb, agno, what);
+        };
+
+        let before = terms("before anything");
+        coherent("before anything");
+
+        // --- the list has room ---
+        //
+        // The window is read off the image rather than out of the taking
+        // transaction, because what is wanted is where the window was *before*.
+        let window_before = {
+            let w = free_list_window(image.path(), &sb, agno);
+            (w.0, w.1, w.2, w.3)
+        };
+        assert!(
+            window_before.2 > 0,
+            "the image's list is empty, so there is nothing to take"
+        );
+        let taken = {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
+            let block = store.take_btree_block().expect("the list has an entry");
+            store
+                .put(
+                    block,
+                    leaf(XFS_ABTB_MAGIC, &[(block, 1)]).into_boxed_slice(),
+                )
+                .expect("write the node");
+            tx.commit().expect("commit");
+            block
+        };
+        device.flush().unwrap();
+        let mid = terms("with a node taken and not yet linked");
+        assert_eq!(
+            mid.1,
+            before.1 + 1,
+            "taking a node is one more block the trees are charged for"
+        );
+        let window_mid = free_list_window(image.path(), &sb, agno);
+        assert_eq!(
+            (window_mid.0, window_mid.1, window_mid.2),
+            (window_before.0 + 1, window_before.1, window_before.2 - 1),
+            "the window did not move past the entry that was taken"
+        );
+
+        let where_to = {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
+            let where_to = store
+                .give_back_btree_block(taken)
+                .expect("the block goes back");
+            tx.commit().expect("commit");
+            where_to
+        };
+        device.flush().unwrap();
+
+        assert_eq!(
+            where_to,
+            WhereTheBlockWent::ToTheFreeList,
+            "the list had room, so the block goes on it"
+        );
+        let after = terms("after the node was given back to the list");
+        coherent("after the node was given back to the list");
+        assert_eq!(
+            after, before,
+            "a round trip through the list has to leave the three terms as they were"
+        );
+        //
+        // The window after the round trip is the same window with one entry
+        // removed from the front and the same block at the back, which is what a
+        // queue does: the count is where it started, and the block is at the other
+        // end of the line from where it was.
+        let (f, l, c, entries) = free_list_window(image.path(), &sb, agno);
+        let mut want = window_before.3.clone();
+        want.remove(0);
+        want.push(taken);
+        assert_eq!(
+            entries, want,
+            "the list is not the queue the window describes"
+        );
+        assert_eq!(
+            (f, l, c),
+            (window_before.0 + 1, window_before.1 + 1, window_before.2),
+            "the window did not come back to its size with the block at the back of it"
+        );
+        assert_eq!(
+            entries.len(),
+            window_before.3.len(),
+            "a take and a give back leaves the list the size it was"
+        );
+        assert_repair_accepts(
+            image.path(),
+            "after a node was taken and given back to the list",
+        );
+
+        // --- the list fills up, so a block has to go to ordinary free space ---
+        //
+        // Filling it by freeing blocks the group is honestly offering, which is
+        // what `free_in_group` does and the reason the list exists.  A run rather
+        // than single blocks, because the list holds well over a hundred entries
+        // and one at a time would take a minute of transactions to prove a point
+        // about the last one.
+        //
+        // Stocking stops one slot short of full, and that turns out to matter:
+        // `append_to_the_free_list` deliberately keeps a slot in hand, so the
+        // window's last stops at 126 in a 128-slot array and `give_back` -- which
+        // refuses at 127 -- has a slot to spare for ever.  **A list stocked only
+        // by freeing can therefore never be full**, which means the fallback
+        // branch below is reachable only by giving a block back, which is the one
+        // thing that writes to the list from anywhere else.  That is worth knowing
+        // before anything relies on the branch: it is not dead, but it is only
+        // alive because of the operation it belongs to.
+        let capacity = {
+            let mut bytes = vec![0u8; sb.sb_blocksize as usize];
+            std::fs::File::open(image.path())
+                .unwrap()
+                .read_exact_at(&mut bytes, sb.ag_header_offset(agno, Sb::AGFL_SECTOR))
+                .unwrap();
+            Agfl::from_bytes(bytes, sb.has_crc())
+                .expect("a free list")
+                .capacity()
+        };
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            assert!(
+                rounds < 12,
+                "the group ran out of free space before the list filled"
+            );
+            let window = free_list_window(image.path(), &sb, agno);
+            if capacity - window.1 <= 2 {
+                break;
+            }
+            let want = capacity - window.1 - 2;
+            // Take the run and give it back in two transactions, so the blocks
+            // really are allocated when they are freed: a free of a run that is
+            // already free is a no-op and stocks nothing.
+            let run = {
+                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let run = allocate(&mut tx, &sb, agno, want)
+                    .expect("the group can spare that many blocks");
+                tx.commit().expect("commit");
+                run
+            };
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            free_in_group(&mut tx, &sb, agno, run).expect("give the run back");
+            tx.commit().expect("commit");
+            device.flush().unwrap();
+            eprintln!(
+                "round {rounds}: freed {run:?}; window now {:?} of {capacity}",
+                {
+                    let w = free_list_window(image.path(), &sb, agno);
+                    (w.0, w.1, w.2)
+                }
+            );
+        }
+        let stocked = free_list_window(image.path(), &sb, agno);
+        {
+            let mut sorted = stocked.3.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                stocked.3.len(),
+                "stocking the list put the same block in it twice"
+            );
+            assert!(
+                !stocked.3.contains(&0),
+                "the list is holding block 0 after being stocked"
+            );
+        }
+
+        // Now take a node and give it back, repeatedly, until the list refuses.
+        let mut went = Vec::new();
+        for _ in 0..3 {
+            let taken = {
+                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
+                let block = store
+                    .take_btree_block()
+                    .expect("the list still has an entry");
+                store
+                    .put(
+                        block,
+                        leaf(XFS_ABTB_MAGIC, &[(block, 1)]).into_boxed_slice(),
+                    )
+                    .expect("write the node");
+                tx.commit().expect("commit");
+                block
+            };
+            device.flush().unwrap();
+            let before = terms("with the list full and a node taken");
+            let where_to = {
+                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
+                let where_to = store
+                    .give_back_btree_block(taken)
+                    .expect("the block goes back somewhere");
+                tx.commit().expect("commit");
+                where_to
+            };
+            device.flush().unwrap();
+            let after = terms("after the node was given back");
+            coherent("after the node was given back");
+            assert_eq!(
+                after.1 + 1,
+                before.1,
+                "the group was charged for the node and is not any more, either way"
+            );
+            match where_to {
+                WhereTheBlockWent::ToTheFreeList => {
+                    assert_eq!(
+                        after.2,
+                        before.2 + 1,
+                        "a block put on the list is one more live list entry"
+                    );
+                    assert_eq!(
+                        after.0, before.0,
+                        "a block put on the list is not free space as well"
+                    );
+                    assert!(
+                        !free_blocks_in_group(image.path(), &sb, agno, true).contains(&taken),
+                        "a block on the free list is also free space in a tree"
+                    );
+                }
+                WhereTheBlockWent::ToFreeSpace => {
+                    assert_eq!(
+                        after.0,
+                        before.0 + 1,
+                        "a block put into ordinary free space is one more free block"
+                    );
+                    assert_eq!(
+                        after.2, before.2,
+                        "a block that went to free space did not go on the list"
+                    );
+                    assert!(
+                        free_blocks_in_group(image.path(), &sb, agno, true).contains(&taken),
+                        "the block was sent to free space and free space does not hold it"
+                    );
+                    assert_eq!(
+                        free_blocks_in_group(image.path(), &sb, agno, true),
+                        free_blocks_in_group(image.path(), &sb, agno, false),
+                        "only one of the two trees got it"
+                    );
+                }
+            }
+            went.push(where_to);
+        }
+        eprintln!("three round trips against a nearly full list: {went:?}");
+        assert_eq!(
+            went,
+            vec![
+                WhereTheBlockWent::ToTheFreeList,
+                WhereTheBlockWent::ToFreeSpace,
+                WhereTheBlockWent::ToFreeSpace,
+            ],
+            "the list took the one slot stocking kept in hand and then had none left"
+        );
+        assert_repair_accepts(
+            image.path(),
+            "after nodes were given back to a full list and to ordinary free space",
         );
     }
 

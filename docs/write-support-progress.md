@@ -155,31 +155,34 @@ kernel usually does not send `open`/`opendir` at all.
 ### Blocked
 
 **Free space tree growth, because nothing can reach it yet.**  A split needs a
-metadata block, a metadata block now comes with the accounting XFS expects, and
-what is left is a way to make a leaf overflow on a real image.  The blocker used
-to be the accounting; that is measured and implemented in the AGFL → b-tree
-direction.  What is left behind it, in order:
+metadata block; metadata blocks now come and go with the accounting XFS expects,
+on both paths and in both directions.  What is left is a way to make a leaf
+overflow on a real image, which needs a file to give up its blocks — the
+truncate that is not built.
 
-1. **The reverse transition, b-tree → AGFL.**  A b-tree block that no longer
-   needs to exist is released.  Nothing implements this, so a b-tree that has
-   grown can only grow.  The three-term identity says the block trades back
-   (`btreeblks −1`, `flcount +1`, `sb_fdblocks` unchanged) but, exactly as in the
-   forward direction, that is a relationship between two states and not a
-   measurement of one operation.
-2. **A free list that is full.**  A block that wants to go back to the list has
-   nowhere to go once the window covers the array.  `Agfl::give_back` already
-   refuses rather than overwriting an entry or running the window past the
-   array, and the caller is expected to send the block to ordinary free space
-   instead — but the caller that does so does not exist yet, and the identity
-   says what the two branches have to do to the counters: `btreeblks −1` either
-   way, `flcount +1` only on the list branch, `freeblks +1` only on the other.
-3. **Whether an emptied window resets to zero or wraps.**  XFS's own group
-   rebuild reset both windows to start at zero, but the hand-built image's
-   groups 1 and 3 sit at 85 and 26, which is evidence that a window does not
-   always go back to zero.  The current code resets, which keeps the model
-   closed — a window that advanced past the end of the array would name a slot
-   that is not there — and the choice is made in one place so it can be changed
-   when it is established.
+What is left in order:
+
+1. **Linking a node in.**  A block taken for a node is charged for the group
+   before it belongs to any tree, and `xfs_repair -n` refuses that state:
+
+   ```text
+   agf_btreeblks 1, counted 0 in ag 0
+   sb_fdblocks 90624, counted 90623
+   ```
+
+   It is the state between taking a node and linking it, which a split passes
+   through, so the fix is not to stop charging but to finish the operation: the
+   charge and the link have to be in the same transaction, which they are, and
+   the operation has to be finished, which nothing can yet do.
+2. **An emptied window: reset or wrap.**  XFS's own group rebuild reset both
+   windows to start at zero, but the hand-built image's groups 1 and 3 sit at 85
+   and 26, which is evidence that a window does not always go back to zero.  The
+   code resets, which keeps the model closed — a window that advanced past the end
+   of the array would name a slot that is not there — and the choice is made in
+   one place so it can be changed when it is established.
+3. **Leaf merge, parent removal, root collapse.**  `xfs_repair` refuses a leaf
+   below 31 records in a 512-byte block, so merging is required, and the released
+   node now has somewhere to go when a merge produces one.
 
 ### Not started
 
@@ -378,11 +381,37 @@ provoke and watch one incremental operation.  What is established is that the
 state either end of the operation is a state native XFS produces, which is what
 `xfs_repair` and the identity both agree on.
 
-The same identity says what the reverse has to do, and it is the next item: a
-b-tree block released to the list is `btreeblks −1`, `flcount +1`, and nothing
-else; released to ordinary free space because the list is full, it is
-`btreeblks −1`, `freeblks +1`, `flcount` unchanged, and `sb_fdblocks` unchanged
-either way.
+The reverse is in the same table, and it is the one with a choice in it:
+
+| a node is released to | `flcount` | `agf_btreeblks` | `agf_freeblks` | `sb_fdblocks` |
+|:----------------------|:----------|:-----------------|:----------------|:--------------|
+| the free list | +1 | **−1** | unchanged | unchanged |
+| ordinary free space, because the list is full | unchanged | **−1** | +1 | unchanged |
+
+`agf_btreeblks` comes down either way, because either way the block is no longer
+one the trees hold.  Which of the other two moves is not a preference — it is
+whether the list had room, and the free list is not an infinite queue.
+
+### A full free list is reachable only by giving back
+
+Worth writing down because it is not obvious and it makes a whole branch of the
+code nearly dead.
+
+`append_to_the_free_list` deliberately keeps a slot in hand: it stocks the list
+with blocks being freed and stops one short of the array's end.  So a list
+stocked only by freeing never fills — the window's `last` stops at 126 in a
+128-slot array — and `Agfl::give_back`, which refuses at 127, has a slot to spare
+for ever.  Measured on `xfsv4.img`: after stocking, three take-and-give-back
+round trips against that list go
+
+```text
+ToTheFreeList, ToFreeSpace, ToFreeSpace
+```
+
+so the list takes the one slot stocking kept in hand and then has none left.  The
+fallback branch is alive, but only because of the operation it belongs to, and
+anything that stocks the list more tightly than `free_in_group` does would make
+it unreachable.
 
 ---
 
@@ -439,8 +468,11 @@ Concretely, in order:
    a block can come from, with the counters asserted.  See
    [What a metadata block's ownership costs](#what-a-metadata-blocks-ownership-costs).
 
-4. **The reverse transition, b-tree → AGFL**, and the AGFL-full case, measured
-   before implemented.
+4. ~~**The reverse transition, b-tree → AGFL, and the AGFL-full case.**~~  Done
+   for the accounting, both branches, checked on a real image with `xfs_repair`
+   accepting the result.  What is still missing is the caller: nothing releases a
+   node, because nothing merges a leaf, because nothing can reach a leaf that
+   needs merging.
 
 5. ~~**The free-space consistency oracle.**~~  Done for the relationships that
    exist.  One check, asked of every group of every unpacked image and again
@@ -648,6 +680,7 @@ metadata — hand-editing is for tests whose subject *is* malformed metadata.
 | a gap reads as zeroes | done |
 | an inode can be allocated from an existing chunk | done |
 | a metadata block can be taken for a live b-tree node, with the accounting XFS expects | done |
+| a metadata block that is no longer needed can be given back, to the list or to free space | done |
 | free space leaf merge, parent removal, root collapse | not started |
 | a new inode chunk can be allocated | not started |
 | a file whose data fork is a B+tree can be written | not started |
