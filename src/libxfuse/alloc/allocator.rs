@@ -983,14 +983,17 @@ mod t {
     /// checked is what was actually written rather than what the cache still
     /// believes.  The roots come from the group header rather than being
     /// assumed, because a tree that has grown a level has a root this code did
-    /// not predict and a check against the wrong root says nothing.
+    /// not predict and a check against the wrong root says nothing.  The block
+    /// size comes from the superblock for the same reason: a 4 KiB file system
+    /// read at 512 bytes reads headers out of the middle of nodes.
     fn free_runs_in_group(
         image: &std::path::Path,
         sb: &Sb,
         agno: u32,
         by_block: bool,
     ) -> Vec<FreeRun> {
-        let mut header = vec![0u8; BS];
+        let bs = sb.sb_blocksize as usize;
+        let mut header = vec![0u8; bs];
         std::fs::File::open(image)
             .unwrap()
             .read_exact_at(&mut header, sb.ag_header_offset(agno, Sb::AGF_SECTOR))
@@ -1000,16 +1003,27 @@ mod t {
         } else {
             be32(&header, 20)
         };
-        free_runs_on_image(image, by_block, root)
+        free_runs_on_image(image, sb, agno, by_block, root)
     }
 
-    fn free_runs_on_image(image: &std::path::Path, by_block: bool, root: u32) -> Vec<FreeRun> {
+    fn free_runs_on_image(
+        image: &std::path::Path,
+        sb: &Sb,
+        agno: u32,
+        by_block: bool,
+        root: u32,
+    ) -> Vec<FreeRun> {
         // Walk the image directly, without a transaction, so that what is read
-        // is what was actually written.
+        // is what was actually written.  A tree's blocks are numbered within
+        // their group, so the group's own offset is part of the address --
+        // which is the other half of what made a check against group 2 or 3
+        // read a block at the start of the image.
+        let bs = sb.sb_blocksize as usize;
+        let base = u64::from(agno) * u64::from(sb.sb_agblocks) * bs as u64;
         let file = std::fs::File::open(image).unwrap();
         let read = |bno: u32| -> Vec<u8> {
-            let mut buf = vec![0u8; BS];
-            file.read_exact_at(&mut buf, u64::from(bno) * BS as u64)
+            let mut buf = vec![0u8; bs];
+            file.read_exact_at(&mut buf, base + u64::from(bno) * bs as u64)
                 .unwrap();
             buf
         };
@@ -1017,8 +1031,8 @@ mod t {
         let mut stack = vec![root];
         while let Some(bno) = stack.pop() {
             let bytes = read(bno);
-            let node =
-                FreeSpaceNode::from_bytes(bytes, false, by_block).expect("a node of the tree");
+            let node = FreeSpaceNode::from_bytes(bytes, sb.has_crc(), by_block)
+                .expect("a node of the tree");
             if node.is_leaf() {
                 out.extend(node.runs().expect("runs"));
             } else {
@@ -1746,6 +1760,219 @@ mod t {
                 "{label}: refusing a corrupt free list changed the image"
             );
         }
+    }
+
+    /// The live free list window of a group, as the header and the list block
+    /// together record it: the three header fields, and the blocks the window
+    /// names.
+    ///
+    /// The entries are read out of the array *by slot* rather than found, because
+    /// that is the whole point of the check they serve -- a slot the header names
+    /// is a slot the file system says it owns, whether or not a scan of the array
+    /// would have found anything there.  The list block is read through
+    /// [`Agfl::from_bytes`] rather than as raw bytes, so a list with a header
+    /// ahead of its array -- which is what a version 5 file system has and a
+    /// version 4 one does not -- is read from the right offset rather than from
+    /// the sequence number.
+    fn free_list_window(image: &std::path::Path, sb: &Sb, agno: u32) -> (u32, u32, u32, Vec<u32>) {
+        let bs = sb.sb_blocksize as usize;
+        let mut agf = vec![0u8; bs];
+        std::fs::File::open(image)
+            .unwrap()
+            .read_exact_at(&mut agf, sb.ag_header_offset(agno, Sb::AGF_SECTOR))
+            .unwrap();
+        let (first, last, count) = (be32(&agf, 40), be32(&agf, 44), be32(&agf, 48));
+        let mut bytes = vec![0u8; bs];
+        std::fs::File::open(image)
+            .unwrap()
+            .read_exact_at(&mut bytes, sb.ag_header_offset(agno, Sb::AGFL_SECTOR))
+            .unwrap();
+        let list = Agfl::from_bytes(bytes, sb.has_crc()).expect("a free list block");
+        let entries = if count == 0 {
+            Vec::new()
+        } else {
+            (first..=last).map(|i| list.entry(i)).collect()
+        };
+        (first, last, count, entries)
+    }
+
+    /// Every block a group's two free space trees occupy, counted once each.
+    ///
+    /// This is what `agf_btreeblks` is about, and the count that settles it is
+    /// *both* trees' blocks **less their two roots**: the roots are the blocks
+    /// the group header already names, so they are not charged to the count.
+    ///
+    /// Counted by walking, so a tree that has grown a level contributes every
+    /// node of every level.  A count worked out from the header's level field and
+    /// a block size would have been a formula fitted to one image.
+    fn count_free_space_btree_blocks(image: &std::path::Path, sb: &Sb, agno: u32) -> u32 {
+        let bs = sb.sb_blocksize as usize;
+        let mut header = vec![0u8; bs];
+        std::fs::File::open(image)
+            .unwrap()
+            .read_exact_at(&mut header, sb.ag_header_offset(agno, Sb::AGF_SECTOR))
+            .unwrap();
+        let file = std::fs::File::open(image).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for by_block in [true, false] {
+            let root = if by_block {
+                be32(&header, 16)
+            } else {
+                be32(&header, 20)
+            };
+            let mut stack = vec![root];
+            while let Some(block) = stack.pop() {
+                assert!(
+                    seen.insert(block),
+                    "ag{agno}: block {block} is in both free space trees"
+                );
+                let mut bytes = vec![0u8; bs];
+                file.read_exact_at(
+                    &mut bytes,
+                    u64::from(agno) * u64::from(sb.sb_agblocks) * bs as u64
+                        + u64::from(block) * bs as u64,
+                )
+                .unwrap();
+                let node = FreeSpaceNode::from_bytes(bytes, sb.has_crc(), by_block)
+                    .unwrap_or_else(|e| panic!("ag{agno} block {block}: {e}"));
+                if !node.is_leaf() {
+                    stack.extend(node.children().expect("children"));
+                }
+            }
+        }
+        seen.len() as u32
+    }
+
+    /// The accounting every group header keeps, checked against what the image
+    /// actually holds.
+    ///
+    /// These are the relationships the write path needs and used to assume.  Each
+    /// was measured against native XFS -- on this repository's images, and on one
+    /// `xfs_repair` rebuilt -- and each is stated here with the numbers it was
+    /// measured from, so that changing one has to be argued for rather than
+    /// absorbed:
+    ///
+    /// ```text
+    /// agf_freeblks  == the sum of the bno tree's record lengths
+    /// agf_btreeblks == the blocks both free space trees hold, less their roots
+    /// sb_fdblocks   == sum over groups of (freeblks + btreeblks + flcount)
+    /// ```
+    ///
+    /// The third is the one that was furthest off.  The old assumption was that
+    /// the superblock's free count is the sum of the groups' free counts, and on
+    /// `xfsv4.img` that is 90277 against a superblock saying 90624.  The 347 is
+    /// 325 of b-tree blocks plus 22 of free list entries -- the two other places
+    /// a free block can be accounted for.  The same 325+22, 0+16 and 0+16 split
+    /// on `xfs_writable.img` and `xfs_4kn.img` is what settled it, and
+    /// `xfs_repair -n` counts the same three terms independently.
+    ///
+    /// Nothing here writes.  This is the oracle the write path is measured
+    /// against, so it has to be true of an image nobody has touched -- and it is
+    /// the place a later change to any of the three has to be reconciled with.
+    #[test]
+    fn the_group_accounting_matches_what_the_image_holds() {
+        let mut checked = 0usize;
+        for name in ["xfsv4.img", "xfs_writable.img", "xfs_4kn.img"] {
+            let Some(path) = crate::libxfuse::alloc::golden(name) else {
+                eprintln!("skipping {name}: not unpacked");
+                continue;
+            };
+            let sb = sb_of(&path);
+            let mut free = 0u64;
+            let mut tree_blocks = 0u64;
+            let mut listed = 0u64;
+            for agno in 0..sb.agcount() {
+                let by_block = free_runs_in_group(&path, &sb, agno, true);
+                let by_size = free_runs_in_group(&path, &sb, agno, false);
+                assert_eq!(
+                    by_block, by_size,
+                    "{name} ag{agno}: the two trees do not hold the same free space"
+                );
+                // Sorted, and no two of them naming the same block.
+                for pair in by_block.windows(2) {
+                    assert!(
+                        pair[0].start + pair[0].len <= pair[1].start,
+                        "{name} ag{agno}: runs {:?} and {:?} overlap or touch",
+                        pair[0],
+                        pair[1]
+                    );
+                }
+                let mut header = vec![0u8; sb.sb_blocksize as usize];
+                std::fs::File::open(&path)
+                    .unwrap()
+                    .read_exact_at(&mut header, sb.ag_header_offset(agno, Sb::AGF_SECTOR))
+                    .unwrap();
+                assert_eq!(
+                    be32(&header, 52),
+                    by_block.iter().map(|r| r.len).sum::<u32>(),
+                    "{name} ag{agno}: the header's free count is not the bno tree's total"
+                );
+                assert_eq!(
+                    be32(&header, 56),
+                    by_block.iter().map(|r| r.len).max().unwrap_or(0),
+                    "{name} ag{agno}: the header's longest run is not the tree's"
+                );
+                let blocks = count_free_space_btree_blocks(&path, &sb, agno);
+                assert_eq!(
+                    be32(&header, 60) + 2,
+                    blocks,
+                    "{name} ag{agno}: the header's btree count is not the trees' block count less \
+                     their two roots"
+                );
+
+                // The free list: what it holds is reserved, so it is neither
+                // block 0 nor the null block, and it is not free space as well.
+                let (first, last, count, entries) = free_list_window(&path, &sb, agno);
+                if count == 0 {
+                    assert!(
+                        entries.is_empty(),
+                        "{name} ag{agno}: a window with no live entries named {entries:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        count as usize,
+                        entries.len(),
+                        "{name} ag{agno}: the window's count is not the span it names"
+                    );
+                    assert!(
+                        first <= last,
+                        "{name} ag{agno}: window {first}..={last} is inside out"
+                    );
+                    let free_set: std::collections::HashSet<u32> = by_block
+                        .iter()
+                        .flat_map(|r| r.start..r.start + r.len)
+                        .collect();
+                    for entry in &entries {
+                        assert_ne!(*entry, 0, "{name} ag{agno}: the list offers block 0");
+                        assert_ne!(
+                            *entry,
+                            crate::libxfuse::alloc::agf::NULL_AGBLOCK,
+                            "{name} ag{agno}: the list offers the null block"
+                        );
+                        assert!(
+                            !free_set.contains(entry),
+                            "{name} ag{agno}: block {entry} is on the free list and free space at \
+                             the same time"
+                        );
+                    }
+                }
+                free += u64::from(be32(&header, 52));
+                tree_blocks += u64::from(be32(&header, 60));
+                listed += u64::from(count);
+                checked += 1;
+            }
+            assert_eq!(
+                free + tree_blocks + listed,
+                sb.sb_fdblocks,
+                "{name}: the superblock's free count is not the groups' three terms"
+            );
+            eprintln!(
+                "{name}: free {free} + btree {tree_blocks} + listed {listed} = {} (sb_fdblocks {})",
+                free + tree_blocks + listed,
+                sb.sb_fdblocks
+            );
+        }
+        assert!(checked > 0, "no image was unpacked, so nothing was checked");
     }
 
     /// Freeing enough blocks to split a leaf leaves a coherent image, and the
