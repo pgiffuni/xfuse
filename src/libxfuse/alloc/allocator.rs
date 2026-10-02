@@ -354,75 +354,22 @@ pub fn allocate_in_group(
     })?;
     agf.set_free_blocks(free);
     agf.set_longest_free(longest);
+    // The b-tree roots are deliberately *not* written here.  A take shrinks a
+    // record rather than adding one, so an allocation cannot overflow a leaf,
+    // cannot split, and cannot move a root or consume a free list entry -- which
+    // is also why this does not need the re-read the free path does.  That is a
+    // property of taking, and it is recorded here rather than assumed: a take
+    // that ever gained a record would need the roots written and the header read
+    // again, and the two changes belong together.
     write_agf(transaction, sb, agno, &mut agf)?;
     Ok(Some(run))
 }
 
-/// Move blocks from the group's free space onto its free list, so the list has
-/// something in it.
-///
-/// The list is reserved space for growing the free space btrees, and it is
-/// stocked from the group's own free space: blocks are freed into the trees and
-/// some of them are then moved onto the list.  That is what makes a split able
-/// to get a node without reaching into the trees it is in the middle of
-/// changing -- and the group header, which is written once at the end of the
-/// operation, is no use for finding them part way through.
-///
-/// A block on the list is in neither of the two places `agf_freeblks` counts:
-/// not a free extent in the trees, and not yet a live node.  It is still the
-/// group's to use, just spoken for.
 /// The file system's identifier, which a free list written here must carry.
 fn uuid_of(agf: &Agf) -> [u8; 16] {
     agf.uuid()
 }
 
-/// **Not wired up, and not working.**  It was tried twice and taken back twice;
-/// this is the record of the second attempt, so the next one starts from facts
-/// rather than from the code.
-///
-/// What it got right: the window handling for a list that has never been written.
-/// Asking the list whether it has been written, and starting from an empty window
-/// when it has not, is what stops the header's stale window from naming entries
-/// that are all null.
-///
-/// What is wrong, from `xfs_repair -n` on a real image after taking two blocks
-/// and giving them back -- which is the same operation the passing tests do, so
-/// this is what stocking changed:
-///
-/// ```text
-/// bad agbno 1480672844 in agfl, agno 0
-/// bad agbno 0 in agfl, agno 0
-/// sb_fdblocks 90622, counted 90620
-/// ```
-///
-/// Two faults, and they are separate.  The entries written are not the blocks
-/// that were moved: one reads as a block number and the other as zero, so either
-/// they went to the wrong slots or `give_back` was handed a window that does not
-/// describe the array it is writing.
-///
-/// And the trees lost four more blocks than were freed.  Two were freed and two
-/// were stocked, so the trees should be back where they started at 90624 and the
-/// superblock with them; the trees read 90620 and the superblock 90622.  Both are
-/// short, and they disagree with each other by exactly the number stocked, which
-/// says the removal is happening twice over rather than once.
-///
-/// That is where this stopped.  It is a matter of `Agfl`'s window and of how the
-/// removal is sequenced, not of the idea -- stocking is still what the free list
-/// is for, and the refill that reaches for the group header mid-split is still
-/// blocked on roots that have not been written yet.
-#[allow(dead_code)]
-/// Put as many of a run as the free list has room for onto the free list, and
-/// say how many it took.
-///
-/// These blocks are **not** put in the free space trees at all.  The list exists
-/// to hold blocks that are the group's to use but are spoken for, and a block on
-/// it is in neither of the two places `agf_freeblks` counts: not a free extent,
-/// and not yet a live node.  Adding them to the trees and taking them back out
-/// arrives at the same numbers by two steps instead of one, and it is what made
-/// the superblock and the trees disagree by exactly the number stocked.
-///
-/// They come off the *end* of the run, so the list keeps the order the group
-/// would hand blocks out in.
 /// Say which part of a free a failure came from, since "NoSpace" alone does not.
 fn tag(e: FsError, step: &str) -> FsError {
     match &e {
@@ -431,6 +378,24 @@ fn tag(e: FsError, step: &str) -> FsError {
     }
 }
 
+/// Put as many of a run as the free list has room for onto the free list, and
+/// say how many it took.
+///
+/// The list is reserved space for growing the free space btrees, and it is
+/// stocked from the group's own free space.  These blocks are **not** put in the
+/// free space trees at all: a block on the list is in neither of the two places
+/// `agf_freeblks` counts -- not a free extent, and not yet a live node.  It is
+/// still the group's to use, just spoken for.
+///
+/// They come off the *end* of the run, so the list keeps the order the group
+/// would hand blocks out in.
+///
+/// The window is written to the group header here, before the tree work, because
+/// a split during that work takes an entry off the list and moves the window
+/// again -- so it has to be on disk before that happens, or the split would be
+/// looking at a window that does not include what was just appended.  The caller
+/// reads the header again before writing its own fields, because this is the
+/// second writer of the same bytes in one operation.
 fn append_to_the_free_list(
     transaction: &mut Transaction<'_>,
     sb: &Sb,
