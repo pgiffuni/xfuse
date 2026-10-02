@@ -508,6 +508,168 @@ fn a_write_past_the_end_grows_the_file() {
     });
 }
 
+/// A file that is made shorter gives its blocks back, and the image says so.
+///
+/// The oracle here is stronger than for the write tests, and deliberately so.
+/// A grown file on this image is still a file the rest of the file system can
+/// find, because it already had a directory entry; a *shortened* one is too, and
+/// that is what lets `xfs_repair -n` judge the result at all.  It cannot do the
+/// same for a newly allocated inode, which no directory points at and which
+/// repair therefore calls disconnected.
+///
+/// So this checks three things a write test cannot:
+///
+///   * the file is the size it was made, after a fresh read-only mount;
+///   * the blocks it gave up are free again -- checked with the image's own
+///     accounting, not by looking for particular numbers;
+///   * and `xfs_repair -n` accepts the image, which is the only thing here that
+///     can tell whether the inode's extents, its block count and the group's free
+///     space all describe the same file system.
+#[test]
+fn a_file_made_shorter_gives_its_blocks_back() {
+    require_fusefs!();
+    let image = writable_copy(&GOLDENV4, "truncate");
+    const GROWN: usize = 4096 * 4;
+    let before = with_rw_mount_at(&image, "truncate", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let size = std::fs::metadata(&file).unwrap().len() as usize;
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::End(0)).unwrap();
+        f.write_all(&[b'A'; GROWN]).unwrap();
+        drop(f);
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().len() as usize,
+            size + GROWN,
+            "the file did not grow"
+        );
+        size
+    });
+
+    // Now cut it back to a point **strictly inside** the run the append added.
+    //
+    // That is the case the arithmetic in `drop_extents_above` is about, and it is
+    // easy to miss: cutting back to the file's original length lands the new end
+    // exactly on an extent boundary, where the straddling extent is not straddling
+    // anything and the whole thing is correct by accident.  The first version of
+    // this test cut back to half the original size -- seven bytes, one block --
+    // and passed with a bug in place that gave away the file's own block, because
+    // seven bytes is not inside any extent.
+    let wanted = before + 1500;
+    let blocksize = 1usize
+        << xfs_db_field(&image, &["sb 0"], "blocklog")
+            .parse::<u32>()
+            .expect("the image's block size");
+    let held = |size: usize| size.div_ceil(blocksize);
+    let fdblocks_before = xfs_db_field(&image, &["sb 0"], "fdblocks");
+    let gave_up = held(before + GROWN) - held(wanted);
+    assert!(gave_up > 0, "the test would not shorten a block at all");
+
+    with_rw_mount_at(&image, "truncate-shorter", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        open_rw(&file).set_len(wanted as u64).unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().len() as usize, wanted);
+    });
+
+    // The blocks are *given back*, which is the part of a truncate that is easy to
+    // leave out and which nothing about the file's own appearance would show: an
+    // extent longer than the file's size is legal, so a file that keeps the blocks
+    // it no longer needs reads and even repairs perfectly.  The file system's own
+    // free count is the thing that moves, and it is the sum of the free space, the
+    // b-tree blocks and the free list -- so freeing four blocks shows up as four
+    // more on `sb_fdblocks` whichever of those three took them.
+    assert_eq!(
+        xfs_db_field(&image, &["sb 0"], "fdblocks")
+            .parse::<u64>()
+            .expect("a number"),
+        fdblocks_before.parse::<u64>().expect("a number") + gave_up as u64,
+        "the {gave_up} blocks the file gave up were not given back"
+    );
+
+    with_ro_mount(&image, "truncate-ro", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let content = read_file(&file);
+        assert_eq!(content.len(), wanted, "the file did not stay short");
+        // The bytes that stayed are the original file's, plus the part of the
+        // appended run that the new end still covers.
+        assert_eq!(&content[..before], b"Hello, World!\n", "the original bytes");
+        assert!(
+            content[before..].iter().all(|b| *b == b'A'),
+            "the part of the appended run that is still inside the file"
+        );
+        assert_eq!(
+            content[wanted - 1..wanted].len(),
+            1,
+            "the file is exactly as long as it was asked to be"
+        );
+    });
+
+    repair_accepts(&image, "after a file was made shorter");
+}
+
+/// One field of the image, as `xfs_db` reads it.
+///
+/// The tests here otherwise judge the image through a mount, which is the right
+/// thing to do for what a *file* looks like and the wrong thing for what a *file
+/// system* holds: a mount says nothing about whether the blocks a file gave up
+/// went anywhere.
+fn xfs_db_field(image: &std::path::Path, commands: &[&str], field: &str) -> String {
+    let mut cmd = Command::new("xfs_db");
+    for c in commands {
+        cmd.arg("-c").arg(c);
+    }
+    let out = cmd
+        .arg("-c")
+        .arg(format!("p {field}"))
+        .arg(image)
+        .output()
+        .expect("xfs_db");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    text.lines()
+        .find_map(|l| l.split_once('=').map(|(_, v)| v.trim().to_string()))
+        .unwrap_or_else(|| {
+            eprintln!("skipping: xfs_db did not report {field} for {commands:?}:\n{text}");
+            String::new()
+        })
+}
+
+/// The image is a file system `xfs_repair -n` accepts, or the reason it does not.
+///
+/// A skip where there is no repair tool to ask, because a test that cannot run its
+/// oracle should say so rather than pass quietly.
+fn repair_accepts(image: &std::path::Path, what: &str) {
+    let out = Command::new("xfs_repair")
+        .arg("-n")
+        .arg(image)
+        .output()
+        .expect("xfs_repair");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let complaints: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            !l.is_empty()
+                && !l.starts_with('-')
+                && !l.starts_with("Phase")
+                && !l.starts_with("No modify")
+                && !l.contains("sector size mismatch")
+                && !l.contains("host filesystem")
+                && !l.contains("Finished running")
+        })
+        .collect();
+    assert!(
+        out.status.success(),
+        "xfs_repair -n rejected the image {what}:\n{text}"
+    );
+    assert!(
+        complaints.is_empty(),
+        "xfs_repair -n had things to say {what}:\n{text}"
+    );
+}
+
 /// A write that leaves a gap reads as zeroes, because the blocks in the gap are
 /// not the file's and must not hold what they held before.
 #[test]

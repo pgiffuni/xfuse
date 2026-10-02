@@ -3623,6 +3623,11 @@ mod t {
             bs, 512,
             "the numbers below were measured on a 512-byte block"
         );
+        // The patched images are 64 MiB each and there are several of them, so they
+        // go in a directory that goes away with this test rather than into `/tmp`,
+        // where six of them per run filled the disk.
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let scratch = scratch.path();
         let ag_base = u64::from(sb.sb_agblocks) * bs as u64;
 
         // 1. A non-root leaf.  Group 1's bno tree is two levels deep, and the
@@ -3653,7 +3658,7 @@ mod t {
         );
 
         for below in [30u16, 16, 8] {
-            let image = patch_leaf(&golden, &sb, 1, leaf, below);
+            let image = patch_leaf(&golden, &sb, 1, leaf, below, &scratch);
             let complaints = repair_complaints(&image).expect("xfs_repair runs");
             assert!(
                 complaints.contains(&format!("bad btree nrecs ({below}, min=31, max=62)")),
@@ -3666,7 +3671,7 @@ mod t {
         //    together so that they still agree, and the slots outside the new
         //    count are cleared, so the occupancy is the only thing wrong.
         for down_to in [10u16, 3, 1] {
-            let image = shrink_both_roots(&golden, &sb, down_to);
+            let image = shrink_both_roots(&golden, &sb, down_to, &scratch);
             let complaints = repair_complaints(&image).expect("xfs_repair runs");
             assert!(
                 !complaints.contains("nrecs"),
@@ -3711,11 +3716,12 @@ mod t {
         agno: u32,
         block: u32,
         nrecs: u16,
+        scratch: &std::path::Path,
     ) -> std::path::PathBuf {
         let bs = sb.sb_blocksize as usize;
         let base =
             u64::from(agno) * u64::from(sb.sb_agblocks) * bs as u64 + u64::from(block) * bs as u64;
-        let image = copy_image(golden);
+        let image = copy_image(golden, scratch, &format!("leaf-{block}-{nrecs}.img"));
         let device = BlockDevice::open(&image, Access::ReadWrite).unwrap();
         device.write_at(&nrecs.to_be_bytes(), base + 6).unwrap();
         // Only the slots the block has, or this writes into the blocks after it.
@@ -3736,7 +3742,12 @@ mod t {
     /// Both trees together, because a leaf with fewer records than the other tree
     /// records is a different fault and repair would complain about that instead
     /// of the occupancy.
-    fn shrink_both_roots(golden: &std::path::Path, sb: &Sb, nrecs: u16) -> std::path::PathBuf {
+    fn shrink_both_roots(
+        golden: &std::path::Path,
+        sb: &Sb,
+        nrecs: u16,
+        scratch: &std::path::Path,
+    ) -> std::path::PathBuf {
         let bs = sb.sb_blocksize as usize;
         let mut roots = Vec::new();
         for at in [16usize, 20] {
@@ -3747,7 +3758,7 @@ mod t {
                 .unwrap();
             roots.push(be32(&header, at));
         }
-        let image = copy_image(golden);
+        let image = copy_image(golden, scratch, &format!("roots-{nrecs}.img"));
         let device = BlockDevice::open(&image, Access::ReadWrite).unwrap();
         for root in roots {
             let base = u64::from(root) * bs as u64;
@@ -3765,17 +3776,20 @@ mod t {
         image
     }
 
-    /// A writable copy of an image on disk, which a test can patch and keep for as
-    /// long as it needs.
-    fn copy_image(golden: &std::path::Path) -> std::path::PathBuf {
-        let copy = tempfile::Builder::new()
-            .prefix("xfuse-patched-")
-            .suffix(".img")
-            .tempfile()
-            .unwrap();
-        let path = copy.path().to_path_buf();
+    /// A writable copy of an image inside a scratch directory the caller owns.
+    ///
+    /// Into a directory rather than a temporary file of its own, because a
+    /// `NamedTempFile` that is `keep`ed is never removed, and these are 64 MiB
+    /// images.  The first version made one of those per patched image and left
+    /// six of them in `/tmp` after every run of the test below, which filled the
+    /// disk and then failed a dozen unrelated tests with `No space left on device`.
+    fn copy_image(
+        golden: &std::path::Path,
+        scratch: &std::path::Path,
+        name: &str,
+    ) -> std::path::PathBuf {
+        let path = scratch.join(name);
         std::fs::copy(golden, &path).unwrap();
-        copy.keep().expect("keep the copy");
         path
     }
 
