@@ -53,7 +53,15 @@ mod offset {
     pub const SEQNO: usize = 8;
     /// How many blocks the group has.
     pub const LENGTH: usize = 12;
-    /// How many inodes the group was created with.
+    /// How many inodes the group holds, which moves as chunks are added.
+    ///
+    /// The name says "initial length", which is what the format documentation
+    /// calls it, and it is tempting to read that as a creation-time constant.  It
+    /// is not: `xfsv4.img`'s group 1 holds 257 chunks and this field says 16448,
+    /// which is 257 x 64, so it is the current total and it rises with every chunk
+    /// the group gains.  Reading it as a constant would have made
+    /// `allocate_new_chunk` refuse its own result, since a group starting at zero
+    /// could never claim a free inode.
     pub const ILENGTH: usize = 16;
     /// The block holding the root of the btree that indexes *used* inode
     /// numbers.
@@ -129,7 +137,7 @@ impl Agi {
         self.has_crc
     }
 
-    /// How many inodes the group was created with.
+    /// How many inodes the group holds.
     pub fn inode_count(&self) -> u64 {
         u64::from(self.u32_at(offset::ILENGTH))
     }
@@ -169,6 +177,18 @@ impl Agi {
         self.u32_at(offset::SEQNO)
     }
 
+    /// Move the group's inode count, which is the sum of its chunks' widths.
+    ///
+    /// Moves with a chunk and with nothing else: taking an inode out of a chunk
+    /// changes how many are *free*, not how many there are.
+    pub fn set_inode_count(&mut self, count: u64) -> FsResult<()> {
+        let count = u32::try_from(count).map_err(|_| FsError::Corrupt {
+            what: "a group's inode count does not fit its header".into(),
+        })?;
+        self.set_u32(offset::ILENGTH, count);
+        Ok(())
+    }
+
     /// Move the free inode count.
     ///
     /// A group's free inode count and the superblock's total are two halves of
@@ -184,6 +204,21 @@ impl Agi {
         }
         // Only the free count moves: there is no used field to keep in step.
         self.set_u32(offset::FREECOUNT, free as u32);
+        Ok(())
+    }
+
+    /// Move the group's allocation hint.
+    ///
+    /// This names the chunk most recently *allocated as a chunk*, not the inode
+    /// most recently handed out, so it does not move when an inode is taken from a
+    /// chunk that already exists -- which is why `allocate_ino` leaves it alone
+    /// and only a new chunk has any business setting it.  It is a hint: a tree
+    /// that says no chunk has a free inode is believed over it.
+    pub fn set_next_ino(&mut self, ino: u64) -> FsResult<()> {
+        let ino = u32::try_from(ino).map_err(|_| FsError::Corrupt {
+            what: format!("inode number {ino} does not fit the group's hint"),
+        })?;
+        self.set_u32(offset::NEWINO, ino);
         Ok(())
     }
 

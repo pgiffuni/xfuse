@@ -299,6 +299,14 @@ impl Sb {
     /// made without checksums and a version 5 one differ here rather than in
     /// their version number.
     pub const FEATURES2: usize = 200;
+    /// Where the count of inodes sits, immediately ahead of the free ones.
+    ///
+    /// The two are adjacent and they move together in one direction and apart in
+    /// the other: allocating an inode lowers the free count and leaves the total
+    /// alone, and allocating a chunk of them raises the total and the free count
+    /// by the same sixty-four.  A file system that moved one and not the other is
+    /// what `sb_icount 64, counted 128` is.
+    pub const ICOUNT: usize = 128;
     /// Write a new count of the free blocks on the data device into the
     /// superblock's bytes, fixing the checksum if this file system has one.
     ///
@@ -361,14 +369,27 @@ impl Sb {
     #[allow(dead_code)] // As with `InoAddr`.
     pub fn ino_to_fsb(&self, ino: u64) -> u64 {
         let loc = self.locate_ino(ino);
-        self.ag_offset(loc.agno) + u64::from(loc.agbno)
+        // A block number counted from the start of the image, so the arithmetic is
+        // in blocks throughout.  Adding a block number to `ag_offset` -- which is
+        // a *byte* offset -- works for group 0, whose offset is zero, and is wrong
+        // for every other group.  That is how this went unnoticed: nothing on the
+        // read path calls it, and the only caller that did, `allocate_ino` writing
+        // a new inode's slot, has never run because there is no `create`.  A new
+        // inode chunk called it for the first time, in group 1, and the first call
+        // was wrong.
+        u64::from(loc.agno) * u64::from(self.sb_agblocks) + u64::from(loc.agbno)
     }
 
     /// The byte offset of an inode's own fields.
-    #[allow(dead_code)] // As with `InoAddr`.
     pub fn ino_to_offset(&self, ino: u64) -> u64 {
-        self.ino_to_fsb(ino) * u64::from(self.sb_blocksize)
-            + u64::from(self.locate_ino(ino).slot) * u64::from(self.sb_inodesize)
+        let loc = self.locate_ino(ino);
+        // Through `ag_block_offset`, so that the block-within-a-group arithmetic
+        // and the inode-to-offset arithmetic cannot drift apart -- which is how
+        // `ino_to_fsb` and this came to disagree in the first place, and why
+        // `ag_block_offset` was dead code with a second, wrong version of the same
+        // answer in it.
+        self.ag_block_offset(loc.agno, loc.agbno)
+            + u64::from(loc.slot) * u64::from(self.sb_inodesize)
     }
 
     /// How many blocks a chunk of inodes occupies.
@@ -559,15 +580,53 @@ impl Sb {
     /// Patched in the bytes rather than rebuilt from the struct, for the same
     /// reason as the block count: the struct threw away most of what it read.
     pub fn patch_ifree(bytes: &mut [u8], lower_by: u64) -> FsResult<u64> {
+        Self::move_ifree(bytes, -(lower_by as i128))
+    }
+
+    /// Move the superblock's inode count up by `by`.
+    ///
+    /// The counterpart of taking an inode out of a chunk, which moves the free
+    /// count and leaves this one alone.  A chunk moves both.
+    pub fn add_icount(bytes: &mut [u8], by: u64) -> FsResult<u64> {
+        if bytes.len() < Self::ICOUNT + 8 {
+            return Err(FsError::Corrupt {
+                what: "the superblock is too short to hold an inode count".into(),
+            });
+        }
+        let now = BigEndian::read_u64(&bytes[Self::ICOUNT..Self::ICOUNT + 8]);
+        let next = now.checked_add(by).ok_or_else(|| FsError::Corrupt {
+            what: format!("the file system claims {now} inodes and {by} more were added"),
+        })?;
+        BigEndian::write_u64(&mut bytes[Self::ICOUNT..Self::ICOUNT + 8], next);
+        Ok(next)
+    }
+
+    /// Move the superblock's free inode count **up** by `by`, for a group that
+    /// has just gained a chunk.
+    ///
+    /// The counterpart of [`Sb::patch_ifree`], and it exists because the count
+    /// does go both ways: taking an inode out of a chunk lowers it, and adding a
+    /// chunk of sixty-four raises it.  A function that can only lower cannot
+    /// express the second, and using it for the first is a subtraction that would
+    /// quietly underflow on a file system that has just been given something.
+    pub fn add_ifree(bytes: &mut [u8], by: u64) -> FsResult<u64> {
+        Self::move_ifree(bytes, by as i128)
+    }
+
+    /// Move the superblock's free inode count by `by`, which may be negative.
+    fn move_ifree(bytes: &mut [u8], by: i128) -> FsResult<u64> {
         if bytes.len() < Self::IFREE + 8 {
             return Err(FsError::Corrupt {
                 what: "the superblock is too short to hold a free inode count".into(),
             });
         }
         let now = BigEndian::read_u64(&bytes[Self::IFREE..Self::IFREE + 8]);
-        let next = now.checked_sub(lower_by).ok_or_else(|| FsError::Corrupt {
-            what: format!("the file system claims {now} free inodes and {lower_by} went"),
-        })?;
+        let next = i128::from(now)
+            .checked_add(by)
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or_else(|| FsError::Corrupt {
+                what: format!("moving the free inode count by {by} from {now} leaves nothing"),
+            })?;
         BigEndian::write_u64(&mut bytes[Self::IFREE..Self::IFREE + 8], next);
         // A file system without checksums has a *zero* in the checksum field, and
         // writing one there is a corruption of its own: repair objects to the
@@ -733,11 +792,14 @@ impl Sb {
         (agno as u64 * self.sb_agblocks as u64 + agblock as u64) as XfsFsblock
     }
 
-    /// The image offset of the first block of an allocation group, given as a
-    /// block number within that group.
-    #[allow(dead_code)] // The allocator that calls this is the next phase.
+    /// The image offset of a block named within an allocation group.
+    ///
+    /// The group is a run of blocks and the block is counted from its start, so
+    /// the two have to be turned into a file system block number before they mean
+    /// anything: adding a block number straight onto `ag_offset` added blocks to
+    /// bytes, which was wrong for every group whose offset is not zero.
     pub fn ag_block_offset(&self, agno: u32, agblock: XfsAgblock) -> u64 {
-        self.ag_offset(agno) + self.fsb_to_offset(agblock as u64)
+        self.ag_offset(agno) + u64::from(agblock) * u64::from(self.sb_blocksize)
     }
 
     /// The image offset of one of an allocation group's three header
@@ -1001,11 +1063,24 @@ mod ino_tests {
                 continue;
             }
             let magic = u16::from_be_bytes(bytes[at..at + 2].try_into().unwrap());
-            let should = ino / inos_per_block == u64::from(loc.agbno);
+            // The block within the *group*, which is what the mapping returns, and
+            // which is not `ino / inodes_per_block` for anything but group 0: the
+            // group's own offset in blocks has to come off first.
+            //
+            // It used to be exactly that, and the test passed -- because
+            // `ino_to_fsb` had the same mistake and the two agreed with each other.
+            // Fixing the mapping made this assertion fail, which is the right
+            // outcome for a test that was checking arithmetic against itself.  A
+            // mapping is only checked by something outside it, and here that is
+            // the image: the magic comparison below is what says the offsets are
+            // right, and this assertion only says the two halves agree.
+            let group_first_block = u64::from(loc.agno) * u64::from(sb.sb_agblocks);
+            let should = ino / inos_per_block - group_first_block == u64::from(loc.agbno);
             assert!(
                 should,
-                "inode {ino} decoded to block {} but names block {}",
-                ino / inos_per_block,
+                "inode {ino} decoded to group {} block {} but names block {}",
+                loc.agno,
+                ino / inos_per_block - group_first_block,
                 loc.agbno
             );
             if magic == 0x494e {

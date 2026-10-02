@@ -342,6 +342,85 @@ impl InobtNode {
         (blocksize - BODY) / 8
     }
 
+    /// Put a chunk into this leaf, in the order the leaf keeps them.
+    ///
+    /// The records are the tree's keys, so they have to be in order: a record
+    /// inserted in the wrong place makes a tree whose *contents* are right and
+    /// whose *shape* is wrong, which is a fault that a walk cannot see and
+    /// `xfs_repair` reports as an out-of-order record.
+    ///
+    /// A leaf that is full is refused rather than overflowing.  A full leaf needs
+    /// a split, which needs a block from the group's free space, and this is a
+    /// leaf mutation: it cannot take a block for itself, and a caller that cannot
+    /// finish the operation must not have started it.  `ENOSPC` here means "the
+    /// tree would have to grow", not "the group is full", and the difference
+    /// matters to whoever catches it.
+    pub fn insert_range(&mut self, range: &InoRange) -> FsResult<()> {
+        if !self.is_leaf() {
+            return Err(FsError::invalid(
+                libc::EINVAL,
+                "only a leaf of the inode tree holds chunks",
+            ));
+        }
+        let at = Self::leaf_capacity(self.bytes.len());
+        if self.numrecs as usize >= at {
+            return Err(FsError::NoSpace);
+        }
+        let existing = self.ranges()?;
+        let at = existing.partition_point(|c| c.start < range.start);
+        if existing.iter().any(|c| c.start == range.start) {
+            return Err(FsError::corrupt(format!(
+                "the inode tree already holds a chunk starting at {}",
+                range.start
+            )));
+        }
+        if let Some(next) = existing.get(at) {
+            if range.start < next.start || range.start + INODES_PER_CHUNK > next.start {
+                return Err(FsError::corrupt(format!(
+                    "a chunk starting at {} would overlap the one at {}",
+                    range.start, next.start
+                )));
+            }
+        }
+        self.write_range(at, range)?;
+        self.numrecs += 1;
+        self.renumber();
+        Ok(())
+    }
+
+    fn write_range(&mut self, at: usize, range: &InoRange) -> FsResult<()> {
+        if range.count_agrees() {
+            // nothing to say, and the two fields that matter are written below
+        } else {
+            return Err(FsError::corrupt(
+                "a chunk's free count disagrees with its mask",
+            ));
+        }
+        let start = u32::try_from(range.start).map_err(|_| FsError::Corrupt {
+            what: format!("inode number {} does not fit a chunk record", range.start),
+        })?;
+        let at = BODY + at * LEAF_RECORD;
+        let room = self.bytes.len().checked_sub(at + LEAF_RECORD);
+        if room.is_none() {
+            return Err(FsError::corrupt(
+                "a leaf of the inode tree does not hold the record it claims to",
+            ));
+        }
+        self.bytes[at..at + 4].copy_from_slice(&start.to_be_bytes());
+        self.bytes[at + 4..at + 8].copy_from_slice(&range.free_count.to_be_bytes());
+        self.bytes[at + 8..at + 16].copy_from_slice(&range.free.to_be_bytes());
+        Ok(())
+    }
+
+    /// Put the record count the header says this node has back into its bytes.
+    ///
+    /// The count lives in two places -- the field the struct was built with and
+    /// the bytes -- and they have to move together, which is invisible in a test
+    /// that reads a node back through the struct that wrote it.
+    fn renumber(&mut self) {
+        self.bytes[6..8].copy_from_slice(&self.numrecs.to_be_bytes());
+    }
+
     /// The ranges a leaf holds.
     pub fn ranges(&self) -> FsResult<Vec<InoRange>> {
         if !self.is_leaf() {

@@ -77,7 +77,7 @@ use super::{
         GroupBlocks,
         GroupGeometry,
     },
-    inobt::{first_free_ino, InobtNode},
+    inobt::{first_free_ino, InoRange, InobtNode, INODES_PER_CHUNK},
 };
 use crate::libxfuse::{
     definitions::{XfsAgblock, XfsIno},
@@ -581,6 +581,321 @@ pub fn allocate_in_group(
     Ok(Some(run))
 }
 
+/// Take a named range of blocks out of a group's free space, and move every count
+/// that says it is still free.
+///
+/// The range is named by the caller, which is the difference from
+/// [`allocate_in_group`]: that one asks the trees where a run is, and this one is
+/// told -- which is what allocating a new inode chunk needs, because it has found
+/// the chunk's blocks itself and needs *those* rather than whichever run the
+/// allocation policy would have preferred.
+///
+/// Both then do the same work: shrink both trees, refresh the group's two
+/// summaries, and leave its roots and the superblock's total for the caller.  The
+/// header work lives here once rather than in two places that could drift.
+///
+/// **Taking, not freeing.**  The range was chosen because the bno tree holds it as
+/// free, so freeing it into the trees would be the operation that declines to
+/// record a block twice -- correctly, and leaving the chunk sitting in free space
+/// that something else can be given.  The first version of this did exactly that,
+/// and the test that caught it is the one asserting the chunk's blocks are no
+/// longer offered.
+fn take_named_blocks(
+    transaction: &mut Transaction<'_>,
+    sb: &Sb,
+    agno: u32,
+    run: FreeRun,
+) -> FsResult<()> {
+    let mut agf = read_agf(transaction, sb, agno)?;
+    let geometry = GroupGeometry::new(sb.sb_agblocks, sb.has_crc(), true);
+    let by_length = GroupGeometry::new(sb.sb_agblocks, sb.has_crc(), false);
+    let mut store = TransactionBlocks::new(transaction, sb, agno);
+    let (by_block_root, by_size_root) = take_from_both_trees(
+        &mut store,
+        geometry,
+        agf.block_btree_root(),
+        by_length,
+        agf.extent_btree_root(),
+        run.start,
+        run.len,
+    )?;
+    let (free, longest, block_level, size_level) = {
+        let mut space = FreeSpace::new(&mut store, geometry, by_block_root, by_size_root);
+        let (free, longest) = space.summaries()?;
+        let block_level =
+            crate::libxfuse::alloc::free_space::read_node(&mut store, geometry, by_block_root)
+                .map_err(|e| {
+                    FsError::corrupt(format!("the by-block tree root is unreadable: {e}"))
+                })?
+                .level() as u32
+                + 1;
+        let size_level =
+            crate::libxfuse::alloc::free_space::read_node(&mut store, by_length, by_size_root)
+                .map_err(|e| {
+                    FsError::corrupt(format!("the by-length tree root is unreadable: {e}"))
+                })?
+                .level() as u32
+                + 1;
+        (free, longest, block_level, size_level)
+    };
+    let free = u32::try_from(free).map_err(|_| FsError::Corrupt {
+        what: "a group claims more free blocks than a file system can hold".into(),
+    })?;
+    // Read again: the tree work can reach the group header -- a merge releases a
+    // node and moves the b-tree count, and a split would take an entry off the
+    // free list and move its window -- so the copy this function started with is a
+    // copy taken too early.
+    agf = read_agf(transaction, sb, agno)?;
+    agf.set_free_blocks(free);
+    agf.set_longest_free(longest);
+    agf.set_block_btree(by_block_root, block_level);
+    agf.set_extent_btree(by_size_root, size_level);
+    write_agf(transaction, sb, agno, &mut agf)?;
+    Ok(())
+}
+
+/// Allocate a new inode chunk in a group that has run out of free inodes, and
+/// return the chunk's first inode.
+///
+/// This is the operation that has to come before a group's inodes can be handed
+/// out again once every chunk in it is full, and it is a different shape of thing
+/// from `allocate_ino`: four bookkeeping moves become one, because 64 inodes
+/// appear rather than one.  What follows that is unchanged -- the new chunk's
+/// free count goes into the group's, the group's goes into the superblock's, and
+/// the tree is what says any of it is allocatable.
+///
+/// # Where the chunk goes
+///
+/// **Searched for, not computed.**  The obvious approach -- take the next nominal
+/// chunk boundary after the last one -- is wrong on these images and there is no
+/// version of it that is right.  `xfsv4.img`'s group 1 holds 257 chunks spaced
+/// 128, 160 and 192 inodes apart, so the spacing is not the nominal 64 and it is
+/// not even one number.  A file system with a free inode bitmap asks it where
+/// there is room; this one has none to ask (`free_root` is zero in every group of
+/// every image here), so the only things that can say are the group's own free
+/// space and its own metadata.
+///
+/// So the candidates are the chunk-aligned block ranges in the group, and a
+/// candidate is usable when the bno tree holds every one of its blocks as free.
+/// The trees already exclude the group's headers and its own inode tree -- the
+/// group header, the inode header, the free list, the two free space trees and
+/// every inode in it are not in the bno tree -- so a candidate that is free is
+/// also a candidate that is not metadata.
+///
+/// # What the slots are written as
+///
+/// All zeroes, which is **a choice and not a measurement**.  Every free inode in
+/// `xfsv4.img` has an entirely zero slot, magic included, and `xfs_repair -n`
+/// accepts the image with 52 of them -- so all-zero is a state XFS leaves behind
+/// and a legal thing to write.  What is *not* established is that it is what XFS
+/// writes when it creates a chunk: no chunk in any image here was created by an
+/// operation this suite can watch.  A file that later takes one of these inodes
+/// has every field of it written by `allocate_ino`, so nothing downstream depends
+/// on what was here.
+///
+/// # What is refused rather than guessed
+///
+/// A tree that is not a single leaf.  Inserting a record into a full leaf needs a
+/// split, and a split needs a block, and that is the same structural work the
+/// free space trees have and the inode tree does not.  Rather than write a
+/// half-working split, this returns `ENOSPC` and says why, so a caller that hits
+/// it learns that the inode tree needs the same treatment the free space trees
+/// already got.
+pub fn allocate_new_chunk(transaction: &mut Transaction<'_>, sb: &Sb, agno: u32) -> FsResult<u64> {
+    let chunk_blocks = sb.chunk_blocks();
+    if chunk_blocks == 0 {
+        return Err(FsError::corrupt("a chunk of inodes occupies no blocks"));
+    }
+    let agi_at = sb.ag_header_offset(agno, Sb::AGI_SECTOR);
+    let mut agi = Agi::from_bytes(
+        transaction.read_bytes(agi_at, sb.sb_blocksize as usize)?,
+        sb.has_crc(),
+    )?;
+    let root = agi.inobt_root();
+    if agi.inobt_level() > 1 {
+        return Err(FsError::NoSpace);
+    }
+
+    // The first inode number in the group, which is where a chunk-aligned range
+    // has to start: a chunk's mask is 64 bits over 64 inodes, so the chunk has to
+    // begin on a 64-inode boundary or the mask does not line up with the blocks.
+    //
+    // **The record's `startino` is counted from the start of its group, not from
+    // the start of the file system.**
+    //
+    // That is what the field means, and getting it wrong is invisible until
+    // something reads the record back and turns it into an inode number.  It was
+    // established here by inserting a chunk record into `xfs_writable.img` at each
+    // candidate value and asking `xfs_repair -n`, sweeping the field across its
+    // whole plausible range:
+    //
+    // ```text
+    // startino <  307200:  "inode chunk claims used block" -- the number is in range
+    // startino >= 307200:  "bad starting inode"            -- the number is not
+    // ```
+    //
+    // and 307200 is `153600 * 2`, the number of inodes in the group.  So the field
+    // is bounded by the group's own inode count and is not an absolute number: an
+    // absolute one would have been bounded by the file system's, and group 1's
+    // absolute first inode is 524288.  `Sb::make_ino`, which is what turns the
+    // field into an inode number, adds the group's base, and the repository's
+    // existing code already did this correctly -- `xfsv4.img`'s group 1 holds a
+    // chunk recorded at 35008 and its hint says 35008, both of which are far below
+    // that group's absolute first inode of 65536 and are plainly group-relative.
+    //
+    // The first version of this wrote an absolute number, which the same sweep
+    // refused, and then concluded that XFS and `Sb::locate_ino` disagreed about
+    // where a group's inodes start.  They do not: the disagreement was that a
+    // group-relative field had been given an absolute number.
+    let inopblog = u32::from(sb.sb_inopblog);
+    let inodes_per_group = u64::from(sb.sb_agblocks) << inopblog;
+    let group_first = sb.make_ino(agno, 0);
+    if !group_first.is_multiple_of(INODES_PER_CHUNK) {
+        return Err(FsError::corrupt(format!(
+            "group {agno} starts at inode {group_first}, which is not a chunk boundary"
+        )));
+    }
+
+    // The candidates, in order, each a chunk-aligned run of blocks.
+    let agf = read_agf(transaction, sb, agno)?;
+    let geometry = GroupGeometry::new(sb.sb_agblocks, sb.has_crc(), true);
+    let mut probe = TransactionBlocks::new(transaction, sb, agno);
+    let mut chosen: Option<(u32, u64)> = None;
+    let mut start_block = 0u32;
+    while start_block + chunk_blocks <= sb.sb_agblocks {
+        // The block to the group's own inode number, which is what the record
+        // holds: a shift, because `locate_ino` shifts, and not a ratio, because a
+        // group whose real length is not a power of two makes the ratio a fraction.
+        let startino = u64::from(start_block) << inopblog;
+        if startino + INODES_PER_CHUNK > inodes_per_group {
+            break;
+        }
+        let free = range_is_free(
+            &mut probe,
+            geometry,
+            agf.block_btree_root(),
+            start_block,
+            chunk_blocks,
+        )?;
+        if free {
+            chosen = Some((start_block, startino));
+            break;
+        }
+        start_block += chunk_blocks;
+    }
+    let Some((first_block, startino)) = chosen else {
+        return Err(FsError::NoSpace);
+    };
+    // What the caller wants is the inode number, which is the group's field plus
+    // the group's base.
+    let ino = group_first + startino;
+
+    // The blocks first: if they cannot be taken there is nothing to initialise,
+    // and a chunk whose slots are written but whose blocks belong to something
+    // else is the worst of both.
+    take_named_blocks(
+        transaction,
+        sb,
+        agno,
+        FreeRun {
+            start: first_block,
+            len:   chunk_blocks,
+        },
+    )?;
+
+    // The slots.
+    //
+    // **Not all zeroes, and that was measured rather than assumed.**  Writing them
+    // as zeroes is what an earlier version did, on the strength of every free
+    // inode in `xfsv4.img` having an entirely zero slot.  `xfs_repair -n` on this
+    // image says otherwise, and names the three fields it objects to:
+    //
+    // ```text
+    // bad magic number 0x0 on inode 95, would reset magic number
+    // bad version number 0x0 on inode 95, would reset version number
+    // bad next_unlinked 0x0 on inode 95, would reset next_unlinked
+    // free inode 95 contains errors, would correct
+    // ```
+    //
+    // So a slot in a chunk this file system created carries the inode magic, a
+    // version, and a zero `next_unlinked`, and the rest is zeroes.  The magic and
+    // the version are what make the slot an inode at all; the `next_unlinked`
+    // complaint is about a field that is zero and is expected to be *marked*
+    // zero, which for the version 2 layout is a different bit from "all zeroes" --
+    // so a slot written as zeroes is not a version 2 inode with no unlinked
+    // entries, it is something repair has to correct.
+    //
+    // The version is 2 for a 256-byte inode and 3 for a larger one, which is the
+    // same choice `allocate_ino` makes and the one `xfs_db` reports for the
+    // inodes this image already has (`core.version = 2` on a 256-byte inode).
+    let mut unused = RawDinode::unused(sb.inode_size());
+    unused.set_magic(RawDinode::MAGIC);
+    unused.set_version(RawDinode::version_for(sb.inode_size()));
+    unused.set_next_unlinked();
+    let unused = unused.into_bytes();
+    for bit in 0..INODES_PER_CHUNK {
+        // The absolute inode number, not the record's group-relative one.  Writing
+        // the group-relative number here put 64 inodes at the start of the image,
+        // and `xfs_repair -n` said so plainly -- 63 of the chunk's slots still had
+        // no magic and no version, because the only one that did was the single
+        // inode a later `allocate_ino` wrote.
+        let at = sb.ino_to_offset(ino + bit);
+        transaction.write_bytes(at, &unused)?;
+    }
+
+    // The record, in the leaf that holds the others.
+    let range = InoRange {
+        start:      startino,
+        free_count: INODES_PER_CHUNK as u32,
+        free:       u64::MAX,
+    };
+    let inobt_at = sb.ag_offset(agno) + u64::from(root) * u64::from(sb.sb_blocksize);
+    let mut leaf = InobtNode::from_bytes(
+        transaction
+            .read_bytes(inobt_at, sb.sb_blocksize as usize)?
+            .into_boxed_slice(),
+    )?;
+    leaf.insert_range(&range)?;
+    leaf.update_crc();
+    let leaf = leaf.into_bytes();
+    transaction.write_bytes(inobt_at, &leaf)?;
+
+    // And the counts.  `newino` moves here and nowhere else, because this is the
+    // only operation here that allocates a chunk.
+    // The count first: `set_free_inodes` refuses a free count larger than the
+    // group's inode count, which is a real check -- it is what stops a group
+    // claiming more free inodes than it has -- and a group starting at zero
+    // cannot claim 64 free until it holds 64.
+    agi.set_inode_count(agi.inode_count() + INODES_PER_CHUNK)?;
+    agi.set_free_inodes(agi.free_inodes() + INODES_PER_CHUNK)?;
+    agi.set_next_ino(startino)?;
+    transaction.write_bytes(agi_at, agi.as_bytes())?;
+    // And the superblock's own three counts, patched into its first sector for the
+    // same reason `allocate_ino` patches it: the first group's headers share that
+    // block, so rebuilding the struct and writing it whole would take them with
+    // them.
+    //
+    // All three move, and `xfs_repair -n` names each one it is missing:
+    //
+    // ```text
+    // sb_icount 64, counted 128
+    // sb_fdblocks 483138, counted 483106
+    // ```
+    //
+    // The first is the file system's inode count, which rises with the chunk.  The
+    // second is its free *block* count, which falls by the 32 blocks the chunk
+    // occupies -- so the block total and the inode total move in opposite
+    // directions in the same operation, which is worth writing down before
+    // someone assumes one rule covers both.
+    let mut sector = transaction.read_bytes(0, sb.sb_blocksize as usize)?;
+    Sb::add_ifree(&mut sector, INODES_PER_CHUNK)?;
+    Sb::add_icount(&mut sector, INODES_PER_CHUNK)?;
+    let free_blocks = Sb::fdblocks_in(&sector)?;
+    Sb::patch_fdblocks(&mut sector, free_blocks - u64::from(chunk_blocks))?;
+    transaction.write_bytes(0, &sector)?;
+    Ok(ino)
+}
+
 /// The file system's identifier, which a free list written here must carry.
 fn uuid_of(agf: &Agf) -> [u8; 16] {
     agf.uuid()
@@ -663,14 +978,27 @@ pub fn allocate_ino(
     updated.update_crc();
     store.put(found.block, updated.into_bytes())?;
 
-    // And the slot itself.  A slot that has never been used is all zeroes, so
-    // every field has to be set rather than assumed.
+    // And the slot itself.
+    //
+    // A slot that has never been used is a run of zeroes -- every free inode in
+    // `xfsv4.img` has one, magic included, and the file system accepts them -- so
+    // there may be no inode there to modify, only one to write.  Parsing the slot
+    // and refusing when it does not parse is the wrong answer twice over: it
+    // refuses a slot the tree says is free, and it would refuse every inode in a
+    // freshly allocated chunk.
+    //
+    // The comment that used to be here said "a slot that has never been used is
+    // all zeroes, so every field has to be set rather than assumed", which is
+    // exactly right and is not what the code did: it parsed the slot and modified
+    // the result, so any field it did not set was inherited from whatever was
+    // there.  Nothing caught it because nothing had ever reached this line with a
+    // slot that was not already an inode.
     let at = sb.ino_to_offset(found.ino);
-    let mut inode = RawDinode::from_bytes(
-        transaction
-            .read_bytes(at, sb.sb_inodesize as usize)?
-            .into_boxed_slice(),
-    )?;
+    let bytes = transaction.read_bytes(at, sb.sb_inodesize as usize)?;
+    let mut inode = match RawDinode::from_bytes(bytes.into_boxed_slice()) {
+        Ok(inode) => inode,
+        Err(_) => RawDinode::unused(sb.sb_inodesize as usize),
+    };
     let now = std::time::SystemTime::now();
     inode.set_version(2);
     inode.set_magic(0x494e);
@@ -682,6 +1010,10 @@ pub fn allocate_ino(
     // in it.  That is what the files on both reference images use.
     inode.set_format(2);
     inode.set_forkoff(0);
+    // And the attribute fork's own format, which is not implied by the data
+    // fork's.  Zero is not "no attributes"; it is an invalid format, and
+    // `xfs_repair -n` reports it on a file this code has allocated.
+    inode.set_aformat(2);
     inode.set_size(0);
     inode.set_nblocks(0);
     // The generation tells an old inode from a new one that reused its number,
@@ -992,6 +1324,8 @@ mod t {
     use super::{
         allocate,
         allocate_in_group,
+        allocate_ino,
+        allocate_new_chunk,
         free_in_group,
         read_agf,
         GroupBlocks,
@@ -1093,6 +1427,15 @@ mod t {
             copy.write_all(&buf[..n]).unwrap();
         }
         copy.flush().unwrap();
+        // `XFSFUSE_KEEP_IMAGE` leaves the copy on disk instead of deleting it,
+        // which is the only way to poke at an image a test produced -- to try a
+        // field at a different offset and ask `xfs_repair -n` what it thinks --
+        // without rewriting the operation that produced it.
+        if let Some(dir) = std::env::var_os("XFSFUSE_KEEP_IMAGE") {
+            let path = std::path::Path::new(&dir).join(format!("{name}.kept"));
+            std::fs::copy(copy.path(), &path).unwrap();
+            eprintln!("kept a copy at {}", path.display());
+        }
         Some(copy)
     }
 
@@ -1295,6 +1638,16 @@ mod t {
             eprintln!("skipping the repair check: no xfs_repair to run");
             return;
         };
+        if !complaints.is_empty() {
+            // Keep the image that was *rejected*.  A copy taken before the
+            // operations is the wrong one to look at: it is the image the test
+            // started from, and the fault is in what the test did to it.
+            if let Some(dir) = std::env::var_os("XFSFUSE_KEEP_IMAGE") {
+                let path = std::path::Path::new(&dir).join("rejected.img");
+                std::fs::copy(image, &path).unwrap();
+                eprintln!("repair rejected it; kept a copy at {}", path.display());
+            }
+        }
         assert!(
             complaints.is_empty(),
             "xfs_repair -n rejected the image {what}:\n{complaints}"
@@ -2605,6 +2958,364 @@ mod t {
         coherent("after cutting a hole in a run");
 
         assert_repair_accepts(image.path(), "after allocator operations on a v5 image");
+    }
+
+    /// Where the inode number mapping puts an inode, checked against the image
+    /// rather than against itself.
+    ///
+    /// `ino_to_offset` is on the path of every inode this code writes.  It had
+    /// never been checked against anything, and it was wrong: `ag_offset` is a
+    /// **byte** offset and `ino_to_fsb` was adding a block number to it, so every
+    /// inode outside group 0 resolved to a byte offset that was out by
+    /// `agno * agblocks * blocksize * (blocksize - 1)`.  Group 0 came out right
+    /// because its offset is zero, which is the whole of why it went unnoticed:
+    /// the read path does not call it, and the only caller that did writes an
+    /// inode's slot, which needs a `create` that does not exist yet.
+    ///
+    /// The check is against `ag_block_offset`, which is the same arithmetic done
+    /// one step at a time, and against the image's own length -- an offset that
+    /// runs off the end is the symptom this produced, and the one that caught it.
+    #[test]
+    fn the_inode_number_mapping_puts_an_inode_inside_the_image() {
+        let mut checked = 0usize;
+        for name in ["xfsv4.img", "xfs_writable.img", "xfs_4kn.img"] {
+            let Some(path) = crate::libxfuse::alloc::golden(name) else {
+                eprintln!("skipping {name}: not unpacked");
+                continue;
+            };
+            let sb = sb_of(&path);
+            let len = std::fs::metadata(&path).unwrap().len();
+            for agno in 0..sb.agcount() {
+                // Four inode numbers spread across the group, including its first.
+                let span = 1u64 << (u32::from(sb.sb_agblklog) + u32::from(sb.sb_inopblog));
+                let first =
+                    u64::from(agno) << (u32::from(sb.sb_agblklog) + u32::from(sb.sb_inopblog));
+                for step in [0u64, 1, 7, span / 2] {
+                    let ino = first + step;
+                    let loc = sb.locate_ino(ino);
+                    let at = sb.ino_to_offset(ino);
+                    assert_eq!(loc.agno, agno, "{name}: {ino} is not in group {agno}");
+                    assert_eq!(
+                        at,
+                        sb.ag_block_offset(agno, loc.agbno)
+                            + u64::from(loc.slot) * u64::from(sb.sb_inodesize),
+                        "{name} ag{agno}: inode {ino} maps to {at}, which is not the block the \
+                         mapping names"
+                    );
+                    assert!(
+                        at + u64::from(sb.sb_inodesize) <= len,
+                        "{name} ag{agno}: inode {ino} maps to {at}, past the end of a {} byte \
+                         image",
+                        len
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no image was unpacked, so nothing was checked");
+    }
+
+    /// A group whose inode tree is empty gets its first chunk, and `xfs_repair`
+    /// says whether that is a file system.
+    ///
+    /// `xfs_writable.img`'s groups 1, 2 and 3 have exactly that: `count = 0`,
+    /// `freecount = 0`, and one leaf holding no records at all.  It is the only
+    /// substrate in the repository where a new chunk has no overlap hazards to
+    /// negotiate, and the plan asks for the transition to be created before it is
+    /// implemented, which is what this does.
+    ///
+    /// What is asserted, in order:
+    ///
+    /// * a group with an empty tree and no free inodes declines, and says so --
+    ///   which is the existing rule and must not have been weakened to make room
+    ///   for the new operation;
+    /// * the chunk goes where a *search* puts it, not where arithmetic on the
+    ///   inode number would, and it does not overlap the group's own metadata;
+    /// * `freecount == popcount(free_mask)` for the new chunk, before and after;
+    /// * the group's free inode count and the superblock's total both rose by 64;
+    /// * the group's block accounting followed the 32 blocks it took;
+    /// * an inode from the new chunk can then be allocated, which is the whole
+    ///   point of making one;
+    /// * and `xfs_repair -n` accepts the image.
+    ///
+    /// The last is the only assertion here that can check a claim about a file
+    /// system rather than about this code.
+    #[test]
+    fn a_group_with_no_free_inode_gets_a_new_chunk() {
+        let Some(image) = copy_of_golden("xfs_writable.img") else {
+            eprintln!("skipping: no unpacked xfs_writable.img");
+            return;
+        };
+        let sb = sb_of(image.path());
+        let agno = 1u32;
+        let device = Arc::new(BlockDevice::open(image.path(), Access::ReadWrite).unwrap());
+        let mut cache = BlockCache::new(sb.sb_blocksize as usize, 256);
+
+        let agi_of = |image: &std::path::Path| -> Agi {
+            let at = sb.ag_header_offset(agno, Sb::AGI_SECTOR);
+            Agi::from_bytes(
+                std::fs::read(image).unwrap()[at as usize..at as usize + sb.sb_blocksize as usize]
+                    .to_vec(),
+                sb.has_crc(),
+            )
+            .expect("a group inode header")
+        };
+
+        // The starting state, which is the point of choosing this group.
+        let before = agi_of(image.path());
+        assert_eq!(
+            (before.free_inodes(), before.inobt_level()),
+            (0, 1),
+            "group 1 of this image is meant to have an empty inode tree"
+        );
+        assert!(
+            chunks_in_order(before.inobt_root(), |b| {
+                let mut bytes = vec![0u8; sb.sb_blocksize as usize];
+                std::fs::File::open(image.path())
+                    .unwrap()
+                    .read_exact_at(
+                        &mut bytes,
+                        sb.ag_offset(agno) + u64::from(b) * u64::from(sb.sb_blocksize),
+                    )
+                    .unwrap();
+                Ok(bytes.into_boxed_slice())
+            })
+            .expect("the inode tree")
+            .is_empty(),
+            "the group's inode tree is not empty"
+        );
+
+        // The existing rule, unchanged: a group with no free inode declines rather
+        // than going looking for a slot that happens to be unused.
+        {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            assert_eq!(
+                allocate_ino(&mut tx, &sb, agno, 0o100644, 0, 0).expect("the tree is walked"),
+                None,
+                "a group whose tree has no free bit must not be given an inode"
+            );
+        }
+
+        let ifree_before = sb_of(image.path()).sb_ifree;
+        let terms_before = {
+            let (f, t, l) = group_terms(image.path(), &sb, agno, "before the chunk");
+            assert_trees_own_what_is_charged(image.path(), &sb, agno, "before the chunk");
+            (f, t, l)
+        };
+
+        // The chunk.
+        let startino = {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let ino =
+                allocate_new_chunk(&mut tx, &sb, agno).expect("the group has room for a chunk");
+            tx.commit().expect("commit");
+            ino
+        };
+        device.flush().unwrap();
+        eprintln!(
+            "xfs_writable.img ag1: new chunk at inode {startino}; agblocks {}, chunk_blocks {}, \
+             agbno {}, inopblog {}, inodesize {}",
+            sb.sb_agblocks,
+            sb.chunk_blocks(),
+            sb.locate_ino(startino).agbno,
+            sb.sb_inopblog,
+            sb.sb_inodesize
+        );
+
+        assert!(
+            startino % INODES_PER_CHUNK == 0,
+            "a chunk at {startino} does not start on a chunk boundary"
+        );
+        let after = agi_of(image.path());
+        assert_eq!(
+            after.free_inodes(),
+            before.free_inodes() + INODES_PER_CHUNK,
+            "the group's free inode count did not follow the chunk"
+        );
+        // The hint is counted from the start of the group, like the records it
+        // names: `xfsv4.img`'s group 1 says 35008 and holds a chunk recorded at
+        // 35008, both far below that group's absolute first inode.  So what it
+        // should be here is the group-relative form of the chunk's number, which is
+        // what the record holds and what `first_free_ino` will add a base to.
+        let group_first = sb.make_ino(agno, 0);
+        assert_eq!(
+            after.next_ino(),
+            startino - group_first,
+            "the group's allocation hint does not name the chunk it just allocated"
+        );
+        assert_eq!(
+            sb_of(image.path()).sb_ifree,
+            ifree_before + INODES_PER_CHUNK,
+            "the file system's total did not follow the group's"
+        );
+
+        // The record, and the rule that its two copies of one fact agree.
+        let chunks = chunks_in_order(after.inobt_root(), |b| {
+            let mut bytes = vec![0u8; sb.sb_blocksize as usize];
+            std::fs::File::open(image.path())
+                .unwrap()
+                .read_exact_at(
+                    &mut bytes,
+                    sb.ag_offset(agno) + u64::from(b) * u64::from(sb.sb_blocksize),
+                )
+                .unwrap();
+            Ok(bytes.into_boxed_slice())
+        })
+        .expect("the inode tree");
+        assert_eq!(
+            chunks.len(),
+            1,
+            "the tree should hold the one chunk that was added"
+        );
+        let (_, chunk) = chunks[0];
+        assert_eq!(
+            chunk.start,
+            startino - sb.make_ino(agno, 0),
+            "the record does not hold the chunk's own inode number"
+        );
+        assert!(
+            chunk.count_agrees(),
+            "the chunk's free count disagrees with its mask"
+        );
+        assert_eq!(
+            chunk.free,
+            u64::MAX,
+            "a new chunk should have every inode free"
+        );
+
+        // Its blocks: inside the group, free of the metadata, and no longer free.
+        //
+        // The block is worked out the way `allocate_new_chunk` works it out --
+        // from the group's *real* length -- and not with `Sb::locate_ino`, which
+        // uses the rounded one.  On this image they disagree, and the assertion
+        // below says so rather than leaving it to be discovered later: the group's
+        // length is 153600 blocks, which is not a power of two, so `locate_ino`
+        // places this inode in a different group.  That is a known open question,
+        // recorded at `allocate_new_chunk` and in the documentation, and it is not
+        // something this test should paper over by measuring with the same rule it
+        // is checking.
+        let chunk_blocks = sb.chunk_blocks();
+        let located = sb.locate_ino(startino);
+        assert_eq!(
+            located.agno, agno,
+            "the mapping put the chunk's own inode number in another group"
+        );
+        let first_block = located.agbno;
+        assert_eq!(
+            first_block % chunk_blocks,
+            0,
+            "the chunk does not start on a chunk boundary"
+        );
+        assert!(
+            u64::from(first_block) + u64::from(chunk_blocks) <= u64::from(sb.sb_agblocks),
+            "the chunk runs past the end of the group"
+        );
+        for sector in [Sb::AGF_SECTOR, Sb::AGI_SECTOR, Sb::AGFL_SECTOR] {
+            let reserved = sb.ag_header_offset(agno, sector) - sb.ag_offset(agno);
+            assert!(
+                reserved / u64::from(sb.sb_blocksize) < u64::from(first_block)
+                    || (reserved / u64::from(sb.sb_blocksize))
+                        >= u64::from(first_block) + u64::from(chunk_blocks),
+                "the chunk covers sector {sector}"
+            );
+        }
+        for (label, by_block) in [("by-start", true), ("by-length", false)] {
+            assert!(
+                !free_blocks_in_group(image.path(), &sb, agno, by_block).contains(&first_block),
+                "the {label} tree still offers the block the chunk occupies"
+            );
+        }
+
+        // And the group's block accounting followed the 32 blocks it took.
+        let terms_after = {
+            let (f, t, l) = group_terms(image.path(), &sb, agno, "after the chunk");
+            assert_trees_own_what_is_charged(image.path(), &sb, agno, "after the chunk");
+            (f, t, l)
+        };
+        assert_eq!(
+            terms_after.0,
+            terms_before.0 - u64::from(chunk_blocks),
+            "the group's free block count did not follow the chunk's blocks"
+        );
+        assert_eq!(
+            terms_after.1, terms_before.1,
+            "the chunk's blocks are not b-tree blocks, so the b-tree count should not move"
+        );
+        assert_eq!(terms_after.2, terms_before.2, "the free list did not move");
+        assert!(
+            sb_of(image.path()).sb_fdblocks > 0,
+            "sanity: the file system has free blocks to account for"
+        );
+
+        // The last word, asked while the image is still a file system a file system
+        // can be: a group with a chunk in it and every one of its inodes free.
+        assert_repair_accepts(
+            image.path(),
+            "after a new inode chunk was allocated in a group that had none",
+        );
+
+        // The point of the exercise: the group can now hand out an inode.
+        let allocated = {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let got = allocate_ino(&mut tx, &sb, agno, 0o100644, 0, 0)
+                .expect("the tree is walked")
+                .expect("the new chunk has a free inode");
+            tx.commit().expect("commit");
+            got
+        };
+        device.flush().unwrap();
+        assert_eq!(
+            allocated, startino,
+            "the first inode out of a new chunk is the chunk's first"
+        );
+        let after_alloc = agi_of(image.path());
+        assert_eq!(
+            after_alloc.free_inodes(),
+            INODES_PER_CHUNK - 1,
+            "the group's count did not follow the inode out of the chunk"
+        );
+        assert_eq!(
+            after_alloc.next_ino(),
+            after.next_ino(),
+            "the allocation hint moved when an inode was handed out, and it names a chunk rather \
+             than an inode, so it should not have"
+        );
+
+        // And now, with the inode allocated, `xfs_repair -n` has exactly one thing
+        // to say, and it is not about this operation:
+        //
+        // ```text
+        // disconnected inode 524352, would move to lost+found
+        // ```
+        //
+        // An inode nobody can reach from a directory is *disconnected*, by XFS's
+        // definition, and repair's remedy is to move it to lost+found.  That is
+        // what an inode looks like when it is allocated without being linked, and
+        // linking one is `create`, which does not exist: this program has no way
+        // to make a directory entry.  So the last check in this test is that the
+        // inode's allocation is the *only* thing repair objects to, and the
+        // assertion before it is that the chunk on its own is clean.
+        //
+        // This is also the first time `xfs_repair` has had anything to say about
+        // an inode this code allocated, and the two faults it did find were real
+        // and are now fixed rather than worked around: an attribute fork left
+        // with no format (`bad attribute format 0`) and a free inode whose
+        // `next_unlinked` was zero (`bad next_unlinked 0x0`).
+        let complaints = repair_complaints(image.path()).expect("xfs_repair runs");
+        let mut unexpected: Vec<&str> = complaints
+            .lines()
+            .filter(|l| !l.contains("disconnected inode"))
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect();
+        unexpected.sort_unstable();
+        unexpected.dedup();
+        assert!(
+            unexpected.is_empty(),
+            "repair has more to say than the disconnected inode:\n{}\n{}",
+            unexpected.join("\n"),
+            complaints
+        );
     }
 
     /// What a *free* inode's slot looks like on disk, read out of a real image.

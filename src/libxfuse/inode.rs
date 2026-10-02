@@ -120,6 +120,24 @@ mod offset {
     pub const AFORMAT: usize = 83;
     pub const FLAGS: usize = 90;
     pub const GEN: usize = 92;
+    /// The link in the list of inodes waiting to be reused.
+    ///
+    /// **Immediately after the core, at offset 96** for a version 2 or 3 inode --
+    /// not at the end of the inode, which is where the obvious guess puts it and
+    /// which is where the first version of the new-chunk code wrote it.  Found by
+    /// writing a recognisable value at each offset of a real free inode's slot and
+    /// asking `xfs_repair -n` which one it read:
+    ///
+    /// ```text
+    /// next_unlinked at offset 96 -> bad next_unlinked 0xdeadbeef on inode 524353
+    /// ```
+    ///
+    /// and the value it wants is `0xffffffff`, the marker that ends the list.
+    /// Anything else -- zero, one, the inode's own number -- is refused, so a free
+    /// inode whose field is zero is a fault repair reports.
+    pub const NEXT_UNLINKED: usize = 96;
+    /// The value that ends the list of inodes waiting to be reused.
+    pub const NO_UNLINKED: u32 = 0xffff_ffff;
     /// The start of the version 3 fields.
     pub const V3: usize = 100;
     pub const CRC: usize = 100;
@@ -200,6 +218,50 @@ impl RawDinode {
     }
 
     /// Take ownership of an inode's bytes.
+    /// A slot of the right size that no file system has written into.
+    ///
+    /// Not an inode: it has no magic and no version, so reading it back is an
+    /// error, which is the point.  It is what an allocator starts from when the
+    /// tree has said an inode is free and the slot turns out to hold nothing, and
+    /// every field that is not set on it is then zero rather than inherited from
+    /// whatever used to be there.
+    pub fn unused(inode_size: usize) -> Self {
+        RawDinode {
+            bytes:   vec![0u8; inode_size].into_boxed_slice(),
+            version: 0,
+            dirty:   true,
+        }
+    }
+
+    /// The inode version a slot of this size is written with.
+    ///
+    /// Two for a 256-byte inode and three for a larger one, which is what
+    /// `xfs_db` reports for the inodes these images already hold
+    /// (`core.version = 2` on a 256-byte inode in `xfs_writable.img`).
+    pub fn version_for(inode_size: usize) -> i8 {
+        if inode_size > 256 {
+            3
+        } else {
+            2
+        }
+    }
+
+    /// Record that this inode is not on the list of inodes waiting to be reused.
+    ///
+    /// Zero there is *not* the same thing, and `xfs_repair -n` says so:
+    /// `bad next_unlinked 0x0 on inode N`.  The list's end marker is what a slot
+    /// that is free and not linked carries.
+    pub fn set_next_unlinked(&mut self) {
+        let at = offset::NEXT_UNLINKED;
+        self.bytes[at..at + 4].copy_from_slice(&offset::NO_UNLINKED.to_be_bytes());
+    }
+
+    /// Whether this inode says it is at the end of the reuse list.
+    pub fn is_unlinked(&self) -> bool {
+        let at = offset::NEXT_UNLINKED;
+        u32::from_be_bytes(self.bytes[at..at + 4].try_into().unwrap()) == offset::NO_UNLINKED
+    }
+
     pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> FsResult<Self> {
         let bytes = bytes.into();
         if bytes.len() < offset::V3 {
@@ -417,6 +479,19 @@ impl RawDinode {
     /// Set the offset of the attribute fork within the local area.
     pub fn set_forkoff(&mut self, forkoff: u8) {
         self.bytes[offset::FORKOFF] = forkoff;
+        self.update_crc();
+    }
+
+    /// Set the format of the *attribute* fork: `1` for a list held in the inode.
+    ///
+    /// A new file's attribute fork needs this as much as its data fork does, and
+    /// leaving it at zero is not "no attributes" -- it is an invalid format that
+    /// `xfs_repair -n` reports as `bad attribute format 0 in inode N, would reset
+    /// value` and then cannot use.  `allocate_ino` set the data fork's format and
+    /// not this one, which nothing noticed because the only test that allocated an
+    /// inode did not ask repair.
+    pub fn set_aformat(&mut self, format: u8) {
+        self.bytes[offset::AFORMAT] = format;
         self.update_crc();
     }
 
