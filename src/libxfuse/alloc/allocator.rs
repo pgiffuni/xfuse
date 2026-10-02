@@ -475,6 +475,11 @@ fn append_to_the_free_list(
     agfl.update_crc();
     transaction.write_bytes(at, agfl.as_bytes())?;
     agf.set_free_list_window(window.first, window.last, window.count);
+    // Written here rather than left for the caller, because a split during the
+    // tree work takes an entry off the list and moves the window again -- so it
+    // has to be on disk before that happens, or the split would be looking at a
+    // window that does not include what this function just appended.
+    write_agf(transaction, sb, agno, agf)?;
     Ok(room)
 }
 
@@ -561,6 +566,13 @@ pub fn free_in_group(
     // Read the new roots and heights back off the blocks themselves, so the
     // header records what the tree is rather than what it was assumed to be,
     // and the group's own numbers follow the trees in the same transaction.
+    // Read the group header again before writing it.  A split in the tree work
+    // above takes a block off the free list and moves the header's window to
+    // match, and writing the copy this function started with would put the
+    // window back over a slot that is now null -- which is what taking the next
+    // entry then refuses.  The header is shared by everything that touches this
+    // group, so it has to be re-read rather than carried.
+    agf = read_agf(transaction, sb, agno)?;
     let (free, longest, block_level, size_level) = {
         let mut fresh = TransactionBlocks::new(transaction, sb, agno);
         let block_root = crate::libxfuse::alloc::free_space::read_node(
@@ -1833,8 +1845,35 @@ mod t {
     /// the array agreeing.  That is where this should be picked up: read what
     /// `take_front` does to the window, and what the group's header is told about
     /// it afterwards.
+    ///
+    /// **Not passing, and it is what found a real fault.**
+    ///
+    /// Giving back single blocks from inside a taken run is what a file giving up
+    /// its middle does, and it is the only way to make a leaf overflow -- the
+    /// blocks a whole run gives back are contiguous, so consecutive frees join
+    /// into one growing record and a record count never rises.
+    ///
+    /// Doing it exposed that the group header is written twice in one free: this
+    /// function reads it at the start and writes it at the end, and a split in
+    /// between takes a block off the free list and moves the header's window to
+    /// match.  Writing the copy this function started with put the window back
+    /// over a slot that is now null, which taking the next entry then refuses:
+    ///
+    /// ```text
+    /// free: Corrupt { what: "the group free list has a null block in its live window" }
+    /// ```
+    ///
+    /// The header is now read again before it is written, so a window a split
+    /// moved survives.  That is fixed and stays.
+    ///
+    /// What the test cannot do is **reach the split** -- the trees still do not
+    /// overflow, `agf_btreeblks` stays where it was -- and it cannot be judged by
+    /// `xfs_repair` either, because the blocks it frees were handed out by the
+    /// allocator and belong to no file, so repair rightly objects to inodes that
+    /// are not giving them up.  Overflowing a leaf for real needs a file to give
+    /// up its middle, which is the truncate that is not built.
     #[test]
-    #[ignore = "consuming a list entry can leave a null inside the live window"]
+    #[ignore = "the trees do not overflow, and repair cannot judge freed blocks no file gave up"]
     fn an_overflowing_leaf_takes_a_node_off_the_free_list() {
         let Some(golden) = crate::libxfuse::alloc::golden("xfsv4.img") else {
             eprintln!("skipping: no unpacked xfsv4.img");
