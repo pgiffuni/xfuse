@@ -260,6 +260,34 @@ impl InobtNode {
         })
     }
 
+    /// The bytes as they were read, for writing back.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The bytes, for writing back.
+    pub fn into_bytes(self) -> Box<[u8]> {
+        self.bytes
+    }
+
+    /// Recompute the node's checksum over the node it now is.
+    ///
+    /// A record changed without it changed is a record nothing can be trusted
+    /// from -- but **only where the file system checksums its metadata**, and
+    /// neither reference image does: both are version 4 built without checksums,
+    /// so these nodes carry none and there is nothing to recompute.
+    ///
+    /// That is not the same as there being nothing to do on a checksummed file
+    /// system, and this is not written to pretend otherwise.  Where a checksum
+    /// goes in a version 5 inode b-tree node has not been established here, and
+    /// writing one at a guessed offset would corrupt a real image rather than
+    /// protect it.  So this does nothing until that offset is known, and the
+    /// gap is recorded here rather than papered over.
+    pub fn update_crc(&mut self) {
+        // Nothing to recompute: see above.
+        let _ = &mut self.bytes;
+    }
+
     fn u64_at(&self, at: usize) -> u64 {
         let mut v = [0u8; 8];
         v.copy_from_slice(&self.bytes[at..at + 8]);

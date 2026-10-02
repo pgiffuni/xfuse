@@ -187,6 +187,18 @@ impl RawDinode {
     /// an inode from the zeroes of a slot that was never used.
     pub const MAGIC: u16 = 0x494e;
 
+    /// The inode version: 1, 2 or 3.
+    ///
+    /// A slot that has never been used has a version of zero, which is not one,
+    /// and the version decides where the inode's own extent list and attribute
+    /// area begin.  An inode written without it would be laid out for a version
+    /// that does not exist.
+    pub fn set_version(&mut self, version: i8) {
+        self.version = version;
+        self.bytes[offset::VERSION] = version as u8;
+        self.update_crc();
+    }
+
     /// Take ownership of an inode's bytes.
     pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> FsResult<Self> {
         let bytes = bytes.into();
