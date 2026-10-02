@@ -2089,6 +2089,223 @@ mod t {
     /// charged for and held by no tree, is the one the previous commit established
     /// is not a file system at all.
     ///
+    /// The occupancy a free space leaf has to keep, measured rather than
+    /// inferred from the B+tree literature.
+    ///
+    /// The B+tree documentation says a node "should" be rebalanced when it
+    /// underflows.  What XFS will *accept* is a different question, and it is the
+    /// one that decides whether a delete has to merge.  Established here by
+    /// shrinking a real leaf and asking:
+    ///
+    /// ```text
+    /// group 1's first bno leaf, 31 records, set to 30:
+    ///     bad btree nrecs (30, min=31, max=62) in btbno block 1/4
+    /// the same leaf set to 16, or to 8: the same complaint, with the number
+    /// ```
+    ///
+    /// So a leaf in a 512-byte block holds at most 62 records and, **if it has a
+    /// parent**, at least 31 -- half of 62, rounded up.  A delete that leaves a
+    /// non-root leaf with fewer than 31 records has to merge it, and that is not a
+    /// policy choice.
+    ///
+    /// The second half is what makes the rule bounded, and it is the half that is
+    /// easy to get wrong: **a leaf that is also the root is exempt.**  Group 0's
+    /// two trees are single leaves, blocks 4 and 5; with both shrunk together, to
+    /// 10 records, then 3, then 1, so that the two trees still agree with each
+    /// other and the record slots outside the new count are cleared, so that the
+    /// only thing wrong with the image is the occupancy, `xfs_repair -n` says
+    /// nothing about the number of records:
+    ///
+    /// ```text
+    /// agf_freeblks 30144, counted 3 in ag 0      (and nothing about nrecs)
+    /// agf_longest 29528, counted 3 in ag 0
+    /// ```
+    ///
+    /// Those lines are the accounting, and they are exactly what dropping records
+    /// without touching a header should earn.  What is absent is the complaint.
+    /// A root has no parent to rebalance against, so a tree that is a single leaf
+    /// never needs a merge, and a merge that empties a whole interior node has to
+    /// stop at the root rather than collapse it.
+    ///
+    /// The first version of this experiment shrank the root leaves *without*
+    /// clearing the leftover records, and reported the root as constrained.  It
+    /// was not: repair was complaining that the two trees disagreed, which is a
+    /// different fault, and had stopped before reaching the occupancy.  The
+    /// assertion below that the accounting complaint is *present* in the patched
+    /// image is what stops that mistake being made again -- an absent complaint
+    /// only means something if repair got far enough to have made one.
+    ///
+    /// This test patches metadata on purpose, which is otherwise the one thing
+    /// these tests do not do, because the subject here is what repair accepts of
+    /// an image nothing else will produce.
+    #[test]
+    fn the_occupancy_a_leaf_must_keep_is_what_repair_says_it_is() {
+        let Some(golden) = crate::libxfuse::alloc::golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let sb = sb_of(&golden);
+        let bs = sb.sb_blocksize as usize;
+        assert_eq!(
+            bs, 512,
+            "the numbers below were measured on a 512-byte block"
+        );
+        let ag_base = u64::from(sb.sb_agblocks) * bs as u64;
+
+        // 1. A non-root leaf.  Group 1's bno tree is two levels deep, and the
+        //    leaf measured is the first child of its root.
+        let leaf = {
+            let mut header = vec![0u8; bs];
+            std::fs::File::open(&golden)
+                .unwrap()
+                .read_exact_at(&mut header, sb.ag_header_offset(1, Sb::AGF_SECTOR))
+                .unwrap();
+            let root = be32(&header, 16);
+            let mut bytes = vec![0u8; bs];
+            std::fs::File::open(&golden)
+                .unwrap()
+                .read_exact_at(&mut bytes, ag_base + u64::from(root) * bs as u64)
+                .unwrap();
+            let node = FreeSpaceNode::from_bytes(bytes, sb.has_crc(), true).expect("the root");
+            assert!(
+                !node.is_leaf(),
+                "group 1's tree is meant to be two levels deep"
+            );
+            node.children().expect("children")[0]
+        };
+        let records_here = node_numrecs(&golden, &sb, 1, leaf);
+        assert_eq!(
+            records_here, 31,
+            "the leaf the measurement was made on has moved"
+        );
+
+        for below in [30u16, 16, 8] {
+            let image = patch_leaf(&golden, &sb, 1, leaf, below);
+            let complaints = repair_complaints(&image).expect("xfs_repair runs");
+            assert!(
+                complaints.contains(&format!("bad btree nrecs ({below}, min=31, max=62)")),
+                "a non-root leaf with {below} records was not objected to, so the minimum the \
+                 allocator has to respect is not 31; repair now says:\n{complaints}"
+            );
+        }
+
+        // 2. A leaf that is also the root.  Both of group 0's trees are shrunk
+        //    together so that they still agree, and the slots outside the new
+        //    count are cleared, so the occupancy is the only thing wrong.
+        for down_to in [10u16, 3, 1] {
+            let image = shrink_both_roots(&golden, &sb, down_to);
+            let complaints = repair_complaints(&image).expect("xfs_repair runs");
+            assert!(
+                !complaints.contains("nrecs"),
+                "a root leaf with {down_to} records was objected to, so the exemption measured \
+                 does not hold:\n{complaints}"
+            );
+            assert!(
+                complaints.contains("agf_freeblks"),
+                "the patched image should have complained about the counters and did not, so \
+                 repair cannot have got as far as the leaves:\n{complaints}"
+            );
+        }
+    }
+
+    /// How many records a leaf of a group claims to hold, read off the image.
+    fn node_numrecs(image: &std::path::Path, sb: &Sb, agno: u32, block: u32) -> u16 {
+        let bs = sb.sb_blocksize as usize;
+        let mut bytes = vec![0u8; bs];
+        std::fs::File::open(image)
+            .unwrap()
+            .read_exact_at(
+                &mut bytes,
+                u64::from(agno) * u64::from(sb.sb_agblocks) * bs as u64
+                    + u64::from(block) * bs as u64,
+            )
+            .unwrap();
+        // The record count is at the same offset in both forms of the header;
+        // what a checksum moves is where the *records* begin.
+        u16::from_be_bytes([bytes[6], bytes[7]])
+    }
+
+    /// A copy of an image with one leaf's record count set to `nrecs` and the
+    /// record slots outside it cleared.
+    ///
+    /// The slots are cleared as well as the count set, because a count claiming
+    /// fewer records than the block still holds is not the same thing as a leaf
+    /// with fewer records: repair reads the block, not the count, and would
+    /// complain about the leftovers instead of the thing being measured.
+    fn patch_leaf(
+        golden: &std::path::Path,
+        sb: &Sb,
+        agno: u32,
+        block: u32,
+        nrecs: u16,
+    ) -> std::path::PathBuf {
+        let bs = sb.sb_blocksize as usize;
+        let base =
+            u64::from(agno) * u64::from(sb.sb_agblocks) * bs as u64 + u64::from(block) * bs as u64;
+        let image = copy_image(golden);
+        let device = BlockDevice::open(&image, Access::ReadWrite).unwrap();
+        device.write_at(&nrecs.to_be_bytes(), base + 6).unwrap();
+        // Only the slots the block has, or this writes into the blocks after it.
+        let header_len = if sb.has_crc() { 56usize } else { 16 };
+        let records_at = base + header_len as u64;
+        let capacity = u16::try_from((bs - header_len) / 8).unwrap();
+        for i in u16::from(nrecs)..capacity {
+            device
+                .write_at(&[0u8; 8], records_at + 8 * u64::from(i))
+                .unwrap();
+        }
+        device.flush().unwrap();
+        image
+    }
+
+    /// A copy of an image with group 0's two root leaves shrunk to `nrecs`.
+    ///
+    /// Both trees together, because a leaf with fewer records than the other tree
+    /// records is a different fault and repair would complain about that instead
+    /// of the occupancy.
+    fn shrink_both_roots(golden: &std::path::Path, sb: &Sb, nrecs: u16) -> std::path::PathBuf {
+        let bs = sb.sb_blocksize as usize;
+        let mut roots = Vec::new();
+        for at in [16usize, 20] {
+            let mut header = vec![0u8; bs];
+            std::fs::File::open(golden)
+                .unwrap()
+                .read_exact_at(&mut header, sb.ag_header_offset(0, Sb::AGF_SECTOR))
+                .unwrap();
+            roots.push(be32(&header, at));
+        }
+        let image = copy_image(golden);
+        let device = BlockDevice::open(&image, Access::ReadWrite).unwrap();
+        for root in roots {
+            let base = u64::from(root) * bs as u64;
+            device.write_at(&nrecs.to_be_bytes(), base + 6).unwrap();
+            let header_len = if sb.has_crc() { 56usize } else { 16 };
+            let records_at = base + header_len as u64;
+            let capacity = u16::try_from((bs - header_len) / 8).unwrap();
+            for i in u16::from(nrecs)..capacity {
+                device
+                    .write_at(&[0u8; 8], records_at + 8 * u64::from(i))
+                    .unwrap();
+            }
+        }
+        device.flush().unwrap();
+        image
+    }
+
+    /// A writable copy of an image on disk, which a test can patch and keep for as
+    /// long as it needs.
+    fn copy_image(golden: &std::path::Path) -> std::path::PathBuf {
+        let copy = tempfile::Builder::new()
+            .prefix("xfuse-patched-")
+            .suffix(".img")
+            .tempfile()
+            .unwrap();
+        let path = copy.path().to_path_buf();
+        std::fs::copy(golden, &path).unwrap();
+        copy.keep().expect("keep the copy");
+        path
+    }
+
     /// The second branch is reached by filling the list, which is done the way the
     /// group does it -- by freeing blocks, so the list is stocked with blocks the
     /// group is honestly offering.

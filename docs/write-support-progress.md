@@ -484,11 +484,33 @@ Concretely, in order:
    a block that has been taken for a node but not yet linked into a tree is a
    state `xfs_repair` refuses, so "charged for" and "held by a tree" have to move
    in the same transaction, not one after the other.
-6. **Tree balancing**, validated against `xfs_repair` before it is written: a
-   leaf in a 512-byte block holds at most 62 records and `xfs_repair` refuses
-   one holding fewer than 31 (`bad btree nrecs (30, min=31, max=62)`), so
-   merging is required after all, whatever the B+tree documentation's "should"
-   suggests.
+6. **Tree balancing.**  The occupancy rule is now measured rather than assumed,
+   by shrinking a real leaf and asking `xfs_repair`:
+
+   ```text
+   group 1's first bno leaf, 31 records, set to 30:
+       bad btree nrecs (30, min=31, max=62) in btbno block 1/4
+   ```
+
+   So a leaf in a 512-byte block holds at most 62 records and, **if it has a
+   parent**, at least 31 — half of 62, rounded up.  A delete that leaves a
+   non-root leaf below that has to merge, whatever the B+tree documentation's
+   "should" says.
+
+   And the half that bounds it: **a leaf that is also the root is exempt.**
+   Group 0's two trees are single leaves, and with both shrunk together — so that
+   they still agree, and with the leftover record slots cleared so that occupancy
+   is the only thing wrong — `xfs_repair -n` says nothing about the number of
+   records, at 10 records, at 3, or at 1.  So a tree that is a single leaf never
+   needs a merge, and a merge that empties a whole interior node stops at the root
+   rather than collapsing it.
+
+   The first attempt at that experiment shrank the root leaves without clearing
+   the leftovers and reported the root as constrained; it was not.  Repair had
+   stopped on the trees disagreeing.  An absent complaint means nothing unless
+   repair got far enough to have made one, so the test also asserts that the
+   accounting complaint *is* present in the patched image.
+
 7. **New inode chunks**, only when a test needs one.
 8. **File extension and holes** — both already work for the contiguous case;
    what remains is making them survive the allocator work above.
