@@ -2017,8 +2017,116 @@ mod t {
         seen.len() as u32
     }
 
-    /// The accounting every group header keeps, checked against what the image
-    /// actually holds.
+    /// Check one group's accounting against what the image actually holds, and
+    /// return its three terms.
+    ///
+    /// This is the oracle, and it is written once so that it can be asked the
+    /// same question before and after an operation.  An invariant that is only
+    /// checked on an untouched image is true of every image nobody has written
+    /// to, which is not the question that matters.
+    fn group_terms(image: &std::path::Path, sb: &Sb, agno: u32, what: &str) -> (u64, u64, u64) {
+        let by_block = free_runs_in_group(image, sb, agno, true);
+        let by_size = free_runs_in_group(image, sb, agno, false);
+        assert_eq!(
+            by_block, by_size,
+            "ag{agno} {what}: the two trees do not hold the same free space"
+        );
+        // Sorted, and no two of them naming the same block.
+        for pair in by_block.windows(2) {
+            assert!(
+                pair[0].start + pair[0].len <= pair[1].start,
+                "ag{agno} {what}: runs {:?} and {:?} overlap or touch",
+                pair[0],
+                pair[1]
+            );
+        }
+        let mut header = vec![0u8; sb.sb_blocksize as usize];
+        std::fs::File::open(image)
+            .unwrap()
+            .read_exact_at(&mut header, sb.ag_header_offset(agno, Sb::AGF_SECTOR))
+            .unwrap();
+        assert_eq!(
+            be32(&header, 52),
+            by_block.iter().map(|r| r.len).sum::<u32>(),
+            "ag{agno} {what}: the header's free count is not the bno tree's total"
+        );
+        assert_eq!(
+            be32(&header, 56),
+            by_block.iter().map(|r| r.len).max().unwrap_or(0),
+            "ag{agno} {what}: the header's longest run is not the tree's"
+        );
+
+        // The free list: what it holds is reserved, so it is neither block 0 nor
+        // the null block, and it is not free space as well.
+        let (first, last, count, entries) = free_list_window(image, sb, agno);
+        if count == 0 {
+            assert!(
+                entries.is_empty(),
+                "ag{agno} {what}: a window with no live entries named {entries:?}"
+            );
+        } else {
+            assert_eq!(
+                count as usize,
+                entries.len(),
+                "ag{agno} {what}: the window's count is not the span it names"
+            );
+            assert!(
+                first <= last,
+                "ag{agno} {what}: window {first}..={last} is inside out"
+            );
+            let free_set: std::collections::HashSet<u32> = by_block
+                .iter()
+                .flat_map(|r| r.start..r.start + r.len)
+                .collect();
+            for entry in &entries {
+                assert_ne!(*entry, 0, "ag{agno} {what}: the list offers block 0");
+                assert_ne!(
+                    *entry,
+                    crate::libxfuse::alloc::agf::NULL_AGBLOCK,
+                    "ag{agno} {what}: the list offers the null block"
+                );
+                assert!(
+                    !free_set.contains(entry),
+                    "ag{agno} {what}: block {entry} is on the free list and free space at the \
+                     same time"
+                );
+            }
+        }
+        (
+            u64::from(be32(&header, 52)),
+            u64::from(be32(&header, 60)),
+            u64::from(count),
+        )
+    }
+
+    /// The two free space trees hold exactly as many blocks as the header is
+    /// charged for, less the two roots.
+    ///
+    /// This one is separated from the rest because it is the only one that is
+    /// false of a *mid-operation* state.  A split takes a block for a node,
+    /// charges the group for it, and only then links the node in; between those
+    /// two the header counts a block no tree holds.  That is a real state of a
+    /// real transaction and it is correct, so the check belongs to the states
+    /// that a file system can be *left* in, and a test that wants it in the
+    /// middle has to finish the operation.
+    fn assert_trees_own_what_is_charged(image: &std::path::Path, sb: &Sb, agno: u32, what: &str) {
+        let mut header = vec![0u8; sb.sb_blocksize as usize];
+        std::fs::File::open(image)
+            .unwrap()
+            .read_exact_at(&mut header, sb.ag_header_offset(agno, Sb::AGF_SECTOR))
+            .unwrap();
+        assert_eq!(
+            be32(&header, 60) + 2,
+            count_free_space_btree_blocks(image, sb, agno),
+            "ag{agno} {what}: the header is charged {} blocks and the trees hold {}, less their \
+             two roots",
+            be32(&header, 60),
+            count_free_space_btree_blocks(image, sb, agno)
+        );
+    }
+
+    /// Every group's accounting adds up to the superblock's, on an image nobody
+    /// has written to.
     ///
     /// These are the relationships the write path needs and used to assume.  Each
     /// was measured against native XFS -- on this repository's images, and on one
@@ -2040,9 +2148,8 @@ mod t {
     /// on `xfs_writable.img` and `xfs_4kn.img` is what settled it, and
     /// `xfs_repair -n` counts the same three terms independently.
     ///
-    /// Nothing here writes.  This is the oracle the write path is measured
-    /// against, so it has to be true of an image nobody has touched -- and it is
-    /// the place a later change to any of the three has to be reconciled with.
+    /// This is the baseline the mutation tests compare against: the same check,
+    /// asked again after an operation, is in [`group_terms`].
     #[test]
     fn the_group_accounting_matches_what_the_image_holds() {
         let mut checked = 0usize;
@@ -2052,87 +2159,13 @@ mod t {
                 continue;
             };
             let sb = sb_of(&path);
-            let mut free = 0u64;
-            let mut tree_blocks = 0u64;
-            let mut listed = 0u64;
+            let (mut free, mut tree_blocks, mut listed) = (0u64, 0u64, 0u64);
             for agno in 0..sb.agcount() {
-                let by_block = free_runs_in_group(&path, &sb, agno, true);
-                let by_size = free_runs_in_group(&path, &sb, agno, false);
-                assert_eq!(
-                    by_block, by_size,
-                    "{name} ag{agno}: the two trees do not hold the same free space"
-                );
-                // Sorted, and no two of them naming the same block.
-                for pair in by_block.windows(2) {
-                    assert!(
-                        pair[0].start + pair[0].len <= pair[1].start,
-                        "{name} ag{agno}: runs {:?} and {:?} overlap or touch",
-                        pair[0],
-                        pair[1]
-                    );
-                }
-                let mut header = vec![0u8; sb.sb_blocksize as usize];
-                std::fs::File::open(&path)
-                    .unwrap()
-                    .read_exact_at(&mut header, sb.ag_header_offset(agno, Sb::AGF_SECTOR))
-                    .unwrap();
-                assert_eq!(
-                    be32(&header, 52),
-                    by_block.iter().map(|r| r.len).sum::<u32>(),
-                    "{name} ag{agno}: the header's free count is not the bno tree's total"
-                );
-                assert_eq!(
-                    be32(&header, 56),
-                    by_block.iter().map(|r| r.len).max().unwrap_or(0),
-                    "{name} ag{agno}: the header's longest run is not the tree's"
-                );
-                let blocks = count_free_space_btree_blocks(&path, &sb, agno);
-                assert_eq!(
-                    be32(&header, 60) + 2,
-                    blocks,
-                    "{name} ag{agno}: the header's btree count is not the trees' block count less \
-                     their two roots"
-                );
-
-                // The free list: what it holds is reserved, so it is neither
-                // block 0 nor the null block, and it is not free space as well.
-                let (first, last, count, entries) = free_list_window(&path, &sb, agno);
-                if count == 0 {
-                    assert!(
-                        entries.is_empty(),
-                        "{name} ag{agno}: a window with no live entries named {entries:?}"
-                    );
-                } else {
-                    assert_eq!(
-                        count as usize,
-                        entries.len(),
-                        "{name} ag{agno}: the window's count is not the span it names"
-                    );
-                    assert!(
-                        first <= last,
-                        "{name} ag{agno}: window {first}..={last} is inside out"
-                    );
-                    let free_set: std::collections::HashSet<u32> = by_block
-                        .iter()
-                        .flat_map(|r| r.start..r.start + r.len)
-                        .collect();
-                    for entry in &entries {
-                        assert_ne!(*entry, 0, "{name} ag{agno}: the list offers block 0");
-                        assert_ne!(
-                            *entry,
-                            crate::libxfuse::alloc::agf::NULL_AGBLOCK,
-                            "{name} ag{agno}: the list offers the null block"
-                        );
-                        assert!(
-                            !free_set.contains(entry),
-                            "{name} ag{agno}: block {entry} is on the free list and free space at \
-                             the same time"
-                        );
-                    }
-                }
-                free += u64::from(be32(&header, 52));
-                tree_blocks += u64::from(be32(&header, 60));
-                listed += u64::from(count);
+                let (f, t, l) = group_terms(&path, &sb, agno, "as it was unpacked");
+                assert_trees_own_what_is_charged(&path, &sb, agno, "as it was unpacked");
+                free += f;
+                tree_blocks += t;
+                listed += l;
                 checked += 1;
             }
             assert_eq!(
@@ -2147,6 +2180,163 @@ mod t {
             );
         }
         assert!(checked > 0, "no image was unpacked, so nothing was checked");
+    }
+
+    /// The same accounting, asked again after this code has changed a group.
+    ///
+    /// The baseline check above only says the invariants hold of an image nobody
+    /// has written to, which is a claim about the images rather than about the
+    /// allocator.  This asks it after every step of a sequence of operations
+    /// that touch every part of the accounting: an allocation, a block taken for
+    /// a node, a free, a free that cuts a record in two, and a free that has to
+    /// give up on the free list and go to the trees.
+    ///
+    /// The device-wide identity is the one that catches a counter nobody
+    /// remembered.  It is checked after *every* step rather than at the end,
+    /// because a sequence that only has to be right at the end can be wrong in
+    /// the middle and right again, and a single step is small enough to read.
+    #[test]
+    fn the_accounting_survives_operations_that_change_it() {
+        let Some(image) = copy_of_golden("xfsv4.img") else {
+            eprintln!("skipping: no xfsv4.img to copy");
+            return;
+        };
+        let sb = sb_of(image.path());
+        let agno = 0u32;
+        let device = Arc::new(BlockDevice::open(image.path(), Access::ReadWrite).unwrap());
+        let mut cache = BlockCache::new(sb.sb_blocksize as usize, 256);
+
+        // The whole image, so that the device-wide identity can be asked too.
+        let whole = |what: &str| {
+            let mut total = 0u64;
+            for ag in 0..sb.agcount() {
+                let (f, t, l) = group_terms(image.path(), &sb, ag, what);
+                total += f + t + l;
+            }
+            assert_eq!(
+                total,
+                sb_of(image.path()).sb_fdblocks,
+                "{what}: the superblock's free count is not the groups' three terms"
+            );
+        };
+        // The stronger claim, that the trees hold exactly what the header is
+        // charged for, holds of every state below *except* the one in the middle
+        // of step 2, and the reason is written where that step is.
+        let coherent = |what: &str| {
+            for ag in 0..sb.agcount() {
+                assert_trees_own_what_is_charged(image.path(), &sb, ag, what);
+            }
+        };
+        whole("before anything");
+        coherent("before anything");
+
+        // Something the group is not currently offering, so freeing it is a real
+        // change and not a no-op.  Anything allocated will do: what is being
+        // tested is the accounting, not the ownership.
+        assert!(
+            free_blocks_in_group(image.path(), &sb, agno, true).len() >= 16,
+            "the group has too little free space to work with"
+        );
+
+        // 1. Take a run for a file.
+        let allocated = {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let run = allocate(&mut tx, &sb, agno, 4).expect("the group can spare four blocks");
+            tx.commit().expect("commit");
+            eprintln!("allocated {run:?}");
+            run
+        };
+        device.flush().unwrap();
+        whole("after allocating four blocks");
+        coherent("after allocating four blocks");
+
+        // 2. Give the same run back, which is the one free this test can make
+        //    without lying to the file system: the blocks are this test's, and
+        //    any other allocated block belongs to a file's data fork, which would
+        //    be a truncate rather than a free.  The group puts what it can on the
+        //    list and the rest into the trees, and the two branches move different
+        //    terms, so this is the step where the identity has the most to say.
+        {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            free_in_group(&mut tx, &sb, agno, allocated).expect("give the run back");
+            tx.commit().expect("commit");
+        }
+        device.flush().unwrap();
+        whole("after freeing two blocks");
+        coherent("after freeing two blocks");
+
+        // 3. Free a block from the middle of a run, which cuts the record in two
+        //    and is the operation that grows the trees and can split a leaf.
+        let (victim, len) = {
+            let runs = free_runs_in_group(image.path(), &sb, agno, true);
+            let run = runs
+                .iter()
+                .find(|r| r.len >= 6)
+                .copied()
+                .expect("a run long enough to cut a hole in");
+            (run.start + 2, run.len)
+        };
+        {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            free_in_group(
+                &mut tx,
+                &sb,
+                agno,
+                FreeRun {
+                    start: victim,
+                    len:   1,
+                },
+            )
+            .expect("free one block from inside a run");
+            tx.commit().expect("commit");
+            eprintln!("freed {victim} out of a run of {len}");
+        }
+        device.flush().unwrap();
+        whole("after cutting a hole in a run");
+        coherent("after cutting a hole in a run");
+
+        // The first three steps leave a file system a file system can be left in,
+        // and the last word on that is repair's rather than this suite's.
+        assert_repair_accepts(image.path(), "after allocating, freeing and cutting a hole");
+
+        // 4. Take a block for a b-tree node, off the list, which is what a split
+        //    does -- and stop there.  A split takes a block, charges the group for
+        //    it and then links the node in, and linking one needs a leaf to
+        //    overflow, which nothing can yet do to a real image honestly.  So the
+        //    tree-ownership check is not asked of this step, and neither is
+        //    repair, which is worth saying precisely because the repair check is
+        //    the strongest one there is and it is *right* to refuse here:
+        //
+        //    ```text
+        //    agf_btreeblks 1, counted 0 in ag 0
+        //    sb_fdblocks 90624, counted 90623
+        //    ```
+        //
+        //    The header charges the group for a block no tree holds, so the block
+        //    is in none of the three places a free block can be accounted for and
+        //    the device-wide total is one short.  That is not a defect in the
+        //    take -- the transition is correct, and the identity is satisfied in
+        //    the way a transaction in flight satisfies it -- it is the state
+        //    between taking a node and linking it, and it is the next thing the
+        //    write path has to finish.
+        {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
+            let block = store.take_btree_block().expect("the list has an entry");
+            store
+                .put(
+                    block,
+                    leaf(XFS_ABTB_MAGIC, &[(block, 1)]).into_boxed_slice(),
+                )
+                .expect("write the node");
+            tx.commit().expect("commit");
+            eprintln!("took block {block} for a node, and stopped before linking it");
+        }
+        device.flush().unwrap();
+        whole("after taking a b-tree node off the list");
+        if let Some(complaints) = repair_complaints(image.path()) {
+            eprintln!("xfs_repair -n on a group holding an unlinked node says:\n{complaints}");
+        }
     }
 
     /// Freeing enough blocks to split a leaf leaves a coherent image, and the

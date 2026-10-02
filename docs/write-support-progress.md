@@ -442,16 +442,16 @@ Concretely, in order:
 4. **The reverse transition, b-tree → AGFL**, and the AGFL-full case, measured
    before implemented.
 
-5. **The free-space consistency oracle.**  Half done.  What is in place checks
-   every group of every unpacked image: the two trees hold the same free space,
-   the totals match `agf_freeblks`, the b-tree block count matches
-   `agf_btreeblks`, the free list's entries are valid and are not also free
-   space, and the device-wide identity holds.  What is missing is running those
-   same checks after *every* allocator operation rather than only on untouched
-   images, which is the half with teeth.  Then: `collect_free_runs()` returns
-   normalised extents and the suite checks, after every operation, that no run
-   overlaps group metadata or runs past the end of the group, that b-tree block
-   ownership is consistent, and that every modified v5 block verifies.
+5. ~~**The free-space consistency oracle.**~~  Done for the relationships that
+   exist.  One check, asked of every group of every unpacked image and again
+   after each step of a sequence of operations that touch all of it: the two
+   trees hold the same free space, no two runs overlap or touch, the totals and
+   the longest run match the header, the free list's entries are valid and are
+   not also free space, and the device-wide identity holds.  What writing that
+   found is in [What a metadata block's ownership costs](#what-a-metadata-blocks-ownership-costs):
+   a block that has been taken for a node but not yet linked into a tree is a
+   state `xfs_repair` refuses, so "charged for" and "held by a tree" have to move
+   in the same transaction, not one after the other.
 6. **Tree balancing**, validated against `xfs_repair` before it is written: a
    leaf in a 512-byte block holds at most 62 records and `xfs_repair` refuses
    one holding fewer than 31 (`bad btree nrecs (30, min=31, max=62)`), so
