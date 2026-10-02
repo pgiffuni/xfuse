@@ -1098,18 +1098,6 @@ impl FreeSpaceNode {
         self.numrecs() < self.min_records()
     }
 
-    /// Can a run be taken out of this leaf without leaving it in a shape the
-    /// file system would want to rebalance?
-    ///
-    /// Only a leaf with more than half its capacity may lose a record.  That
-    /// sounds cautious, and it is: taking the last record out of a leaf leaves an
-    /// empty one, and leaving a short one is something the file system would
-    /// rather fix than be handed.  Both need the layer that can merge, which is
-    /// the next change.
-    pub fn can_lose(&self) -> bool {
-        self.numrecs() > self.min_records()
-    }
-
     /// Which of the two orders this tree keeps its runs in.
     pub fn order(&self) -> Order {
         if self.by_block {
@@ -1225,6 +1213,23 @@ pub trait GroupBlocks {
     /// of the same thing that hands out the tree's blocks rather than being
     /// passed in separately: the group is what holds the answer.
     fn take_btree_block(&mut self) -> FsResult<XfsAgblock>;
+    /// Give a block that was a node of one of these trees back to the group.
+    ///
+    /// The mirror of [`GroupBlocks::take_btree_block`], and it exists because a
+    /// merge releases a node: a leaf that drops below the occupancy the format
+    /// accepts is merged into a sibling, and the block it lived in stops being a
+    /// node.
+    ///
+    /// This is a question about the group rather than about the shape of the
+    /// tree, for the same reason taking one is: where a released block goes --
+    /// onto the free list, or into ordinary free space -- depends on the group's
+    /// free list, and the group is what holds the answer.  Leaving it to the tree
+    /// would have the tree decide, and it cannot.
+    ///
+    /// It is not optional bookkeeping.  A group whose header claims more b-tree
+    /// blocks than its trees hold is a state `xfs_repair -n` reports, and it is
+    /// reached the moment the first merge happens on a real image.
+    fn give_back_btree_block(&mut self, block: XfsAgblock) -> FsResult<()>;
 }
 
 /// Check that every level of a tree is a doubly linked list of exactly the live
@@ -1352,6 +1357,15 @@ impl GroupBlocks for MemoryBlocks {
 
     fn put(&mut self, block: XfsAgblock, bytes: Box<[u8]>) -> FsResult<()> {
         self.blocks.insert(block, bytes);
+        Ok(())
+    }
+
+    fn give_back_btree_block(&mut self, block: XfsAgblock) -> FsResult<()> {
+        // A group in memory has no free list and no header, so a released node
+        // simply becomes a block again: it is taken out of the map, which is what
+        // "nothing in this group is using it" means here, and it can be handed out
+        // again by `take_btree_block` afterwards.
+        self.blocks.remove(&block);
         Ok(())
     }
 }
@@ -1895,6 +1909,13 @@ fn walk_up<B: GroupBlocks>(
         if child_node.numrecs() == 0 {
             unlink_child(blocks, geometry, &parent, *index)?;
             parent.remove_child(*index)?;
+            // The node is gone from the tree, so the group has to stop charging
+            // for it: `agf_btreeblks` is a count of the blocks the trees hold, and
+            // a header that still counts this one describes a tree that has a node
+            // no walk will ever reach.  Handing it back is a question about the
+            // group -- onto the free list, or into free space -- so it is asked of
+            // the group rather than decided here.
+            blocks.give_back_btree_block(child)?;
         } else if child_node.wants_merging() && parent.numrecs() > 1 {
             // Into the sibling on its left if there is one, so that its records
             // end up where the tree's order says, and into the one on its right
@@ -1914,6 +1935,13 @@ fn walk_up<B: GroupBlocks>(
                 blocks.put(sibling_block, sibling.into_bytes())?;
                 unlink_child(blocks, geometry, &parent, *index)?;
                 parent.remove_child(*index)?;
+                // Same as above: the leaf has been merged away, so the block
+                // it lived in is no longer one of the trees' blocks.  This is
+                // the ordinary way a node is released -- a leaf that was
+                // already half empty, one record taken from it, and it fits
+                // in its neighbour -- and a group that counted it afterwards
+                // would be wrong by one for every merge.
+                blocks.give_back_btree_block(child)?;
             } else {
                 // Two full leaves cannot be merged into one, and this is the
                 // ordinary case rather than the corner one: a leaf that has just

@@ -150,7 +150,7 @@ kernel usually does not send `open`/`opendir` at all.
 | Area | Status | What is missing |
 |:-----|:-------|:----------------|
 | Free-space tree structural growth | in progress | Leaf split and root split exist and are tested in memory.  They are not reachable from the image, because reaching them needs a leaf to overflow, and no test can overflow a leaf honestly without a file giving up its blocks — which is the truncate that is not built. |
-| Free-space tree shrinkage | in progress | Not started, in fact, and deliberately: the minimum a leaf may hold is 31 records in a 512-byte block, so a delete that leaves one below that has to merge, and the merge has to be validated against `xfs_repair` before it is written. |
+| Free-space tree shrinkage | in progress | Leaf merging works and is checked on a real image with `xfs_repair`.  Root collapse does not exist, and is not reachable: nothing empties an interior node, because a parent always has at least two children and the merge branch refuses to take the last one. |
 
 ### Blocked
 
@@ -180,15 +180,20 @@ What is left in order:
    code resets, which keeps the model closed — a window that advanced past the end
    of the array would name a slot that is not there — and the choice is made in
    one place so it can be changed when it is established.
-3. **Leaf merge, parent removal, root collapse.**  `xfs_repair` refuses a leaf
-   below 31 records in a 512-byte block, so merging is required, and the released
-   node now has somewhere to go when a merge produces one.
+3. **Root collapse.**  Leaf merging works — see below — but a root left with a
+   single child is not collapsed into it.  It cannot be reached yet, which is why
+   it is not built: a parent always holds at least two children, the merge branch
+   refuses to take the last one, and nothing else removes a node, so no interior
+   node can be emptied.  It becomes reachable the moment something can empty a
+   parent, and it should be written then, against a test that gets there, rather
+   than speculatively.
 
 ### Not started
 
 | Area |
 |:-----|
-| Leaf merge, parent removal, root collapse |
+| Leaf merge and parent removal |
+| Root collapse |
 | New inode chunk allocation |
 | BMBT growth (inode btree interior nodes) |
 | Truncate, and freeing a file's data |
@@ -511,6 +516,30 @@ Concretely, in order:
    repair got far enough to have made one, so the test also asserts that the
    accounting complaint *is* present in the patched image.
 
+   With the rule measured, the merge itself turned out to be **already written**
+   — `walk_up` merges a short leaf into its left sibling, shares records across the
+   boundary when the sibling is full, unlinks the node and relinks its two
+   neighbours — and already fuzzed in memory, 300 randomised take-and-free rounds
+   per seed against a model of which blocks are free.  What was missing was not the
+   tree work but the two things only a real image could show, and both turned up
+   the moment a merge was actually run on one:
+
+   * **the group kept charging for the node the merge released.**  `agf_btreeblks`
+     is a count of the blocks the trees hold, so a header still counting a merged-
+     away leaf describes a tree with a node no walk will ever reach.  A merge is
+     now the first real caller of the release path, and the release is asked of the
+     group rather than decided by the tree, because where a released block goes
+     depends on the group's free list and the group is what holds the answer.
+
+   * **the take path wrote a stale header over the top.**  `allocate_in_group`
+     reasoned that a take cannot split and therefore cannot touch the group header
+     — which was true while taking could only shrink leaves, and stopped being true
+     the moment a shrink could merge one.  It now reads the header again before
+     writing it, exactly as the free path already had to.  That is the third time
+     this suite has found that same bug in a different place: the header is shared
+     by everything that touches a group, so a copy taken before the work is a copy
+     taken too early.
+
 7. **New inode chunks**, only when a test needs one.
 8. **File extension and holes** — both already work for the contiguous case;
    what remains is making them survive the allocator work above.
@@ -703,7 +732,8 @@ metadata — hand-editing is for tests whose subject *is* malformed metadata.
 | an inode can be allocated from an existing chunk | done |
 | a metadata block can be taken for a live b-tree node, with the accounting XFS expects | done |
 | a metadata block that is no longer needed can be given back, to the list or to free space | done |
-| free space leaf merge, parent removal, root collapse | not started |
+| free space leaf merge and parent removal | done |
+| free space root collapse | not started |
 | a new inode chunk can be allocated | not started |
 | a file whose data fork is a B+tree can be written | not started |
 | files can be truncated and their blocks returned | not started |
