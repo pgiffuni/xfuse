@@ -183,6 +183,10 @@ pub struct RawDinode {
 }
 
 impl RawDinode {
+    /// The magic every inode's first field carries, and the way a reader tells
+    /// an inode from the zeroes of a slot that was never used.
+    pub const MAGIC: u16 = 0x494e;
+
     /// Take ownership of an inode's bytes.
     pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> FsResult<Self> {
         let bytes = bytes.into();
@@ -376,6 +380,39 @@ impl RawDinode {
     #[allow(dead_code)]
     pub fn gen(&self) -> u32 {
         BigEndian::read_u32(&self.bytes[offset::GEN..])
+    }
+
+    // "IN"
+
+    /// Mark this as an inode.
+    ///
+    /// A slot that has never been used is all zeroes, and a reader looking for
+    /// inodes is looking for this.  It is also what the file system's own
+    /// bookkeeping uses to know a slot is free, so a slot has to carry it from
+    /// the moment it is allocated and not from the moment it is written.
+    pub fn set_magic(&mut self, magic: u16) {
+        BigEndian::write_u16(&mut self.bytes[offset::MAGIC..], magic);
+        self.update_crc();
+    }
+
+    /// Set the format of the data fork: `1` for local, `2` for an extent list
+    /// held in the inode, `3` for a B+tree rooted in the inode.
+    pub fn set_format(&mut self, format: u8) {
+        self.bytes[offset::FORMAT] = format;
+        self.update_crc();
+    }
+
+    /// Set the offset of the attribute fork within the local area.
+    pub fn set_forkoff(&mut self, forkoff: u8) {
+        self.bytes[offset::FORKOFF] = forkoff;
+        self.update_crc();
+    }
+
+    /// Set the generation number, which tells an old inode from a new one that
+    /// reused its number, and so must differ every time a slot is reused.
+    pub fn set_gen(&mut self, gen: u32) {
+        BigEndian::write_u32(&mut self.bytes[offset::GEN..], gen);
+        self.update_crc();
     }
 
     /// The offset within the image at which this inode's local area starts.

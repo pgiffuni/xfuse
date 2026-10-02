@@ -1092,6 +1092,42 @@ every inode number the geometry can name in group 0 finds **2688 inodes among
 65536 numbers**, and 2688 is what the group header says the group has.  A wrong
 `sb_inopblog` or `sb_agblklog` cannot produce that.
 
+### Free inodes, and the one count that adds up
+
+A group's tree of used inode numbers is the only thing that knows **which chunks
+exist**: the inode number says where a chunk would be, and the tree says whether
+one is there.  That distinction matters here because these images space their
+records **160 inodes apart** rather than sixty-four -- there are holes between
+chunks, so a chunk number worked out from the inode number alone would name a
+hole.
+
+Given that, the first free inode in a group is the lowest set bit of the lowest
+chunk that has one, found by walking the tree left to right.  The order is the
+point: it makes allocation repeatable and keeps a group filling from the start
+rather than from wherever its last hole was.
+
+The counts all move together, and **the file system's total agrees with the
+groups', exactly**:
+
+```text
+                       sb_ifree   sum(AGI freecount)
+xfsv4.img                 2824                 2824
+xfs_writable.img            57                   57
+```
+
+which is worth contrasting with blocks: `sb_fdblocks` is 347 and 16 *away* from
+the sum of the groups' free block counts on the same two images.  So the inode
+accounting has one obvious reading -- `sb_ifree` is the sum of the groups' free
+inode counts -- and the block accounting does not, which is the reason that one
+is written down as unresolved rather than as an invariant.
+
+Allocating from an existing chunk is therefore four moves, all in one
+transaction: clear the bit, decrement the chunk's count, decrement the group's,
+decrement `sb_ifree`.  The tree needs no structural change -- the record stays in
+the leaf it is in -- and `agi_newino` does not move, because it names the chunk
+most recently *allocated as a chunk* rather than the inode most recently handed
+out.
+
 ### Sibling links are structure, not navigation
 
 A B+tree block names the block on its left and the block on its right, and those

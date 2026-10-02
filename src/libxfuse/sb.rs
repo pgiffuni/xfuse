@@ -328,6 +328,13 @@ impl Sb {
         }
     }
 
+    /// The inode number a group's relative number makes, which is the inverse of
+    /// [`Self::locate_ino`].
+    pub fn make_ino(&self, agno: u32, agino: u32) -> u64 {
+        let block_bits = u32::from(self.sb_agblklog) + u32::from(self.sb_inopblog);
+        (u64::from(agno) << block_bits) | u64::from(agino)
+    }
+
     /// The image block an inode number names.
     ///
     /// The block the number carries is counted **from the start of its group**,

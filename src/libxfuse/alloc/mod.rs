@@ -162,6 +162,15 @@ fn looks_like_an_image(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The superblock of the unpacked hand-built image, for the tests that need
+/// its geometry.
+#[cfg(test)]
+pub(crate) fn sb_of_xfsv4() -> Option<crate::libxfuse::sb::Sb> {
+    let image = golden("xfsv4.img")?;
+    let mut reader = std::io::BufReader::new(std::fs::File::open(image).ok()?);
+    Some(crate::libxfuse::sb::Sb::from(&mut reader))
+}
+
 /// Whether the tools the tests check themselves against are here.
 ///
 /// The tests that compare what this code reads with what the file system's own
