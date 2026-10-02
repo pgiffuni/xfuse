@@ -291,6 +291,25 @@ impl Agfl {
     /// applied: the caller writes it to the group header in the same
     /// transaction, because a free list that has lost a block while its header
     /// still offers it will hand the same block out again.
+    ///
+    /// Only the *front* of the window is read.  The window is a queue, so the
+    /// entry that is next out is the one at `first` and nothing else is
+    /// consulted -- which is what the format says and what the images confirm:
+    /// two of the four groups in `xfsv4.img` have windows that do not start at
+    /// slot 0 at all (one at 85, one at 26), and their entries are in no order,
+    /// so there is nothing to sort them by even if a scan were wanted.  A window
+    /// is also not searched for "any entry that looks usable": the header says
+    /// which slots are live, and the entry at the front of them is what comes
+    /// next.
+    ///
+    /// A count of zero is refused, because that is the caller's job to notice:
+    /// an empty list is an ordinary state and the caller answers it from the
+    /// group's free space.  A count that is *not* zero and a front slot that is
+    /// not a block is refused here instead, and it is a corrupt group.  The two
+    /// are not the same thing, and a caller that treats the second as the first
+    /// takes a block out of ordinary free space for an entry the file system
+    /// still believes it owns -- after which the free space and the list name
+    /// the same block, and two files can be given it.
     pub fn take_front(&mut self, window: &mut AgflWindow) -> FsResult<XfsAgblock> {
         if window.count == 0 || window.first > window.last {
             return Err(no_entry(b"the group free list is empty"));
@@ -304,9 +323,14 @@ impl Agfl {
             });
         }
         let block = self.entry(window.first);
-        if block == NULL_AGBLOCK {
+        if !self.holds_block(window.first) {
             return Err(FsError::Corrupt {
-                what: "the group free list has a null block in its live window".into(),
+                what: format!(
+                    "the group free list's window claims {} entries, but slot {} -- the one at \
+                     its front -- holds {block}: a live entry is neither the null block nor block \
+                     0",
+                    window.count, window.first
+                ),
             });
         }
         self.set_entry(window.first, NULL_AGBLOCK);
@@ -406,6 +430,22 @@ pub struct AgflWindow {
 }
 
 impl AgflWindow {
+    /// Whether the group header says the list is empty.
+    ///
+    /// This is an ordinary state and not a fault.  It is what a group looks like
+    /// before anything has been reserved on its list, and what it looks like
+    /// again after its last entry has been taken; an allocator answers it by
+    /// taking a block out of the group's ordinary free space.
+    ///
+    /// It is deliberately not the same question as "does the front of the window
+    /// hold a block".  A count of zero with a stale array behind it is an empty
+    /// list -- the header decides what is live, and nothing in the array says
+    /// otherwise -- while a count that is not zero and a front slot that is null
+    /// or zero is a corrupt group.  See [`Agfl::take_front`].
+    pub const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     /// An empty window.
     pub const fn empty() -> Self {
         AgflWindow {
@@ -543,6 +583,124 @@ mod t {
         let mut window = agfl.window(0, 0, 0);
         let err = agfl.take_front(&mut window).unwrap_err();
         assert_eq!(err.errno(), libc::ENOENT);
+    }
+
+    /// An empty window and a window naming nothing usable are different states,
+    /// and only one of them is the caller's to answer.
+    ///
+    /// A count of zero is a list with nothing in it, and the allocator answers
+    /// that from the group's free space.  A count that is not zero with a slot
+    /// at the front that is not a block is a group whose header and whose free
+    /// list disagree, and there is nothing sensible to answer it with: the file
+    /// system still believes it owns that entry, so handing out a block from
+    /// anywhere else makes the list and the free space name the same block.
+    #[test]
+    fn an_empty_window_is_the_callers_and_a_lying_one_is_not() {
+        // 0xffffffff in every slot, and a count of zero: empty, and the caller's
+        // business.
+        let mut agfl = Agfl::from_bytes(vec![0xffu8; 512], false).unwrap();
+        let mut empty = agfl.window(0, 0, 0);
+        assert!(empty.is_empty());
+        assert!(!agfl.window(0, 0, 1).is_empty());
+        let err = agfl.take_front(&mut empty).unwrap_err();
+        assert_eq!(err.errno(), libc::ENOENT, "an empty list is not corruption");
+
+        // The same block with a count of one: the header says an entry is live
+        // and the array says it is not, and that is corruption.
+        let mut lying = agfl.window(0, 0, 1);
+        let err = agfl.take_front(&mut lying).unwrap_err();
+        assert_eq!(
+            err.errno(),
+            crate::libxfuse::EUCLEAN,
+            "a null entry is corruption"
+        );
+    }
+
+    /// A slot holding zero is block zero, and block zero is not a block.
+    ///
+    /// A free list block that has never been written is a run of zeroes, so a
+    /// window over one names entries that read as *block 0* -- the block that
+    /// holds the group's own headers, and in group 0 the superblock.  Believing
+    /// one hands the superblock out as a b-tree node, and the damage is done
+    /// before anything notices, because the number that comes back is a number.
+    ///
+    /// This is the one hole the null-block check alone does not cover, and it is
+    /// why [`Agfl::holds_block`] and [`Agfl::take_front`] both name zero rather
+    /// than only the null block.
+    #[test]
+    fn a_zero_entry_is_never_a_block() {
+        let mut agfl = Agfl::from_bytes(vec![0u8; 512], false).unwrap();
+        assert!(!agfl.holds_block(0), "a blank slot offers nothing");
+        let mut window = agfl.window(0, 3, 4);
+        let err = agfl.take_front(&mut window).unwrap_err();
+        assert_eq!(
+            err.errno(),
+            crate::libxfuse::EUCLEAN,
+            "a zero entry must be refused, not handed out as block 0"
+        );
+        // And the same, with the zero one slot in and a real block behind it: the
+        // queue is taken from the front, so this is a refusal, not a skip.
+        agfl.give_back(&mut window, 42).unwrap();
+        let mut window = agfl.window(1, 1, 1);
+        let err = agfl.take_front(&mut window).unwrap_err();
+        assert_eq!(err.errno(), crate::libxfuse::EUCLEAN);
+    }
+
+    /// The window does not start at slot zero, and the entry that comes out is
+    /// the one at its front rather than the lowest-numbered one in the array.
+    ///
+    /// This is not a hypothetical window.  Two of the four groups in
+    /// `xfsv4.img` have windows that do not start at slot 0 -- one at 85, one at
+    /// 26 -- and their entries are in no order, so "the first usable slot" and
+    /// "the first live slot" are not the same thing and only the second is
+    /// what the format describes.
+    #[test]
+    fn a_window_that_does_not_start_at_zero_is_taken_from_its_front() {
+        let mut agfl = Agfl::from_bytes(vec![0xffu8; 512], false).unwrap();
+        // How a window comes to start at 85 rather than 0: the list is stocked
+        // and then consumed from the front, and the array it is a window onto
+        // does not move under it.  This is the shape group 1 of `xfsv4.img` is
+        // in -- window (85, 90, 6) -- and reproducing it is the only honest way
+        // to test a window that does not start at the bottom.
+        let mut window = agfl.window(0, 0, 0);
+        for block in 1000u32..1091 {
+            window = agfl
+                .give_back(&mut window, block)
+                .expect("room in the list");
+        }
+        for _ in 0..85 {
+            agfl.take_front(&mut window).expect("a live entry");
+        }
+        assert_eq!(
+            window,
+            agfl.window(85, 90, 6),
+            "the window did not follow what was taken"
+        );
+        assert_eq!(
+            agfl.window_blocks(&window),
+            (1085u32..1091).collect::<Vec<_>>()
+        );
+
+        // The queue comes out of the front of the window, in the order the
+        // window named -- not in slot order, not in block order, and not from
+        // the lowest-numbered slot with something in it.
+        let mut taken = Vec::new();
+        while !window.is_empty() {
+            taken.push(agfl.take_front(&mut window).expect("a live entry"));
+        }
+        assert_eq!(
+            taken,
+            (1085u32..1091).collect::<Vec<_>>(),
+            "the queue did not come out in the order the window named"
+        );
+        // Nothing outside the window is still offering anything.
+        for i in 0..agfl.entries {
+            assert_eq!(
+                agfl.entry(i),
+                NULL_AGBLOCK,
+                "slot {i} is still offering a block"
+            );
+        }
     }
 
     /// Taking a block shrinks the window and empties the slot, so the same

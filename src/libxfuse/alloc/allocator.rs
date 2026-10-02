@@ -198,29 +198,47 @@ impl<'a, 't, 's> GroupBlocks for TransactionBlocks<'a, 't, 's> {
             agf.free_list_last(),
             agf.free_list_count(),
         );
-        // Whether the list has anything to give is asked *before* taking, rather
-        // than inferred from a failure afterwards, because there are two ways
-        // for it to have nothing and they mean the same thing here: a window with
-        // no room left in it, and a window naming entries that were never
-        // written.  The second is what a file system looks like before it has
-        // ever grown a btree node -- every image in this repository is in that
-        // state -- and treating it as an error would mean a group that had
-        // never split a leaf could not split one now.
+        // Whether the list has anything to give is the *count*, and it is asked
+        // before anything is taken rather than inferred from a failure
+        // afterwards.  There are two ways for a list to be of no use and they
+        // mean different things:
         //
-        // And a list that has never been written is not a list full of blocks:
-        // its array is a run of zeroes, which read as *block 0*, not as the null
-        // block.  `from_bytes` only checks that the block is long enough, so a
-        // blank block parses happily, and a window taken from the header over it
-        // would hand out the block at the very start of the file system -- the
-        // superblock.  `is_written` is the check that says the header of a list
-        // is there at all.
-        // Whether the list has anything to give is the window's business, not
-        // the block's: a free list in these file systems is a bare array with no
-        // header at all, so asking whether it has been *written* says no to a
-        // list that is full of usable blocks.
-        let usable = (window.first..=window.last).any(|i| agfl.holds_block(i));
-        if usable {
+        //   * `flcount` is zero.  That is an ordinary state, and it is what a
+        //     group looks like before it has ever grown a btree node and after
+        //     its last entry has been taken.  The block comes from the group's
+        //     own free space.
+        //
+        //   * `flcount` is not zero and the entry at the front of the window is
+        //     null or zero.  That is a corrupt group, and it is refused by
+        //     `take_front`.  It is not the first case wearing a different hat:
+        //     answering it from ordinary free space hands out a block the list
+        //     still owns, and the list and the free space then name it together.
+        //
+        // The window is not searched for an entry that happens to look usable.
+        // The header says which slots are live, the entry at the front of them
+        // is the next one out, and the rest of the array is not this code's
+        // business -- two of the four groups in `xfsv4.img` have windows that
+        // do not start at slot 0, so even the first slot is not something that
+        // can be assumed.
+        //
+        // Note also that a list which has *never been written* is not a list
+        // full of blocks: its array is a run of zeroes, and a zero entry is
+        // block 0 -- the superblock.  So the test for a usable slot is whether
+        // it holds a block number that is neither the null block nor zero, and
+        // not whether the block opens with a magic number: a free list in a
+        // version 4 file system is a bare array with no header at all, and
+        // asking whether one has been *written* would say no to a list that is
+        // full of usable blocks.  All four of this repository's images have
+        // written arrays; what they lack is a magic number, which is not the
+        // same thing.
+        if !window.is_empty() {
             let block = agfl.take_front(&mut window)?;
+            if u64::from(block) >= u64::from(self.sb.sb_agblocks) {
+                return Err(FsError::corrupt(format!(
+                    "the group free list offers block {block}, past the group's {} blocks",
+                    self.sb.sb_agblocks
+                )));
+            }
             agfl.update_crc();
             self.transaction.write_bytes(at, agfl.as_bytes())?;
             agf.set_free_list_window(window.first, window.last, window.count);
@@ -233,13 +251,23 @@ impl<'a, 't, 's> GroupBlocks for TransactionBlocks<'a, 't, 's> {
         // needs comes out of the group's own free space, and stops being free
         // space by becoming a node.
         //
-        // No accounting is needed here.  `agf_freeblks` counts the free extents
-        // the btrees represent, and the caller recomputes it from the trees once
-        // its own work is done -- so a block taken here is already out of that
-        // sum by then, and the caller's change to the superblock's total is one
-        // smaller by exactly this block.  Taking is also the one tree operation
-        // that cannot need a node of its own: it shrinks a record rather than
-        // adding one, so this cannot recurse.
+        // Which of the group's free blocks it is, is a choice and not a
+        // measurement.  Taking the first run the tree offers is a perfectly good
+        // one -- any block the group is offering will do, provided the tree
+        // mutation that follows is right -- and it is what the bno tree, which
+        // is ordered by start block, makes easiest to find.  What is *not* a
+        // choice, and is not done here, is guessing at which blocks the file
+        // system would have preferred: that is the accounting transition this
+        // whole path is blocked on, and until it is established this picks a
+        // block and says plainly that it picked one.
+        //
+        // The counters this moves are the blocked ones, so they are not moved
+        // here.  Measured against native XFS, a block that is in a free space
+        // tree and becomes a b-tree node is `-1` on `agf_freeblks` and `+1` on
+        // `agf_btreeblks`, with the superblock's total unmoved -- the block
+        // trades one of the three terms of the device-wide identity for
+        // another.  Neither counter is touched by this function, and the caller
+        // that rebuilds them from the trees is the one that has to get it right.
         let geometry = GroupGeometry::new(self.sb.sb_agblocks, self.sb.has_crc(), true);
         let by_length = GroupGeometry::new(self.sb.sb_agblocks, self.sb.has_crc(), false);
         let block_tree = first_run_from(agf.block_btree_root(), geometry, 0, |b| self.get(b))?
@@ -1637,72 +1665,85 @@ mod t {
         //    this test is what will hold it to them.
     }
 
-    /// A group whose free list is empty gets a block out of its own free
-    /// space, and that block stops being free.
+    /// A window that claims entries the list does not hold is a corrupt group,
+    /// and it is refused rather than answered from the group's free space.
     ///
-    /// The list exists so a btree can grow when a group is full, and it is
-    /// stocked from the group's free space, so an empty list is an ordinary state
-    /// and not a reason to refuse.
+    /// **This test used to assert the opposite, and the opposite was wrong.**
+    /// It set a window of `(0, 3, 4)` over a free list block that had never
+    /// been written -- a run of zeroes -- and required a metadata block to come
+    /// out of ordinary free space, on the grounds that "a window naming entries
+    /// that were never written" is the state a file system is in before it has
+    /// ever grown a btree node.  That is a misreading: the file system is in
+    /// that state because its header says `flcount = 0`, not because its slots
+    /// happen to be zero.  A header that says four entries are live, over four
+    /// slots holding zeroes, is a header and an array that disagree, and the
+    /// array it names is claiming four blocks of which the first is block 0.
     ///
-    /// The part worth stating is what an empty list *is*.  A list block that has
-    /// never been written is a run of zeroes, and a zero entry reads as **block
-    /// 0** -- not as the null block.  `Agfl::from_bytes` only checks that the
-    /// block is long enough, so a blank block parses happily, and a window taken
-    /// from the group header over it would hand out the block at the start of the
-    /// file system.  A test that only ever used a written list would never see
-    /// that, and every image in this repository is in the unwritten state.
-    /// The commit happens and the roots are the ones the fixture uses, so the
-    /// next thing to look at is whether the removal reaches the tree at all.
+    /// Answering that from the free space would hand out a block the free list
+    /// still believes it owns, and the two would then name the same block: one
+    /// as a b-tree node and one as space two files can be given.  So the
+    /// distinction is now the one the format actually draws:
+    ///
+    /// ```text
+    /// flcount == 0                  an empty list, and an ordinary state
+    /// flcount > 0, front is null    corrupt
+    /// flcount > 0, front is zero    corrupt, and block 0 is not a block
+    /// ```
+    ///
+    /// The two corrupt cases are exercised on the same fixture, and each leaves
+    /// the image exactly as it was -- a refusal is not a partial take.
     #[test]
-    fn an_empty_free_list_takes_a_block_that_was_really_free() {
+    fn a_window_over_an_unwritten_list_is_a_corrupt_group() {
         let (f, sb) = image_with_group(&[(100, 50)]);
-        {
-            let device = Arc::new(BlockDevice::open(f.path(), Access::ReadWrite).unwrap());
-            let mut cache = BlockCache::new(BS, 256);
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
-            // A window over a block that was never written: the state every image
-            // here is in, and the one that used to lend out block 0.
-            let mut agf = read_agf(&mut tx, &sb, 0).expect("a group header");
-            agf.set_free_list_window(0, 3, 4);
-            super::write_agf(&mut tx, &sb, 0, &mut agf).expect("write the header");
-            tx.commit().unwrap();
-        }
         let device = Arc::new(BlockDevice::open(f.path(), Access::ReadWrite).unwrap());
         let mut cache = BlockCache::new(BS, 256);
-        let taken = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
-            let mut store = TransactionBlocks::new(&mut tx, &sb, 0);
-            let got = store
-                .take_btree_block()
-                .expect("the group supplies a block");
-            // Committing matters here: a block that has been taken but not
-            // written is a block that is both a node and free space.
-            tx.commit().expect("commit");
-            got
-        };
-        assert_ne!(
-            taken, 0,
-            "the block at the start of the file system is not spares"
-        );
-        assert!(
-            (100..150).contains(&taken),
-            "the block came from outside the group's free space: {taken}"
-        );
-        // It stops being free: it is a node now, not space anyone can be given.
-        // The group's *count* is refreshed by whoever asked for the block, so it
-        // is deliberately not checked here -- asking this function in isolation
-        // is not how it is used.
-        for (label, root, by_block) in [("by-start", 4u32, true), ("by-length", 5, false)] {
-            let geometry = GroupGeometry::new(sb.sb_agblocks, sb.has_crc(), by_block);
-            let mut cache = BlockCache::new(BS, 256);
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
-            let mut store = TransactionBlocks::new(&mut tx, &sb, 0);
-            let runs = crate::libxfuse::alloc::free_space::walk(root, geometry, |b| store.get(b))
-                .expect("the free space tree");
-            assert!(
-                !runs.iter().any(|r| u64::from(r.start) <= u64::from(taken)
-                    && u64::from(taken) < u64::from(r.start) + u64::from(r.len)),
-                "{label} still offers block {taken}, which is now a node"
+
+        // Both shapes of a window that lies: over a block of zeroes, where every
+        // slot reads as block 0, and over a block whose slots have been
+        // emptied, where every slot reads as the null block.
+        for (label, first, last, count, blank) in [
+            ("zeroes behind the window", 0u32, 3u32, 4u32, false),
+            ("nulls behind the window", 0, 3, 4, true),
+        ] {
+            if blank {
+                // Put the free list's array beyond empty, as an initialised list
+                // that has been fully taken would be.
+                let mut agfl = Agfl::from_bytes(vec![0u8; BS], false).expect("a list block");
+                agfl.initialise(0, &[0u8; 16]);
+                agfl.blank_array();
+                BlockDevice::open(f.path(), Access::ReadWrite)
+                    .unwrap()
+                    .write_at(agfl.as_bytes(), u64::from(Sb::AGFL_SECTOR) * BS as u64)
+                    .unwrap();
+            }
+            {
+                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut agf = read_agf(&mut tx, &sb, 0).expect("a group header");
+                agf.set_free_list_window(first, last, count);
+                super::write_agf(&mut tx, &sb, 0, &mut agf).expect("write the header");
+                tx.commit().unwrap();
+            }
+            let before = std::fs::read(f.path()).unwrap();
+            {
+                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut store = TransactionBlocks::new(&mut tx, &sb, 0);
+                let err = store
+                    .take_btree_block()
+                    .err()
+                    .unwrap_or_else(|| panic!("{label}: a lying window was answered with a block"));
+                assert_eq!(
+                    err.errno(),
+                    crate::libxfuse::EUCLEAN,
+                    "{label}: a window that lies must be corruption, not a block from somewhere \
+                     else: {err:?}"
+                );
+                // Nothing was committed, so nothing should have moved.
+                tx.abort();
+            }
+            assert_eq!(
+                std::fs::read(f.path()).unwrap(),
+                before,
+                "{label}: refusing a corrupt free list changed the image"
             );
         }
     }
