@@ -50,7 +50,85 @@
 //! no such tree, they are zero and the gaps between the ranges are where the
 //! free inodes are.
 
-use crate::libxfuse::error::{FsError, FsResult};
+use crate::libxfuse::{
+    definitions::{XfsAgblock, XfsIno},
+    error::{FsError, FsResult},
+    sb::Sb,
+};
+
+/// A free inode, and where in the group's records it was found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FreeIno {
+    /// The inode's number across the whole file system.
+    pub ino:         XfsIno,
+    /// The leaf that holds the chunk's record.
+    pub block:       XfsAgblock,
+    /// The first inode number of the chunk.
+    pub chunk_start: u64,
+    /// Which bit of the chunk's mask says this inode is free.
+    pub bit:         u32,
+}
+
+/// Every chunk a tree holds, with the leaf it is in, in the order the tree holds
+/// them.
+///
+/// The order is the point: chunks are visited left to right so the first free
+/// inode found is the lowest one, which makes allocation repeatable and keeps a
+/// group filling from the start rather than from wherever its last hole was.
+pub fn chunks_in_order<F>(root: XfsAgblock, mut fetch: F) -> FsResult<Vec<(XfsAgblock, InoRange)>>
+where
+    F: FnMut(XfsAgblock) -> FsResult<Box<[u8]>>,
+{
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(block) = stack.pop() {
+        let node = InobtNode::from_bytes(fetch(block)?)?;
+        if node.is_leaf() {
+            for chunk in node.ranges()? {
+                out.push((block, chunk));
+            }
+            continue;
+        }
+        let mut children: Vec<XfsAgblock> = node.children()?.into_iter().map(|(_, b)| b).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    Ok(out)
+}
+
+/// The first free inode a group has.
+///
+/// The tree of used inode numbers is the only thing that knows which chunks
+/// exist: the inode number says where a chunk *would* be, and the tree says
+/// whether one is there.  These images space their records 160 inodes apart
+/// rather than sixty-four, so working it out from the number alone would be
+/// wrong -- and a chunk that has not been allocated has no record to find.
+///
+/// Only an existing chunk is offered.  Allocating a new one needs blocks out of
+/// the group's free space and an entry added to this tree, which is a different
+/// operation and is not done here.
+pub fn first_free_ino<F>(
+    sb: &Sb,
+    agno: u32,
+    root: XfsAgblock,
+    fetch: F,
+) -> FsResult<Option<FreeIno>>
+where
+    F: FnMut(XfsAgblock) -> FsResult<Box<[u8]>>,
+{
+    for (block, chunk) in chunks_in_order(root, fetch)? {
+        if chunk.free != 0 {
+            let bit = chunk.free.trailing_zeros();
+            return Ok(Some(FreeIno {
+                ino: sb.make_ino(agno, (chunk.start + u64::from(bit)) as u32),
+                block,
+                chunk_start: chunk.start,
+                bit,
+            }));
+        }
+    }
+    Ok(None)
+}
 
 /// The magic at the start of every node: "IABT".
 const XFS_INOBT_MAGIC: u32 = 0x4941_4254;
@@ -461,6 +539,84 @@ mod t {
         assert_eq!(bracketed("1:[32,0,0]"), vec![32, 0, 0]);
         assert_eq!(bracketed("2:[2400]"), vec![2400]);
         assert_eq!(after_colon("1:6 2:11"), vec![6, 11]);
+    }
+
+    /// The first free inode a group has is the lowest one, and there really are
+    /// as many of them as the header says.
+    ///
+    /// The tree is the only thing that knows which chunks exist, so this checks
+    /// it two ways against the file system's own accounting: the free inodes it
+    /// finds must add up to the group header's count, and the lowest one it finds
+    /// must be the lowest bit of the lowest chunk that has one.  Getting the
+    /// order wrong would not change either number -- it would just hand out
+    /// higher inode numbers than it should, which nothing else here would notice.
+    #[test]
+    fn the_first_free_inode_is_the_lowest_and_the_counts_agree() {
+        let Some(sb) = crate::libxfuse::alloc::sb_of_xfsv4() else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let Some(golden) = crate::libxfuse::alloc::golden("xfsv4.img") else {
+            return;
+        };
+        let bytes = std::fs::read(&golden).expect("the image");
+        let bs = sb.sb_blocksize as usize;
+        let mut total_free = 0u64;
+        let mut lowest: Option<u64> = None;
+        for agno in 0..sb.agcount() {
+            let at = sb.ag_header_offset(agno, Sb::AGI_SECTOR) as usize;
+            let agi = Agi::from_bytes(bytes[at..at + bs].to_vec(), sb.has_crc()).expect("a header");
+            let ag_offset = sb.ag_offset(agno) as usize;
+            let fetch = |b: XfsAgblock| -> FsResult<Box<[u8]>> {
+                let at = ag_offset + b as usize * bs;
+                Ok(bytes[at..at + bs].to_vec().into_boxed_slice())
+            };
+            let chunks = chunks_in_order(agi.inobt_root(), fetch).expect("the chunks");
+            let mut in_group = 0u64;
+            for (_, chunk) in &chunks {
+                in_group += u64::from(chunk.free.count_ones());
+            }
+            assert_eq!(
+                in_group,
+                agi.free_inodes(),
+                "group {agno}: the chunks hold {in_group} free inodes and the header says {}",
+                agi.free_inodes()
+            );
+            total_free += in_group;
+            if let Some(found) =
+                first_free_ino(&sb, agno, agi.inobt_root(), fetch).expect("a search")
+            {
+                let here = lowest.is_none();
+                if here {
+                    lowest = Some(found.ino);
+                }
+            }
+        }
+        assert_eq!(
+            total_free, sb.sb_ifree,
+            "the chunks hold {total_free} free inodes across the file system and the superblock \
+             says {}",
+            sb.sb_ifree
+        );
+        // The lowest free inode in the file system is the one group 0 offers,
+        // since groups are numbered before the numbers that reach them.
+        let lowest = lowest.expect("a file system with free inodes");
+        let loc = sb.locate_ino(lowest);
+        assert_eq!(
+            loc.agno, 0,
+            "the lowest free inode should be in the first group"
+        );
+        // And it must really be free in the tree that says so.
+        let at = sb.ino_to_offset(lowest) as usize;
+        assert!(
+            at + 2 <= bytes.len(),
+            "inode {lowest} has no bytes in the image"
+        );
+        eprintln!(
+            "lowest free inode is {lowest} (group {}, block {}, slot {}); {total_free} free \
+             inodes in total",
+            loc.agno, loc.agbno, loc.slot
+        );
     }
 
     /// A chunk's free count is the number of free inodes in its mask.
