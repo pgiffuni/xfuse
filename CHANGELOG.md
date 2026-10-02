@@ -12,6 +12,21 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   does not exist yet.  A read-write mount of an image that uses a feature the
   write path cannot maintain is refused, naming the feature.  See
   `docs/write-support-progress.md`.
+* The group free list is read as what the group header says it is.  A window
+  that claims entries the list does not hold is refused as a corrupt group
+  rather than answered out of ordinary free space, which was handing out a block
+  the list still believed it owned; only the entry at the front of the window is
+  read, since the window is a slice of the array and does not start at the
+  bottom; and a slot holding zero is refused as well as one holding the null
+  block, because zero is block 0 and block 0 is the superblock.
+* A block taken for a b-tree node is now counted, on `agf_btreeblks`.  Taking
+  one off the free list was charging nothing anywhere, so a group could owe the
+  file system a block and its own header would not say so.  The rule -- the count
+  is the blocks both free space trees hold, less their two roots -- was measured
+  against native XFS on every group of three reference images and confirmed by
+  `xfs_repair`, and the superblock's free count was found to be the sum of each
+  group's free blocks, b-tree blocks and free list entries rather than the sum of
+  the free counts alone.  See `docs/write-support-progress.md`.
 * The device access was split into a positional block device, a block cache, and
   a transaction, so that all metadata changes go through one place.  The read
   path is unchanged: the same images mount and read as they always did.
