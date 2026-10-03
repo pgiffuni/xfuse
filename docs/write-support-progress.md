@@ -927,8 +927,11 @@ complaints, none of them clean -- because the experiment was wrong, not the
 candidates: it rewrote one leaf of a three-leaf tree, leaving the interior node
 claiming three children, so repair walked the untouched leaves too and every
 complaint was about something else.  **The setup has to be coherent before the
-question is askable**: point the fork at a single new leaf and rewrite the fork
-header with it, and only then does what repair says mean anything.
+question is askable**, and the recipe is in the section above: a single leaf, a
+record with an unambiguous startoff, the block number in one candidate field or the
+other, and a fork header that names that one leaf at level 0.  Then the only
+complaint repair can possibly make is about the field that is wrong, and where it
+names an offset *is* the layout.
 
 Also worth knowing before anyone tries: the b-tree path in this code is not only a
 *writer*.  `BtreeBlockHdr` has no notion of a b-map block, `DiU::Bmbt` describes a
