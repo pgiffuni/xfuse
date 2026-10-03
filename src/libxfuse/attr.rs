@@ -52,7 +52,6 @@ use super::{
     },
     sb::Sb,
     utils,
-    volume::SUPERBLOCK,
 };
 
 #[allow(dead_code)]
@@ -169,13 +168,19 @@ impl AttrLeafName {
         }
     }
 
-    fn value<F, R>(&mut self, buf_reader: &mut R, map_dblock: F) -> &[u8]
+    /// The name's value, or why it could not be read.
+    ///
+    /// This returns a `Result` because the other half of it can fail: a value held
+    /// out of line is read from the image, and that read needs the file system's
+    /// block size.  Returning `&[u8]` left no way to say so except to crash, and
+    /// the crash was in `SUPERBLOCK`.
+    fn value<F, R>(&mut self, buf_reader: &mut R, map_dblock: F) -> Result<&[u8], i32>
     where
         R: BufRead + Reader + Seek,
         F: Fn(XfsDablk, &mut R) -> XfsFsblock,
     {
         match self {
-            AttrLeafName::Local(local) => &local.nameval[local.namelen as usize..],
+            AttrLeafName::Local(local) => Ok(&local.nameval[local.namelen as usize..]),
             AttrLeafName::Remote(remote) => remote.value(buf_reader.by_ref(), map_dblock),
         }
     }
@@ -219,7 +224,7 @@ impl AttrLeafblock {
             .entries
             .binary_search_by_key(&hash, |entry| entry.hashval)
         {
-            Ok(i) => Ok(self.names[i].value(buf_reader, map_logical_block_to_fs_block)),
+            Ok(i) => self.names[i].value(buf_reader, map_logical_block_to_fs_block),
             Err(_) => Err(crate::libxfuse::ENOATTR),
         }
     }
@@ -273,13 +278,20 @@ pub struct AttrLeafNameRemote {
 }
 
 impl AttrLeafNameRemote {
-    fn value<R, F>(&mut self, buf_reader: &mut R, map_dblock: F) -> &[u8]
+    /// Read the value out of line, into a buffer this name owns.
+    ///
+    /// Every failure here is a real one and is reported: no image in this process
+    /// to take a block size from, a seek that did not land, a header that did not
+    /// decode, or a short read.  Each of those used to be an `unwrap`, in a
+    /// function whose signature could not carry an error, which is the situation
+    /// this signature exists to end.
+    fn value<R, F>(&mut self, buf_reader: &mut R, map_dblock: F) -> Result<&[u8], i32>
     where
         R: BufRead + Reader + Seek,
         F: Fn(XfsDablk, &mut R) -> XfsFsblock,
     {
         if self.value.len() < self.valuelen as usize {
-            let sb = SUPERBLOCK.get().unwrap();
+            let sb = super::volume::try_superblock().ok_or(libc::ENODEV)?;
             self.value.reserve(self.valuelen as usize);
             let mut valueblk = self.valueblk;
             let mut valuelen: i64 = self.valuelen.into();
@@ -288,16 +300,19 @@ impl AttrLeafNameRemote {
                 let blk_num = map_dblock(valueblk, buf_reader.by_ref());
                 buf_reader
                     .seek(SeekFrom::Start(sb.fsb_to_offset(blk_num)))
-                    .unwrap();
-                let hdr: AttrRmtHdr = utils::decode_from(buf_reader.by_ref()).unwrap();
+                    .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+                let hdr: AttrRmtHdr =
+                    utils::decode_from(buf_reader.by_ref()).map_err(|_| libc::EUCLEAN)?;
                 let oldlen = self.value.len();
                 self.value.resize(oldlen + hdr.rm_bytes as usize, 0);
-                buf_reader.read_exact(&mut self.value[oldlen..]).unwrap();
+                buf_reader
+                    .read_exact(&mut self.value[oldlen..])
+                    .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
                 valuelen -= i64::from(hdr.rm_bytes);
                 valueblk += 1;
             }
         }
-        &self.value[..]
+        Ok(&self.value[..])
     }
 }
 
