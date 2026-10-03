@@ -301,8 +301,8 @@ impl AttrLeafNameRemote {
                 buf_reader
                     .seek(SeekFrom::Start(sb.fsb_to_offset(blk_num)))
                     .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-                let hdr: AttrRmtHdr =
-                    utils::decode_from(buf_reader.by_ref()).map_err(|_| libc::EUCLEAN)?;
+                let hdr: AttrRmtHdr = utils::decode_from(buf_reader.by_ref())
+                    .map_err(|_| crate::libxfuse::EUCLEAN)?;
                 let oldlen = self.value.len();
                 self.value.resize(oldlen + hdr.rm_bytes as usize, 0);
                 buf_reader

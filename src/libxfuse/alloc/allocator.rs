@@ -1403,7 +1403,7 @@ mod t {
         },
         block_cache::BlockCache,
         block_device::{Access, BlockDevice},
-        btree::{BmbtLeafBlock, BmbtLeafRecord},
+        btree::BmbtLeafBlock,
         dinode::{DiU, Dinode},
         dinode_core::XfsDinodeFmt,
         dir3::{Dir2DataEntry, Dir3},
@@ -1692,7 +1692,8 @@ mod t {
     /// no repair tool rather than failing a host that cannot run one.
     fn assert_repair_accepts(image: &std::path::Path, what: &str) {
         let Some(complaints) = repair_complaints(image) else {
-            eprintln!("skipping the repair check: no xfs_repair to run");
+            crate::libxfuse::alloc::require_oracle("xfs_repair", "xfsprogs");
+            crate::libxfuse::alloc::skipped_oracle_check(what);
             return;
         };
         if !complaints.is_empty() {
@@ -3455,7 +3456,7 @@ mod t {
 
         let after = inobt_shape(image.path(), &sb, agno);
         assert!(
-            after.leaves >= before.leaves + 1,
+            after.leaves > before.leaves,
             "splitting a full leaf in two must add a leaf: {} then {}",
             before.leaves,
             after.leaves
@@ -3873,7 +3874,9 @@ mod t {
             .read_exact_at(&mut raw, sb.fsb_to_offset(start))
             .unwrap();
         let tail_at = dblksize - 8;
-        let word = |raw: &[u8], at: usize| u32::from_be_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
+        let word = |raw: &[u8], at: usize| {
+            u32::from_be_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]])
+        };
         let count = word(&raw, tail_at) as usize;
         let stale = word(&raw, tail_at + 4);
         let magic = word(&raw, 0);
@@ -3883,9 +3886,17 @@ mod t {
              stale bytes; they start at {index_at}"
         );
         assert_ne!(magic, 0, "the block does not start with a magic");
-        assert!(index_at >= dblksize / 2, "the hash index is implausibly far down the block");
+        assert!(
+            index_at >= dblksize / 2,
+            "the hash index is implausibly far down the block"
+        );
         let index: Vec<(u32, u32)> = (0..count)
-            .map(|i| (word(&raw, index_at + 8 * i), word(&raw, index_at + 8 * i + 4)))
+            .map(|i| {
+                (
+                    word(&raw, index_at + 8 * i),
+                    word(&raw, index_at + 8 * i + 4),
+                )
+            })
             .collect();
         eprintln!("the hash index: {index:?}");
         assert!(
@@ -3917,8 +3928,8 @@ mod t {
         let last_end = offsets.last().copied().unwrap_or(0) as usize
             + Dir2DataEntry::get_length(&sb, &last_entry) as usize;
         eprintln!(
-            "the last entry ends at {last_end}; the hash index starts at {index_at}, so {} \
-             bytes are free between them",
+            "the last entry ends at {last_end}; the hash index starts at {index_at}, so {} bytes \
+             are free between them",
             index_at.saturating_sub(last_end)
         );
         assert!(
@@ -4364,6 +4375,10 @@ mod t {
     #[test]
     fn what_xfs_does_with_a_full_free_list() {
         if !crate::libxfuse::alloc::have_xfs_repair() {
+            crate::libxfuse::alloc::require_oracle("xfs_repair", "xfsprogs");
+            crate::libxfuse::alloc::skipped_oracle_check(
+                "the leaf occupancy a file system accepts",
+            );
             eprintln!("skipping: no xfs_repair to ask");
             return;
         }
@@ -4554,7 +4569,6 @@ mod t {
     /// has one to allocate a chunk in — `xfs_4kn.img` has 4 KiB blocks and so 4 KiB
     /// inodes, and its groups are not empty of chunks either.  That half of the
     /// choice stays an inference and the test says so.
-    #[test]
     /// The b-map leaf reader, checked against the records `xfs_repair` printed.
     ///
     /// `xfs_repair` prints a record it dislikes in full:
@@ -4580,7 +4594,6 @@ mod t {
     ///   **corrupt** structure and not a panic — this program reads images it did
     ///   not write, and the path it replaced had `assert_eq!(bb_level, 0)` and
     ///   `panic!` on a bad magic in it.
-    #[test]
     /// The b-map leaf reader, checked against the records `xfs_repair` printed.
     ///
     /// `xfs_repair` prints a record it dislikes in full, in its own notation:
@@ -4617,7 +4630,6 @@ mod t {
     /// records than fit, and too short a block are all errors.  The path this
     /// replaced had `assert_eq!(bb_level, 0)` and `panic!` on a bad magic, in a
     /// program that reads images it did not write.
-    #[test]
     /// The b-map leaf reader, pinned against the bytes of a real leaf.
     ///
     /// The reader is new and the path it replaced had **never been run**: it
@@ -4725,8 +4737,13 @@ mod t {
         );
     }
 
+    #[test]
     fn which_inode_version_a_fresh_chunks_slots_must_carry() {
         if !crate::libxfuse::alloc::have_xfs_repair() {
+            crate::libxfuse::alloc::require_oracle("xfs_repair", "xfsprogs");
+            crate::libxfuse::alloc::skipped_oracle_check(
+                "the leaf occupancy a file system accepts",
+            );
             eprintln!("skipping: no xfs_repair to ask");
             return;
         }
@@ -5002,6 +5019,10 @@ mod t {
         // and a host that does not have it cannot run the oracle -- so it skips
         // rather than failing, which is the same rule the helper below follows.
         if !crate::libxfuse::alloc::have_xfs_repair() {
+            crate::libxfuse::alloc::require_oracle("xfs_repair", "xfsprogs");
+            crate::libxfuse::alloc::skipped_oracle_check(
+                "the leaf occupancy a file system accepts",
+            );
             eprintln!("skipping: no xfs_repair to ask");
             return;
         }
@@ -5954,8 +5975,8 @@ mod t {
     /// without the inode giving it up is what repair calls *found inodes not in
     /// the inode allocation tree*.  The only free a real image takes honestly is
     /// one of the blocks just taken, which is not enough to fill a leaf.
-    #[test]
     #[ignore = "reserving every freed block means the trees never overflow, so no split occurs"]
+    #[test]
     fn a_split_leaves_the_block_count_right() {
         let Some(golden) = crate::libxfuse::alloc::golden("xfsv4.img") else {
             eprintln!("skipping: no unpacked xfsv4.img");
@@ -6384,8 +6405,8 @@ mod t {
     /// allocator and belong to no file, so repair rightly objects to inodes that
     /// are not giving them up.  Overflowing a leaf for real needs a file to give
     /// up its middle, which is the truncate that is not built.
-    #[test]
     #[ignore = "the trees do not overflow, and repair cannot judge freed blocks no file gave up"]
+    #[test]
     fn an_overflowing_leaf_takes_a_node_off_the_free_list() {
         let Some(golden) = crate::libxfuse::alloc::golden("xfsv4.img") else {
             eprintln!("skipping: no unpacked xfsv4.img");

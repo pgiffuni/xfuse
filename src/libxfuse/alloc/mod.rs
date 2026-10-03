@@ -195,6 +195,50 @@ pub(crate) fn have_xfs_repair() -> bool {
         .is_ok()
 }
 
+/// Whether a missing `xfs_repair` should be an error rather than a skip.
+///
+/// **It should, wherever the tests are meant to mean something.**
+///
+/// A test that skips its only oracle does not pass: it *stops*, and reports the
+/// same as a pass.  That is not hypothetical here -- the project's own CI installs
+/// `curl fusefs-libs pkgconf` and no `xfsprogs`, so every assertion in this suite
+/// that ends in `assert_repair_accepts` has been skipping on it, silently, and a
+/// hundred and eighty-nine green results have included a large number of checks
+/// that verified nothing at all.  That is worse than a failure, because a failure
+/// is at least visible.
+///
+/// With `XFSFUSE_REQUIRE_ORACLE` set, a missing tool is a failure with the name of
+/// the package that provides it.  Continuous integration sets it, so the oracle
+/// stops being optional the moment anyone relies on the results.
+#[cfg(test)]
+pub(crate) fn require_oracle(tool: &str, package: &str) {
+    if std::env::var_os("XFSFUSE_REQUIRE_ORACLE").is_some() {
+        panic!(
+            "XFSFUSE_REQUIRE_ORACLE is set but {tool} is not installed, so every check that ends \
+             in it is skipping and reporting success.  Provide it with {package}."
+        );
+    }
+}
+
+/// Say that a check was **not** made, in a form that cannot be read as a pass.
+///
+/// A test that skips its only oracle does not pass: it stops, and prints the same
+/// thing a pass prints.  That is not hypothetical here -- the project's CI installs
+/// `curl fusefs-libs pkgconf` and no XFS tools, so every check that ends in
+/// `assert_repair_accepts` has been skipping on it, silently.
+///
+/// So a skip is counted, printed with a prefix no test result can be confused for,
+/// and -- with `XFSFUSE_REQUIRE_ORACLE` set -- turned into a failure.  A green run
+/// that says how many checks it did not make is honest; one that says nothing is
+/// not, and the number is the whole of the difference.
+#[cfg(test)]
+pub(crate) fn skipped_oracle_check(what: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SKIPPED: AtomicUsize = AtomicUsize::new(0);
+    let n = SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!("SKIPPED ORACLE CHECK ({n} so far): {what}");
+}
+
 pub mod agf;
 pub mod agfl;
 pub mod agi;

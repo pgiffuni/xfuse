@@ -212,6 +212,54 @@ What is left in order:
 
 ---
 
+## The FreeBSD build was broken, and the test count was wrong
+
+Both of these are the same mistake seen twice, and both were invisible from inside
+the environment where the work was done.
+
+**`libc::EUCLEAN` does not exist on FreeBSD**, and four call sites introduced while
+making the decoders fallible used it.  This project had already solved that --
+`crate::libxfuse::EUCLEAN` is `libc::EUCLEAN` on Linux and macOS and `libc::EIO` on
+the BSDs, with a comment explaining that an I/O error is the honest thing to report
+there -- and the new code went straight past it to the platform-specific value.  The
+Linux and WSL build is green and says nothing about this, which is the whole reason
+a second platform in continuous integration is worth having.
+
+**And the test count was inflated by two while a real test never ran.**  The number
+of passing tests had been read as a health check all through this work, and it was
+wrong: a duplicated `#[test]` attribute registered one test three times, and the
+`#[test]` that should have been on
+`which_inode_version_a_fresh_chunks_slots_must_carry` was not there at all.  So
+`a_bmap_leaf_reads_the_shape_of_a_real_leaf` counted for three, and a test that
+verifies a choice of inode version had never been executed.  The honest count is
+**187**, not 189.
+
+Both were found by looking rather than by reasoning, and the second one by
+*comparing* rather than by counting: `cargo test -- --list` at one revision and at
+another, set against each other.  Counting tests is not a health check when a
+duplicate attribute is possible, and a count that has been believed for hours is
+exactly the thing a duplicate makes wrong.
+
+### A skipped check is not a passing check
+
+The project's CI installs `curl fusefs-libs pkgconf` and no XFS tools, so
+**every** check that ends in `assert_repair_accepts` has been skipping on it --
+silently, printing nothing that could be told apart from a pass.  A hundred and
+eighty-seven green results have included a large number of verifications that never
+happened.
+
+So a skip now says so in a form no test result can be mistaken for:
+
+```text
+SKIPPED ORACLE CHECK (17 so far): after a name was added to the root directory
+```
+
+and with `XFSFUSE_REQUIRE_ORACLE` set a missing tool is a **failure** that names the
+package that provides it.  That does not make the oracle exist -- only a machine
+with `xfs_repair` can supply it, and that machine is not this one -- but it means a
+green run can be read for what it verified, and a run that verified nothing says so
+rather than looking like a success.
+
 ## How strong each measurement is, and how to read one
 
 The claim that started this section's audit was wrong twice: a free inode's slot
