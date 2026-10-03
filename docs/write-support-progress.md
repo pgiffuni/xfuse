@@ -252,10 +252,19 @@ Each numerical claim in this document, what it rests on, and where it now stands
 | the free slots of a new chunk: magic, version, `next_unlinked` | tool | repair's complaints, item by item | **repair-validated only** |
 | — the *version* XFS picks for a new chunk's slots | inference | none: no image here has a chunk XFS created | **unmeasured** |
 | AGFL → ordinary free space, when the list is full | tool | a full list handed to `xfs_repair` comes back with **every** one of its 42 blocks as ordinary free space | **confirmed**, with a caveat about who did it |
+| a b-map leaf's magic, level, record count and sibling fields | tool | `BMAP` (`0x424d4150`) at 0, level at 4, count at 6, siblings at 8 and 12, the same in three leaves `xfs_db` can name the extents of | **confirmed** |
+| a b-map extent's start is at offset 24, in bytes | tool | writing 777777 there produced `offset 1519`, and 777777 / 512 is 1519 | **confirmed** |
+| offsets 12 and 44 are not record fields | tool | perturbing either produced no extent complaint | **confirmed** |
+| the "starting block number" repair reports is composite | tool | the low half of offset 32 changes it to `1592888456` and the high half to `49152`; neither is any byte range | **confirmed** |
+| the b-map extent's block number: where it is | — | not yet; the field it lives in has not been isolated | **unmeasured** |
 | root collapse | — | unreachable, so nothing to confirm | **not written** |
 
-Two rows are worth dwelling on, because they are the difference between "this is
-how it works" and "this is how it happens to work here":
+**Two rows are still open**, and both are the difference between "this is how it
+works" and "this is how it happens to work here".  Everything else above is
+`confirmed` or `repair-validated`, and the method that got it there is
+[How a format fact is established here](#how-a-format-fact-is-established-here)
+— read that before adding a row, because it is what keeps a row from being a
+guess.
 
 * **The free slots of a new chunk are repair-validated, not confirmed.**  Repair
   says what it will accept, and the layout here is what it accepts.  That is not
@@ -330,6 +339,74 @@ how it works" and "this is how it happens to work here":
   being wrong.
 
 ---
+
+## How a format fact is established here
+
+There is one rule in this document that everything in [Measured
+invariants](#measured-invariants) and in the [audit](#how-strong-each-measurement-is-and-how-to-read-one)
+follows, and it is worth stating on its own because it was learned the hard way and
+because it is reusable: XFS's own diagnostic program is the oracle, and it can only
+be asked about structures it already accepts.
+
+> **Do not infer an on-disk structure by building a candidate and reading the
+> rejection.**  Get a structure the file system already accepts, perturb one
+> controlled field, and read what the checker then says about *that* structure.
+
+### Why, concretely
+
+Building candidates looks like the same method and is not.  When six hand-built
+records were handed to `xfs_repair` for the b-map block layout, all six were
+refused — and **none of them was ever read.**  The refusal described the
+*construction*, not the format: the fork pointed at the new leaves, but repair read
+values that were not the ones written, which is what a checker does when it is
+looking somewhere else entirely.  A table of six rejected candidates reads exactly
+like six rejected layouts, and the two have nothing in common.  Had it been taken
+at face value, the next six guesses would have been built on nothing.
+
+Perturbing the pristine, accepted leaves instead produced answers on the first
+try, because the only thing differing from a structure the file system itself wrote
+is the field under test.  That is what makes the evidence attributable.
+
+### How to run one
+
+1. **Find accepted metadata that uses the structure.**  Not a fixture and not a
+   construction — real bytes `xfs_repair -n` already accepts.  `xfs_db -c
+   'blockget -v -s'` finds the inodes that use a given format; here it found the
+   three files in `xfsv4.img` whose data fork is a b-tree.
+2. **Verify the rewrite landed, before reading any verdict.**  Ask `xfs_db` what it
+   now sees.  A complaint about a structure you did not manage to write is a
+   statement about you, not about XFS.
+3. **Change one field, to a value that is unmistakably wrong.**  `0x1122…` rather
+   than a plausible block number, so the message has to name it.
+4. **Read the message for the field you changed, and only that field.**  Where the
+   checker reports an *offset* or a *derived* number, convert it back before
+   comparing.
+5. **Treat the checker's numbers as decoded values, never as fields.**  This is
+   the trap.  Repair reported a "starting block number" of `0x188000000c488` for a
+   block whose on-disk bytes are `000000000000c48b`: the number shares digits with
+   two different regions and is neither, so it is *assembled*.  Reading it as a
+   field is the same false inference the whole exercise exists to avoid, one step
+   removed from where it first appeared.
+6. **Write down what the experiment cannot show.**  A refused candidate whose
+   verdict is not about the candidate is not evidence, and saying so is cheaper than
+   letting the next person count it.
+
+### Where else this applies
+
+Several things this document records were established exactly this way, and each
+was a case where the obvious reading would have been wrong:
+
+| fact | how it was pinned |
+|:-----|:------------------|
+| the free list's live window is a slice starting at 85 | `xfs_db` prints `flfirst = 85` for a group the header says so |
+| a free inode's `next_unlinked` is at offset 96 | perturb each offset of an accepted slot; repair names the one it read |
+| version 3 is wrong for a 256-byte inode | write 3 into an accepted slot and ask |
+| a non-root leaf needs 31 records, a root leaf none | shrink an accepted leaf, both cases, and read repair's `min=`/`max=` |
+| a full free list's blocks become ordinary free space | fill an accepted list to the end of the array and let the tool rebuild it |
+| the device-wide free count has three terms | `xfs_db`'s own block walk, not this code's reader and not a parser |
+
+The common shape is that the first reading was wrong, and in each case it was wrong
+in a way that looked right.
 
 ## Measured invariants
 

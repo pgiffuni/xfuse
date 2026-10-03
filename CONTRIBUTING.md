@@ -1,5 +1,38 @@
 # CONTRIBUTING
 
+## Establishing a fact about the on-disk format
+
+A large part of this project is writing metadata that XFS accepts, and most of the
+difficulty is in knowing what XFS expects when there is no document that says so
+precisely.  `xfs_repair -n` is the oracle.  There is one rule about asking it, and
+it is the rule everything else in `docs/write-support-progress.md` follows:
+
+> **Do not infer an on-disk structure by building a candidate and reading the
+> rejection.**  Get a structure the file system already accepts, perturb one
+> controlled field, and read what the checker then says about *that* structure.
+
+These look like the same method and are not.  When six hand-built records were
+handed to `xfs_repair` to find the layout of a b-map block, all six were refused
+and **none of them was ever read** — the verdict described the construction, not
+the format.  Perturbing the pristine, accepted leaves produced answers on the first
+attempt, because the only difference from metadata the file system itself wrote is
+the field under test.
+
+Three things follow, and all three have been got wrong here:
+
+* **Verify the rewrite landed before reading a verdict.**  Ask `xfs_db` what it now
+  sees.  A complaint about something you failed to write is a statement about you.
+* **The checker's numbers are decoded values, not fields.**  It reported a
+  "starting block number" of `0x188000000c488` for a block whose bytes are
+  `000000000000c48b`; the number shares digits with two regions and is neither, so
+  it is assembled from several.  Reading it as a field is the same false inference
+  as trusting a parser.
+* **A refused candidate whose verdict is not about the candidate is not evidence.**
+  Say so when writing it down, or the next person counts it.
+
+For the measurements, the evidence levels, and the worked examples, see
+[`docs/write-support-progress.md`](docs/write-support-progress.md).
+
 ## How to run the project
 
 1. Check for errors
