@@ -1406,7 +1406,7 @@ mod t {
         btree::{BmbtLeafBlock, BmbtLeafRecord},
         dinode::{DiU, Dinode},
         dinode_core::XfsDinodeFmt,
-        dir3::Dir3,
+        dir3::{Dir2DataEntry, Dir3},
         dir3_block::Dir2Block,
         inode::RawDinode,
         sb::Sb,
@@ -3785,7 +3785,13 @@ mod t {
             match block.next(&mut reader, &sb, off) {
                 Ok((ino, next, _t, name)) => {
                     names.push((name.to_string_lossy().into_owned(), ino));
-                    offsets.push(off);
+                    // The offset the walk moves to, not the one it was called with:
+                    // the first call is made with a sentinel of 0 and the entry it
+                    // reads is after the header and the leaf index, so pairing a
+                    // name with the offset it was *asked* for shifts every entry by
+                    // one -- which is exactly the kind of off-by-one that makes a
+                    // length check fail for the wrong name.
+                    offsets.push(next);
                     if next < 0 {
                         break;
                     }
@@ -3814,6 +3820,43 @@ mod t {
             dblksize.saturating_sub(last) > 64,
             "there is no room after the last entry for a name and its tag"
         );
+
+        // Every entry's length, against the formula the reader uses.
+        //
+        // This was doubted and the doubt was wrong.  Sixteen bytes is what the
+        // first three entries step by, and a directory entry has to hold an
+        // eight-byte inode number, a name and a tag, so sixteen looked impossible
+        // -- but `.`, `..` and `sf` are one, two and two characters, and
+        // `((namelen + 19) / 8) * 8` is exactly sixteen for all three.  The larger
+        // names step by more: `block` by 24, `btree_with_single_leaf` by 40.  So
+        // the formula is right for every one of the thirteen measurable entries,
+        // and the doubt came from reading a list of offsets without noticing that
+        // it was not all one steps.
+        //
+        // That is worth a test rather than a comment, because it is the thing a
+        // writer has to agree with byte for byte.
+        let mut lengths_ok = 0;
+        for (i, (name, _ino)) in names.iter().enumerate() {
+            let Some(next) = offsets.get(i + 1) else {
+                break;
+            };
+            let step = (next - offsets[i]) as usize;
+            // Real entry bytes, so this asks the reader's own formula rather than a
+            // copy of it written here.
+            let mut entry = vec![0u8; 32];
+            entry[8] = name.as_bytes().len() as u8;
+            assert_eq!(
+                step as i64,
+                Dir2DataEntry::get_length(&sb, &entry),
+                "`{name}` steps by {step}, which is not what an entry of that length needs"
+            );
+            lengths_ok += 1;
+        }
+        assert!(
+            lengths_ok >= 10,
+            "only {lengths_ok} entries were checked, which is too few to be a check"
+        );
+        eprintln!("every one of {lengths_ok} measurable entries is the length its name needs");
     }
 
     /// What a *free* inode's slot looks like on disk, read out of a real image.
