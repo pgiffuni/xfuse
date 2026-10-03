@@ -77,7 +77,7 @@ use super::{
         GroupBlocks,
         GroupGeometry,
     },
-    inobt::{first_free_ino, InoRange, InobtNode, INODES_PER_CHUNK},
+    inobt::{first_free_ino, insert_chunk, InoRange, InobtNode, INODES_PER_CHUNK},
 };
 use crate::libxfuse::{
     definitions::{XfsAgblock, XfsIno},
@@ -251,9 +251,7 @@ impl<'a, 't, 's> TransactionBlocks<'a, 't, 's> {
             Err(e) => Err(e),
         }
     }
-}
 
-impl<'a, 't, 's> GroupBlocks for TransactionBlocks<'a, 't, 's> {
     /// Take a block for a split's new node out of the group's free list.
     ///
     /// The free list is the group's own supply of blocks that are free but not
@@ -308,7 +306,7 @@ impl<'a, 't, 's> GroupBlocks for TransactionBlocks<'a, 't, 's> {
     /// Note also that these blocks are reserved for that purpose and must not be
     /// handed out for ordinary file data, so metadata-block allocation is a
     /// different thing from ordinary allocation and not interchangeable with it.
-    fn take_btree_block(&mut self) -> FsResult<XfsAgblock> {
+    fn take_from_the_group(&mut self, inode_tree: bool) -> FsResult<XfsAgblock> {
         let mut agf = read_agf(self.transaction, self.sb, self.agno)?;
         let at = self.sb.ag_header_offset(self.agno, Sb::AGFL_SECTOR);
         let bytes = self
@@ -387,7 +385,9 @@ impl<'a, 't, 's> GroupBlocks for TransactionBlocks<'a, 't, 's> {
             agfl.update_crc();
             self.transaction.write_bytes(at, agfl.as_bytes())?;
             agf.set_free_list_window(window.first, window.last, window.count);
-            agf.set_btree_blocks(agf.btree_blocks() + 1);
+            if !inode_tree {
+                agf.set_btree_blocks(agf.btree_blocks() + 1);
+            }
             write_agf(self.transaction, self.sb, self.agno, &mut agf)?;
             return Ok(block);
         }
@@ -426,9 +426,60 @@ impl<'a, 't, 's> GroupBlocks for TransactionBlocks<'a, 't, 's> {
             block_tree.start,
             1,
         )?;
-        agf.set_btree_blocks(agf.btree_blocks() + 1);
+        if !inode_tree {
+            agf.set_btree_blocks(agf.btree_blocks() + 1);
+        }
         write_agf(self.transaction, self.sb, self.agno, &mut agf)?;
         Ok(block_tree.start)
+    }
+
+    /// A block for a new b-tree node, for either of the group's trees.
+    ///
+    /// `inode_tree` says which, and the only thing that differs between them is
+    /// whether `agf_btreeblks` moves -- see
+    /// [`TransactionBlocks::take_inode_tree_block`], which is why they are one
+    /// function rather than two nearly identical ones.
+    fn take_btree_block_inner(&mut self, inode_tree: bool) -> FsResult<XfsAgblock> {
+        self.take_from_the_group(inode_tree)
+    }
+
+    /// A block for a new node of the group's *inode* tree.
+    ///
+    /// The same blocks as any other node, and accounted differently, and the
+    /// difference is measured rather than argued:
+    ///
+    /// ```text
+    /// agf_btreeblks 59, counted 58 in ag 1
+    /// sb_fdblocks 90368, counted 90367
+    /// ```
+    ///
+    /// `agf_btreeblks` counts the blocks the two **free space** trees hold, and a
+    /// node of the inode tree is not one of those, so charging it charges the
+    /// group for a tree it does not have.  And a block that has become an inode
+    /// tree node is in none of the three places a free block is accounted for, so
+    /// the device's free count falls by one -- unlike a node of a free space tree,
+    /// which trades one term for another and leaves the total alone.
+    ///
+    /// Both lines are what `xfs_repair -n` said about an image whose inode tree
+    /// had been split, and neither is a variation to argue about: they are what a
+    /// file system with a node in that tree counts.
+    pub fn take_inode_tree_block(&mut self) -> FsResult<XfsAgblock> {
+        let block = self.take_btree_block_inner(true)?;
+        let mut sector = self.transaction.read_bytes(0, self.blocksize)?;
+        let free = Sb::fdblocks_in(&sector)?;
+        Sb::patch_fdblocks(&mut sector, free - 1)?;
+        self.transaction.write_bytes(0, &sector)?;
+        Ok(block)
+    }
+}
+
+impl<'a, 't, 's> GroupBlocks for TransactionBlocks<'a, 't, 's> {
+    fn take_btree_block(&mut self) -> FsResult<XfsAgblock> {
+        self.take_from_the_group(false)
+    }
+
+    fn take_inode_tree_block(&mut self) -> FsResult<XfsAgblock> {
+        Self::take_inode_tree_block(self)
     }
 
     fn get(&mut self, block: u32) -> FsResult<Box<[u8]>> {
@@ -693,14 +744,17 @@ fn take_named_blocks(
 /// has every field of it written by `allocate_ino`, so nothing downstream depends
 /// on what was here.
 ///
-/// # What is refused rather than guessed
+/// # Growing the tree
 ///
-/// A tree that is not a single leaf.  Inserting a record into a full leaf needs a
-/// split, and a split needs a block, and that is the same structural work the
-/// free space trees have and the inode tree does not.  Rather than write a
-/// half-working split, this returns `ENOSPC` and says why, so a caller that hits
-/// it learns that the inode tree needs the same treatment the free space trees
-/// already got.
+/// Inserting into a tree whose leaves are all full needs a split, and a split
+/// needs a block.  `insert_chunk` does that: it walks to the leaf, splits it in
+/// half, links the new node into the sibling chain on both sides, gives the parent
+/// a new child -- recursively, so a parent with no room splits too -- and grows a
+/// new root if the tree was a single leaf.
+///
+/// That is the ordinary case rather than a corner.  A leaf in a 512-byte block
+/// holds 31 records and `xfsv4.img`'s group 1 has seven of its nine leaves
+/// already full, so the eighth chunk inserted there is the one that splits.
 pub fn allocate_new_chunk(transaction: &mut Transaction<'_>, sb: &Sb, agno: u32) -> FsResult<u64> {
     let chunk_blocks = sb.chunk_blocks();
     if chunk_blocks == 0 {
@@ -712,9 +766,6 @@ pub fn allocate_new_chunk(transaction: &mut Transaction<'_>, sb: &Sb, agno: u32)
         sb.has_crc(),
     )?;
     let root = agi.inobt_root();
-    if agi.inobt_level() > 1 {
-        return Err(FsError::NoSpace);
-    }
 
     // The first inode number in the group, which is where a chunk-aligned range
     // has to start: a chunk's mask is 64 bits over 64 inodes, so the chunk has to
@@ -843,22 +894,23 @@ pub fn allocate_new_chunk(transaction: &mut Transaction<'_>, sb: &Sb, agno: u32)
         transaction.write_bytes(at, &unused)?;
     }
 
-    // The record, in the leaf that holds the others.
+    // The record, in the tree that holds the others -- growing the tree if every
+    // leaf in it is full, which for this image's group 1 is the case from the
+    // first insertion: seven of its nine leaves hold 31 records and a 512-byte
+    // leaf holds 31.
     let range = InoRange {
         start:      startino,
         free_count: INODES_PER_CHUNK as u32,
         free:       u64::MAX,
     };
-    let inobt_at = sb.ag_offset(agno) + u64::from(root) * u64::from(sb.sb_blocksize);
-    let mut leaf = InobtNode::from_bytes(
-        transaction
-            .read_bytes(inobt_at, sb.sb_blocksize as usize)?
-            .into_boxed_slice(),
-    )?;
-    leaf.insert_range(&range)?;
-    leaf.update_crc();
-    let leaf = leaf.into_bytes();
-    transaction.write_bytes(inobt_at, &leaf)?;
+    let mut store = TransactionBlocks::new(transaction, sb, agno);
+    let root = insert_chunk(&mut store, root, range)?;
+    if root != agi.inobt_root() {
+        // The tree grew a level, so the group has to say where its root is and how
+        // deep it is, or the next walk stops at the old one.
+        agi.set_inobt(root, agi.inobt_level() + 1)?;
+        transaction.write_bytes(agi_at, agi.as_bytes())?;
+    }
 
     // And the counts.  `newino` moves here and nowhere else, because this is the
     // only operation here that allocates a chunk.
@@ -1347,7 +1399,7 @@ mod t {
                 XFS_ABTB_MAGIC,
                 XFS_ABTC_MAGIC,
             },
-            inobt::{chunks_in_order, INODES_PER_CHUNK},
+            inobt::{chunks_in_order, InobtNode, INODES_PER_CHUNK},
         },
         block_cache::BlockCache,
         block_device::{Access, BlockDevice},
@@ -3316,6 +3368,280 @@ mod t {
             unexpected.join("\n"),
             complaints
         );
+    }
+
+    /// A chunk in a group whose inode tree is full makes the tree grow, and the
+    /// grown tree is still a tree.
+    ///
+    /// This is not a corner case, it is the ordinary case for these images.  A
+    /// leaf in a 512-byte block holds 31 records and `xfsv4.img`'s group 1 has
+    /// nine leaves, **every one of them full** — 31 records each, which is what
+    /// `xfs_db` prints for them and what the measured occupancy rule puts at the
+    /// ceiling.  So the first new chunk in that group has to split a leaf, and the
+    /// split is what this reaches.
+    ///
+    /// What it checks, and why each of them is here:
+    ///
+    /// * the chunk goes in, and the tree is still *ordered*: every leaf's records
+    ///   ascend, because a tree whose contents are right and whose shape is not is
+    ///   a fault no walk can see and `xfs_repair` reports as an out-of-order
+    ///   record;
+    /// * the tree is still *reachable* from the group's header, and the sibling
+    ///   chain is bidirectional — a chain that names a node on one side only is a
+    ///   chain no walk can follow, and that is the failure the plan calls out by
+    ///   name;
+    /// * the group header names the tree that is actually there, at the depth it
+    ///   actually is, since the tree grew a level;
+    /// * the new node came out of the group's free space and was *charged* for, so
+    ///   the b-tree block count moved with it;
+    /// * and `xfs_repair -n` accepts the result.
+    ///
+    /// The last is the only check here that can tell whether any of it is right,
+    /// and it is the reason the test is on a real image rather than on a tree built
+    /// in memory: a tree assembled from blocks this code just wrote is checked
+    /// against this code's own idea of a tree.
+    #[test]
+    fn a_chunk_in_a_full_group_makes_the_inode_tree_grow() {
+        let Some(image) = copy_of_golden("xfsv4.img") else {
+            eprintln!("skipping: no xfsv4.img to copy");
+            return;
+        };
+        let sb = sb_of(image.path());
+        let agno = 1u32;
+        let device = Arc::new(BlockDevice::open(image.path(), Access::ReadWrite).unwrap());
+        let mut cache = BlockCache::new(sb.sb_blocksize as usize, 256);
+
+        // The tree as it is: every leaf full.
+        let before = inobt_shape(image.path(), &sb, agno);
+        assert!(
+            before.leaves > 1,
+            "group 1's inode tree is meant to have interior nodes, and it has {} leaves",
+            before.leaves
+        );
+        let blocks_before = inobt_node_count(image.path(), &sb, agno);
+
+        // Chunks until the tree has to split.  Which leaf a new chunk lands in
+        // depends on where the search finds room, so the test keeps going rather
+        // than assuming one: with seven of the nine leaves already full, the first
+        // chunk that cannot find a leaf with room is the one that splits.
+        let mut added = 0u32;
+        while inobt_shape(image.path(), &sb, agno).leaves == before.leaves {
+            added += 1;
+            assert!(added < 200, "the tree never split, so nothing was tested");
+            {
+                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                allocate_new_chunk(&mut tx, &sb, agno).expect("the group has room for a chunk");
+                tx.commit().expect("commit");
+            }
+            device.flush().unwrap();
+        }
+        eprintln!(
+            "xfsv4.img ag1: the tree split after {added} chunks ({} of {} leaves were full)",
+            before.full_leaves, before.leaves
+        );
+
+        let after = inobt_shape(image.path(), &sb, agno);
+        assert!(
+            after.leaves >= before.leaves + 1,
+            "splitting a full leaf in two must add a leaf: {} then {}",
+            before.leaves,
+            after.leaves
+        );
+        assert!(
+            after.nodes > before.nodes,
+            "the tree gained a leaf and no node to hold it"
+        );
+        assert!(
+            after.chain_is_bidirectional,
+            "the sibling chain does not go both ways, so a walk cannot follow it"
+        );
+        assert_eq!(
+            after.leaf_blocks.len(),
+            after.leaves,
+            "a leaf exists that cannot be reached from the group's root"
+        );
+        assert!(
+            after.ordered,
+            "the tree's records are not in order after the split"
+        );
+        assert!(
+            after.records > before.records,
+            "the chunk is not in the tree"
+        );
+
+        // The tree grew a node, and the group owns it.
+        assert_eq!(
+            inobt_node_count(image.path(), &sb, agno),
+            blocks_before + 1,
+            "the node the split needed is not one the group owns"
+        );
+
+        assert_repair_accepts(
+            image.path(),
+            "after a new inode chunk made the inode tree split",
+        );
+    }
+
+    /// The shape of a group's inode tree, and whether it hangs together.
+    ///
+    /// A tree is four things at once and each is checked separately, because a
+    /// wrong one hides the others: the *contents* can be complete and correct while
+    /// the *order* is wrong, the order can be right while a node is *unreachable*
+    /// from the root, and every node can be reachable while the *chain* between
+    /// them runs one way only.
+    fn inobt_shape(image: &std::path::Path, sb: &Sb, agno: u32) -> InobtShape {
+        let mut shape = InobtShape {
+            levels: 0,
+            nodes: 0,
+            leaves: 0,
+            full_leaves: 0,
+            records: 0,
+            ordered: true,
+            chain_is_bidirectional: true,
+            leaf_blocks: Vec::new(),
+        };
+        let agi = {
+            let at = sb.ag_header_offset(agno, Sb::AGI_SECTOR);
+            let mut bytes = vec![0u8; sb.sb_blocksize as usize];
+            std::fs::File::open(image)
+                .unwrap()
+                .read_exact_at(&mut bytes, at)
+                .unwrap();
+            Agi::from_bytes(bytes, sb.has_crc()).expect("a group inode header")
+        };
+        shape.levels = agi.inobt_level();
+        let root = agi.inobt_root();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![root];
+        while let Some(block) = stack.pop() {
+            assert!(
+                seen.insert(block),
+                "block {block} is in the inode tree twice"
+            );
+            let node = read_inobt_node(image, sb, agno, block);
+            shape.nodes += 1;
+            if node.is_leaf() {
+                shape.leaves += 1;
+                let ranges = node.ranges().expect("the leaf's records");
+                shape.records += ranges.len();
+                if ranges.len() == InobtNode::leaf_capacity(sb.sb_blocksize as usize) {
+                    shape.full_leaves += 1;
+                }
+                if !ranges.windows(2).all(|w| w[0].start < w[1].start) {
+                    shape.ordered = false;
+                }
+                shape.leaf_blocks.push(block);
+            } else {
+                for (_, child) in node.children().expect("children") {
+                    stack.push(child);
+                }
+            }
+        }
+        shape.leaf_blocks.sort_unstable();
+        // The sibling chain, followed from one end and compared with the tree.
+        //
+        // The chain is in the tree's *order*, not in block-number order, and
+        // walking it by sorting the blocks numerically compares the chain with a
+        // list it has nothing to do with -- which reported this image's own,
+        // untouched chain as broken.  So the order comes from the chain itself:
+        // start at the leaf with no left neighbour and walk right.
+        let leftmost: Vec<u32> = shape
+            .leaf_blocks
+            .iter()
+            .copied()
+            .filter(|b| {
+                read_inobt_node(image, sb, agno, *b)
+                    .left_sibling()
+                    .is_none()
+            })
+            .collect();
+        match leftmost.as_slice() {
+            [start] => {
+                let mut walked = vec![*start];
+                let mut next = read_inobt_node(image, sb, agno, *start).right_sibling();
+                while let Some(block) = next {
+                    if walked.len() > shape.leaf_blocks.len() {
+                        // A chain that never ends is not a chain.
+                        shape.chain_is_bidirectional = false;
+                        break;
+                    }
+                    let node = read_inobt_node(image, sb, agno, block);
+                    // Both sides, at every step: a chain that names the node on one
+                    // side only is a chain no walk can follow back.
+                    if node.left_sibling() != walked.last().copied() {
+                        shape.chain_is_bidirectional = false;
+                    }
+                    if !shape.leaf_blocks.contains(&block) {
+                        shape.chain_is_bidirectional = false;
+                    }
+                    walked.push(block);
+                    next = node.right_sibling();
+                }
+                if walked.len() != shape.leaf_blocks.len() {
+                    shape.chain_is_bidirectional = false;
+                }
+            }
+            // More than one leaf with no left neighbour, or none, means the chain
+            // does not have the ends it should.
+            _ => shape.chain_is_bidirectional = false,
+        }
+        shape
+    }
+
+    fn read_inobt_node(image: &std::path::Path, sb: &Sb, agno: u32, block: u32) -> InobtNode {
+        let bs = sb.sb_blocksize as usize;
+        let mut bytes = vec![0u8; bs];
+        std::fs::File::open(image)
+            .unwrap()
+            .read_exact_at(
+                &mut bytes,
+                u64::from(agno) * u64::from(sb.sb_agblocks) * bs as u64
+                    + u64::from(block) * bs as u64,
+            )
+            .unwrap();
+        InobtNode::from_bytes(bytes).unwrap_or_else(|e| panic!("ag{agno} block {block}: {e}"))
+    }
+
+    /// How many blocks a group's inode tree occupies.
+    ///
+    /// Counted by walking it, so the answer is what the tree *is* rather than what
+    /// the header says, and the two are compared by the test.
+    fn inobt_node_count(image: &std::path::Path, sb: &Sb, agno: u32) -> u32 {
+        let bs = sb.sb_blocksize as usize;
+        let mut count = 0u32;
+        let mut seen = std::collections::HashSet::new();
+        let agi_at = sb.ag_header_offset(agno, Sb::AGI_SECTOR);
+        let mut bytes = vec![0u8; bs];
+        std::fs::File::open(image)
+            .unwrap()
+            .read_exact_at(&mut bytes, agi_at)
+            .unwrap();
+        let mut stack = vec![be32(&bytes, 20)];
+        while let Some(block) = stack.pop() {
+            if !seen.insert(block) {
+                continue;
+            }
+            count += 1;
+            let node = read_inobt_node(image, sb, agno, block);
+            if !node.is_leaf() {
+                for (_, child) in node.children().expect("children") {
+                    stack.push(child);
+                }
+            }
+        }
+        count
+    }
+
+    /// What a group's inode tree looks like, and whether it hangs together.
+    struct InobtShape {
+        levels: u32,
+        nodes: usize,
+        leaves: usize,
+        full_leaves: usize,
+        records: usize,
+        ordered: bool,
+        chain_is_bidirectional: bool,
+        leaf_blocks: Vec<u32>,
     }
 
     /// What a *free* inode's slot looks like on disk, read out of a real image.

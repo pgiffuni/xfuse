@@ -202,8 +202,7 @@ What is left in order:
 
 | Area |
 |:-----|
-| Leaf merge and parent removal |
-| Root collapse |
+| Root collapse (an interior root left with one child) |
 | BMBT growth (inode btree interior nodes) |
 | `create`, `unlink`, directory and namespace mutation |
 | Journal, log recovery, crash safety |
@@ -554,11 +553,12 @@ Concretely, in order:
      by everything that touches a group, so a copy taken before the work is a copy
      taken too early.
 
-7. ~~**New inode chunks.**~~  Done, on a group with an empty inode tree, with
-   `xfs_repair -n` accepting the result.  Two things are still missing and are
-   listed above: inserting into a tree that is more than a single leaf needs a
-   split, which is refused rather than half-written; and the free slots' layout is
-   measured against repair rather than observed in an image XFS built.
+7. ~~**New inode chunks.**~~  Done, on a group with an empty inode tree *and* on
+   one whose inode tree has to split to make room, with `xfs_repair -n` accepting
+   both.  What is still not established is the free slots' layout in an image XFS
+   itself built: the layout here is measured against repair, which is the only
+   authority available here, and no chunk in any image in this repository was
+   created by an operation anyone here can watch.
 8. **File extension and holes** — both already work for the contiguous case;
    what remains is making them survive the allocator work above.
 9. **BMBT growth and directories**, in that order.  Truncate is done: a file made

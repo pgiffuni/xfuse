@@ -1230,6 +1230,29 @@ pub trait GroupBlocks {
     /// blocks than its trees hold is a state `xfs_repair -n` reports, and it is
     /// reached the moment the first merge happens on a real image.
     fn give_back_btree_block(&mut self, block: XfsAgblock) -> FsResult<()>;
+
+    /// A block for a new node of one of the group's *other* trees -- the inode
+    /// tree, not the free space ones.
+    ///
+    /// Separate from [`GroupBlocks::take_btree_block`] because the two are
+    /// accounted differently, and the difference is measured rather than argued:
+    ///
+    /// ```text
+    /// agf_btreeblks 59, counted 58 in ag 1
+    /// sb_fdblocks 90368, counted 90367
+    /// ```
+    ///
+    /// `agf_btreeblks` is a count of the blocks the two **free space** trees
+    /// hold, less their roots, and a node of the inode tree is not one of those --
+    /// so charging it is charging the group for a tree it does not have.  And a
+    /// block that has become an inode-tree node is in none of the three places a
+    /// free block is accounted for, so the device's free count falls by one: unlike
+    /// a node of a free space tree, which trades one term for another and leaves
+    /// the total alone, this one simply stops being free.
+    ///
+    /// Both of those are what `xfs_repair -n` said, on an image where a chunk
+    /// insertion had split an inode tree leaf.
+    fn take_inode_tree_block(&mut self) -> FsResult<XfsAgblock>;
 }
 
 /// Check that every level of a tree is a doubly linked list of exactly the live
@@ -1367,6 +1390,16 @@ impl GroupBlocks for MemoryBlocks {
         // again by `take_btree_block` afterwards.
         self.blocks.remove(&block);
         Ok(())
+    }
+
+    fn take_inode_tree_block(&mut self) -> FsResult<XfsAgblock> {
+        // The same blocks as any other node, and this group has no accounting to
+        // keep: a released node comes out of the map, and a taken one goes back
+        // into it, which is the whole of what "the group owns it" means here.
+        match self.blocks.keys().copied().max() {
+            Some(block) => Ok(block),
+            None => Err(FsError::NoSpace),
+        }
     }
 }
 

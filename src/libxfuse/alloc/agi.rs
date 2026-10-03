@@ -177,6 +177,21 @@ impl Agi {
         self.u32_at(offset::SEQNO)
     }
 
+    /// Record where the group's tree of used inode numbers now starts, and how
+    /// deep it is.
+    ///
+    /// These move together and only when the tree grows: a new chunk added to a
+    /// tree whose leaves all have room leaves both alone, and a tree that grew a
+    /// level leaves the old root behind as an ordinary node, so a header still
+    /// naming the old root would send the next walk to a node that is no longer
+    /// the top of anything.
+    pub fn set_inobt(&mut self, root: u32, level: u32) -> FsResult<()> {
+        self.set_u32(offset::INOBT_ROOT, root);
+        self.set_u32(offset::INOBT_LEVEL, level);
+        Ok(())
+    }
+
+    /// Record that this inode is not on the list of inodes waiting to be reused.
     /// Move the group's inode count, which is the sum of its chunks' widths.
     ///
     /// Moves with a chunk and with nothing else: taking an inode out of a chunk

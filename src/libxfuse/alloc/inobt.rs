@@ -131,6 +131,13 @@ where
 }
 
 /// The magic at the start of every node: "IABT".
+use crate::libxfuse::alloc::{agf::NULL_AGBLOCK, free_space::GroupBlocks};
+
+/// The magic every node of the inode b-tree carries.
+///
+/// Both depths carry the same one: a 512-byte image's group 1 has an interior
+/// node at block 12 and a leaf at block 6 and both read `IABT`.  The level field
+/// is what tells them apart, which is why there is one magic here and not two.
 const XFS_INOBT_MAGIC: u32 = 0x4941_4254;
 
 const MAGIC: usize = 0;
@@ -207,6 +214,232 @@ impl InoRange {
     pub fn count_agrees(&self) -> bool {
         self.free.count_ones() == self.free_count
     }
+}
+
+/// Insert a chunk into the tree, growing the tree if it has to.
+///
+/// Returns the tree's new root, which is the same block unless the tree was a
+/// single leaf that had to become an interior node -- see
+/// [`insert_chunk_above`] for what "growing" involves.
+///
+/// The two things this has to get right, and which the free space trees already
+/// have to get right and got wrong twice between them:
+///
+/// * **a new node comes from the group.**  A tree that cannot grow without a
+///   block must not pretend otherwise, which is why inserting into a full tree was
+///   a refusal rather than a write.  This is not a corner case: a leaf in a
+///   512-byte block holds 31 records and `xfsv4.img`'s group 1 has nine of them,
+///   all full, so the *first* new chunk in that group needs a split.
+/// * **a new node's siblings have to be relinked.**  The chain is structure, not
+///   a hint: a node left out of it is one no walk can reach, and no comparison of
+///   free space would ever notice.
+pub fn insert_chunk<B: GroupBlocks>(blocks: &mut B, root: u32, range: InoRange) -> FsResult<u32> {
+    // Down to the leaf that should hold the record, remembering the way: which
+    // parent, and which child of it we came through.
+    let mut path: Vec<(u32, usize)> = Vec::new();
+    let mut block = root;
+    let mut leaf = loop {
+        let node = InobtNode::from_bytes(blocks.get(block)?)?;
+        if node.is_leaf() {
+            break node;
+        }
+        let children = node.children()?;
+        if children.is_empty() {
+            return Err(FsError::corrupt(
+                "an interior node of the inode tree has no children",
+            ));
+        }
+        // The child whose keys cover `start`.  The last child covers everything
+        // above its first key, which is what makes a tree's keys separators
+        // rather than bounds on their own.
+        let at = child_index(&children, range.start).min(children.len() - 1);
+        path.push((block, at));
+        block = children[at].1;
+    };
+    match leaf.insert_range(&range) {
+        Ok(()) => {
+            // **Write the leaf back.**  Not doing so is silent and total: the
+            // insert succeeds, the tree is not changed, the caller believes the
+            // chunk is there, and nothing anywhere reports an error.  The tree
+            // never grows either, because the leaf it keeps landing in is never
+            // any fuller -- which is how this was found, by a test that added two
+            // hundred chunks to a group whose leaves were full and watched none of
+            // them split.
+            leaf.update_crc();
+            blocks.put(block, leaf.into_bytes())?;
+            Ok(root)
+        }
+        Err(FsError::NoSpace) => {
+            let root = insert_chunk_above(blocks, root, &mut path, block, leaf, &range)?;
+            // **And then insert the chunk**, which the split has not done: a split
+            // makes room, it does not use it.  Dropping the record here is silent
+            // too, and shows up one counter away, as a group that claims an inode
+            // the tree has never heard of --
+            //
+            // ```text
+            // agi_count 16960, counted 16896 in ag 1
+            // sb_icount 22656, counted 22592
+            // ```
+            //
+            // -- a whole chunk short.  The tree is bigger by then, so the walk
+            // starts again from the new root; it strictly grows, so this cannot
+            // loop, and the bound is here only so that a bug says so rather than
+            // hanging.
+            let mut root = root;
+            for _ in 0..depth_bound(blocks, root) {
+                let mut path = Vec::new();
+                let mut block = root;
+                let mut leaf = loop {
+                    let node = InobtNode::from_bytes(blocks.get(block)?)?;
+                    if node.is_leaf() {
+                        break node;
+                    }
+                    let children = node.children()?;
+                    if children.is_empty() {
+                        return Err(FsError::corrupt(
+                            "an interior node of the inode tree has no children",
+                        ));
+                    }
+                    let at = child_index(&children, range.start).min(children.len() - 1);
+                    path.push((block, at));
+                    block = children[at].1;
+                };
+                match leaf.insert_range(&range) {
+                    Ok(()) => {
+                        leaf.update_crc();
+                        blocks.put(block, leaf.into_bytes())?;
+                        return Ok(root);
+                    }
+                    Err(FsError::NoSpace) => {
+                        root = insert_chunk_above(blocks, root, &mut path, block, leaf, &range)?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(FsError::Corrupt {
+                what: "the inode tree kept splitting and the chunk never fitted".into(),
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// A bound on how deep a tree can be, for a loop that must end.
+///
+/// The root's own level plus one, read from the tree rather than assumed: every
+/// round of that loop splits a leaf, and a split raises the tree by at most a level,
+/// so the root's depth bounds the number of rounds there can be.
+fn depth_bound<B: GroupBlocks>(blocks: &mut B, root: u32) -> usize {
+    match blocks
+        .get(root)
+        .and_then(|b| InobtNode::from_bytes(b.into_vec()))
+    {
+        Ok(node) => node.level() as usize + 2,
+        Err(_) => 2,
+    }
+}
+
+/// Which child of an interior node a chunk belongs in.
+fn child_index(children: &[(u64, u32)], start: u64) -> usize {
+    children.partition_point(|(key, _)| *key < start)
+}
+
+/// Split a full leaf and put the new one into the tree.
+///
+/// `leaf_block` is the full leaf and `path` is the way down to it, outermost
+/// first.  Returns the tree's new root.
+fn insert_chunk_above<B: GroupBlocks>(
+    blocks: &mut B,
+    root: u32,
+    path: &mut Vec<(u32, usize)>,
+    leaf_block: u32,
+    mut leaf: InobtNode,
+    _range: &InoRange,
+) -> FsResult<u32> {
+    // Half each, and the right half keeps the higher records, so the order is the
+    // same on both sides of the split as it was before it.
+    let records = leaf.ranges()?;
+    let half = records.len().div_ceil(2);
+    let (low, high) = records.split_at(half);
+    let size = leaf.len();
+    let old_right = leaf.right_sibling().filter(|b| *b != NULL_AGBLOCK);
+    leaf.replace_ranges(low)?;
+    leaf.link_right(NULL_AGBLOCK);
+    leaf.update_crc();
+    blocks.put(leaf_block, leaf.into_bytes())?;
+    let sibling_block = blocks.take_inode_tree_block()?;
+    let mut sibling = InobtNode::empty_leaf(size);
+    sibling.replace_ranges(high)?;
+    sibling.update_crc();
+    blocks.put(sibling_block, sibling.into_bytes())?;
+
+    // The chain, both ways.  The new node goes between the leaf and whatever was
+    // to its right, and **both sides** are relinked: a chain that names the new
+    // node only on one side is a chain no walk can follow.
+    let mut sibling = InobtNode::from_bytes(blocks.get(sibling_block)?)?;
+    sibling.link_left(leaf_block);
+    if let Some(right) = old_right {
+        sibling.link_right(right);
+        let mut node = InobtNode::from_bytes(blocks.get(right)?)?;
+        node.link_left(sibling_block);
+        node.update_crc();
+        blocks.put(right, node.into_bytes())?;
+    }
+    sibling.update_crc();
+    blocks.put(sibling_block, sibling.into_bytes())?;
+    let mut leaf = InobtNode::from_bytes(blocks.get(leaf_block)?)?;
+    leaf.link_right(sibling_block);
+    leaf.update_crc();
+    blocks.put(leaf_block, leaf.into_bytes())?;
+
+    let sibling_key = high
+        .first()
+        .map(|c| c.start)
+        .ok_or_else(|| FsError::corrupt("a split left the new node with no records"))?;
+
+    // And now the parent, the innermost one -- one step, not a loop, because each
+    // step either finishes or hands the same problem one level up.
+    if let Some((parent_block, at)) = path.pop() {
+        let mut parent = InobtNode::from_bytes(blocks.get(parent_block)?)?;
+        match parent.insert_child(at + 1, sibling_key, sibling_block) {
+            Ok(()) => {
+                parent.update_crc();
+                blocks.put(parent_block, parent.into_bytes())?;
+                return Ok(root);
+            }
+            Err(FsError::NoSpace) => {
+                // This parent is full, which is the same problem one level up, so
+                // it goes through the same split with the path above it already
+                // built.
+                let child = parent.child_block(at)?;
+                insert_chunk_above(blocks, root, path, child, parent, _range)?;
+                return Ok(root);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Nothing above the leaf: the tree was a single leaf, so it needs a new
+    // interior node above it, and that is a root that has moved.
+    let left = InobtNode::from_bytes(blocks.get(leaf_block)?)?;
+    let left_key = left.ranges()?.first().map(|c| c.start).unwrap_or(0);
+    let root_block = blocks.take_inode_tree_block()?;
+    let mut new_root = InobtNode::new_interior(size);
+    new_root.push_child(left_key, leaf_block)?;
+    new_root.push_child(sibling_key, sibling_block)?;
+    new_root.update_crc();
+    blocks.put(root_block, new_root.into_bytes())?;
+    // The two nodes below it must no longer claim a parent, and their chain must
+    // start at the new root's children rather than at each other.
+    let mut left = InobtNode::from_bytes(blocks.get(leaf_block)?)?;
+    left.link_left(NULL_AGBLOCK);
+    left.update_crc();
+    blocks.put(leaf_block, left.into_bytes())?;
+    let mut right = InobtNode::from_bytes(blocks.get(sibling_block)?)?;
+    right.link_left(NULL_AGBLOCK);
+    right.update_crc();
+    blocks.put(sibling_block, right.into_bytes())?;
+    Ok(root_block)
 }
 
 /// Every range of inode numbers a tree says are in use, in the order the tree
@@ -443,6 +676,137 @@ impl InobtNode {
 
     /// The first inode number under each child of an interior node, paired with
     /// the block holding it.
+    /// How many bytes this node is, which is how a new one is sized to match.
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// A node of this size that holds nothing.
+    fn empty_like(&self, leaf: bool) -> Self {
+        Self::blank(self.bytes.len(), if leaf { 0 } else { 1 })
+    }
+
+    /// A leaf of this size that holds nothing.
+    fn empty_leaf(size: usize) -> Self {
+        Self::blank(size, 0)
+    }
+
+    /// An interior node of this size that holds nothing.
+    fn new_interior(size: usize) -> Self {
+        Self::blank(size, 1)
+    }
+
+    /// A node of this size and depth that holds nothing and has no siblings.
+    ///
+    /// A new node's siblings are set by whoever links it in, and are the null
+    /// block until they are: a node that claimed a sibling it had not been given
+    /// would put the chain into a block that is not part of the tree.
+    fn blank(size: usize, level: u16) -> Self {
+        let mut bytes = vec![0u8; size];
+        bytes[MAGIC..MAGIC + 4].copy_from_slice(&XFS_INOBT_MAGIC.to_be_bytes());
+        bytes[LEVEL..LEVEL + 2].copy_from_slice(&level.to_be_bytes());
+        bytes[LEFTSIB..LEFTSIB + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        bytes[RIGHTSIB..RIGHTSIB + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        InobtNode {
+            bytes: bytes.into_boxed_slice(),
+            level,
+            numrecs: 0,
+        }
+    }
+
+    /// Put this node's records in place of its own.
+    ///
+    /// Used by a split: the records that were here are now two halves, and this is
+    /// one of them.  The count moves with them, because a leaf whose count and
+    /// records disagree is a leaf nothing can be read out of.
+    fn replace_ranges(&mut self, ranges: &[InoRange]) -> FsResult<()> {
+        if !self.is_leaf() {
+            return Err(FsError::invalid(
+                libc::EINVAL,
+                "only a leaf of the inode tree holds chunks",
+            ));
+        }
+        let at = Self::leaf_capacity(self.bytes.len());
+        if ranges.len() > at {
+            return Err(FsError::corrupt(
+                "a split left more records in a node than the node holds",
+            ));
+        }
+        self.numrecs = 0;
+        for (i, r) in ranges.iter().enumerate() {
+            self.write_range(i, r)?;
+            self.numrecs += 1;
+        }
+        self.renumber();
+        Ok(())
+    }
+
+    /// Say which node is to this one's left, or none.
+    pub fn link_left(&mut self, block: u32) {
+        self.bytes[LEFTSIB..LEFTSIB + 4].copy_from_slice(&block.to_be_bytes());
+    }
+
+    /// Say which node is to this one's right, or none.
+    pub fn link_right(&mut self, block: u32) {
+        self.bytes[RIGHTSIB..RIGHTSIB + 4].copy_from_slice(&block.to_be_bytes());
+    }
+
+    /// The block of this interior node's `at`th child.
+    fn child_block(&self, at: usize) -> FsResult<u32> {
+        if self.is_leaf() {
+            return Err(FsError::invalid(
+                libc::EINVAL,
+                "a leaf holds chunks, not children",
+            ));
+        }
+        let ptrs = BODY + self.capacity() * 4 + at * 4;
+        Ok(self.u32_at(ptrs))
+    }
+
+    /// Put a child at `at`, making room by refusing when there is none.
+    ///
+    /// A node that is full is a node that has to split, and refusing here is what
+    /// makes that the caller's to arrange: a node cannot take a block for itself.
+    pub fn insert_child(&mut self, at: usize, key: u64, block: u32) -> FsResult<()> {
+        if self.is_leaf() {
+            return Err(FsError::invalid(
+                libc::EINVAL,
+                "a leaf holds chunks, not children",
+            ));
+        }
+        let capacity = self.capacity();
+        if self.numrecs as usize >= capacity {
+            return Err(FsError::NoSpace);
+        }
+        let at = at.min(self.numrecs as usize);
+        let keys = BODY;
+        let ptrs = keys + capacity * 4;
+        // Shift the tail of both arrays right by one, from the back so nothing is
+        // overwritten before it has been moved.
+        for i in (at..self.numrecs as usize).rev() {
+            let k = self.u32_at(keys + i * 4);
+            let p = self.u32_at(ptrs + i * 4);
+            self.bytes[keys + (i + 1) * 4..keys + (i + 1) * 4 + 4]
+                .copy_from_slice(&k.to_be_bytes());
+            self.bytes[ptrs + (i + 1) * 4..ptrs + (i + 1) * 4 + 4]
+                .copy_from_slice(&p.to_be_bytes());
+        }
+        let key = u32::try_from(key).map_err(|_| FsError::Corrupt {
+            what: format!("chunk start {key} does not fit an interior key"),
+        })?;
+        self.bytes[keys + at * 4..keys + at * 4 + 4].copy_from_slice(&key.to_be_bytes());
+        self.bytes[ptrs + at * 4..ptrs + at * 4 + 4].copy_from_slice(&block.to_be_bytes());
+        self.numrecs += 1;
+        self.renumber();
+        Ok(())
+    }
+
+    /// Add a child at the end, which is where a split's new child goes.
+    fn push_child(&mut self, key: u64, block: u32) -> FsResult<()> {
+        let at = self.numrecs as usize;
+        self.insert_child(at, key, block)
+    }
+
     pub fn children(&self) -> FsResult<Vec<(u64, u32)>> {
         if self.is_leaf() {
             return Err(FsError::invalid(
