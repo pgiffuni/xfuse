@@ -1575,9 +1575,9 @@ work was thrown away rather than committed half-done, because a `create` that
 produces a directory `xfs_repair` calls corrupt is worse than no `create`.
 
 What would settle it: the entry layout of a directory **XFS itself wrote**.  These
-images are hand-built, and the two facts that do not fit the format -- a tag that
-is two bytes wide and a length formula that disagrees with the field layout -- are
-both of a piece with that.  `mkfs.xfs` makes no directory with a name in it that
+images are hand-built, and the one fact that does not fit the format -- fourteen
+bytes of fields will not share sixteen with a four-byte tag -- is of a piece with
+that.  `mkfs.xfs` makes no directory with a name in it that
 this suite can reach without mounting a file system, so that measurement needs a
 substrate this environment cannot make -- which is now the answer to three separate
 questions: the b-map block's data block, the free list's own transition, and this.
