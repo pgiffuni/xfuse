@@ -321,7 +321,7 @@ pub trait Btree: BtreePriv {
         match &mut *guard {
             BtreeBlockCache::Intermediate(bci) => {
                 if self.level() <= 1 {
-                    return Err(libc::EUCLEAN);
+                    return Err(crate::libxfuse::EUCLEAN);
                 }
 
                 let entry = bci.entry(idx);
@@ -343,7 +343,7 @@ pub trait Btree: BtreePriv {
             }
             BtreeBlockCache::Leaf(bcl) => {
                 if self.level() > 1 {
-                    return Err(libc::EUCLEAN);
+                    return Err(crate::libxfuse::EUCLEAN);
                 }
 
                 let entry = bcl.entry(idx);
@@ -357,7 +357,8 @@ pub trait Btree: BtreePriv {
                         buf_reader
                             .read_exact(&mut bytes)
                             .map_err(|e| e.raw_os_error().unwrap())?;
-                        let btl = BtreeLeaf::from_bytes(&bytes).map_err(|_| libc::EUCLEAN)?;
+                        let btl =
+                            BtreeLeaf::from_bytes(&bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
                         Ok(ve.insert(btl).get_extent(logical_block))
                     }
                     Entry::Occupied(oe) => {

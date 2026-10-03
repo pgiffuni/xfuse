@@ -839,7 +839,10 @@ fn repair_accepts(image: &std::path::Path, what: &str) {
     // case on the project's CI, and which is a fact about the host rather than
     // about the image.
     let Ok(out) = Command::new("xfs_repair").arg("-n").arg(image).output() else {
-        eprintln!("skipping the repair check for {what}: no xfs_repair to run");
+        // Loudly.  A skipped oracle is not a passing test, and a run that cannot
+        // say how many checks it did not make cannot be read as a run that
+        // verified them.
+        eprintln!("SKIPPED ORACLE CHECK: {what} (no xfs_repair to run)");
         return;
     };
     let text = format!(
