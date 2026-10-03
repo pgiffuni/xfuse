@@ -262,7 +262,8 @@ Each numerical claim in this document, what it rests on, and where it now stands
 | a b-map record's size and field offsets | tool | 16 bytes; `o` at 24+16n, `s` at 28+16n, `c` at 32+16n | **confirmed** |
 | a b-map record's shape: 16 bytes, four 4-byte words, from offset 24 | tool | perturbing the word at 24 changes entry 0, at 40 changes entry 1, through entry 4 | **confirmed** |
 | a b-map extent's file offset is the record's **second** word, in **bytes** | tool | it reads 0, 512, 1024, 1536 — the offsets 0, 1, 2, 3 that repair *prints* | **confirmed** |
-| a b-map extent's data block: where it is | — | the fourth word ascends by `0x400000`, which is no block number here | **unmeasured** |
+| a b-map record's fourth word is `(entry << 16) \| length in blocks`, not a block | tool | its low half is 1 in all 64 entries and its high half counts 0..63 across three leaves without a break | **confirmed** |
+| a b-map extent's data block: where it is | — | **not in the record** — both constant words and the counter are excluded | **unmeasured, narrowed** |
 | root collapse | — | unreachable, so nothing to confirm | **not written** |
 
 **Two rows are still open**, and both are the difference between "this is how it
@@ -1164,30 +1165,51 @@ So the layout is:
 | 4 | level (u16), record count (u16) | |
 | 8, 12 | left and right sibling | |
 | 16 | nothing repair validates | pristine contents here are the next node's daddr, by coincidence |
-| 24 + 16n | not attributed | constant across records (`00000000`) |
+| 24 + 16n | not attributed | constant across every record: `00000000` |
 | 28 + 16n | the extent's file offset, in **bytes** | measured |
-| 32 + 16n | not attributed | constant across records (`00000018`) |
-| 36 + 16n | not attributed | ascends by `0x400000` per record |
+| 32 + 16n | not attributed | constant across every record: `00000018` |
+| 36 + 16n | `(entry << 16) \| length in blocks` | measured across all three leaves |
 
-**Two of those rows correct the row above them.**  The record was written up as
-`{offset, start block, count}` in that order, on the strength of `xfs_repair`'s
-notation — and reading the record's words in the notation's order gives
-`0, 0, 24` where repair prints `0, 50312, 1`, which is how the wrongness was found
-rather than merely suspected.  Only the *second* word is attributed, and it is the
-file offset in **bytes**: it reads 0, 512, 1024, 1536 across the first four
-records, which are the offsets 0, 1, 2, 3 that repair prints.  So the record holds
-a byte offset and the **diagnostic** is in blocks.  That distinction matters — a
-reader that took the printed form for the stored one would be out by a factor of
-the block size — and it is the same trap as the composite: `xfs_repair`'s numbers
-are decoded values, not the bytes on the disk.
+The fourth word resolves into two halves once the three leaves are read together,
+which is what it took:
 
-**Where the data block lives is the open question.**  The fourth word ascends by
-`0x400000` per record, which is not a block number in any image here, and neither
-constant word is it.  The reader that exists maps the file offset correctly and
-reports every extent as starting at block zero, so it is right about *which*
-extent covers a block and wrong about *which block* it is.  That is strictly less
-wrong than the decoder it replaced — which read the *inode's* packed record form
-here and had never been run against anything — and it is marked provisional in the
+```text
+leaf 1 (entries  0..29)  first o=0     last o=14848   high 0x9100 -> 0x9840
+leaf 2 (entries 30..44)  first o=15360  last o=22528   high 0x9880 -> 0x9c00
+leaf 3 (entries 45..63)  first o=23040  last o=32256   high 0x9c40 -> 0xa0c0
+```
+
+The low half is `0001` in every record of every leaf, and the extents are one block
+each, so it is the **length in blocks**.  The high half advances by `0x40` — 64 —
+per entry, and 64 is exactly the number of entries in the file, running from
+`0x9100` on entry 0 to `0xa0c0` on entry 63 without a break at either leaf
+boundary.  So it is an **entry counter**, not a block number: it keeps counting
+across nodes, which no block number would.
+
+**And that is the finding that closes the search.**  The leaf's records hold the
+file offset and the length, and they do **not** hold the data block — the two
+constant words are not it, and the fourth word is a counter.  So the mapping's
+block for these files lives somewhere this has not looked, and the reader cannot
+be completed by reading the record differently; there is nothing else in it to
+read.  `xfs_repair` can compute a block for every entry, so it has a source, and
+finding it is the next question rather than re-examining the record.
+
+The offsets are confirmed across all three leaves and are continuous from 0 to
+32256 for a 32768-byte file, with one entry per 512-byte block — so the second
+word is the extent's file offset in bytes, and the offsets `xfs_repair` *prints*
+(0, 1, 2, 3) are those byte offsets divided by the block size.  A reader that took
+the printed form for the stored one would be out by a factor of the block size,
+which is the same trap as the composite: the checker's numbers are decoded values,
+not the bytes on the disk.
+
+**So the record is `{unused, offset in bytes, unused, entry counter and length}`**,
+and where an extent's block comes from is the open question.  The reader that
+exists maps the file offset correctly and reports every extent as starting at
+block zero, so it is right about *which* extent covers a block and wrong about
+*which block* it is.  That is strictly less wrong than the decoder it replaced —
+which read the *inode's* packed record form here and had never been run against
+anything — and it is marked provisional in the code rather than left to look
+settled.
 code rather than left to look settled.
 
 **And that is what stopped a write.**  `tests/write.rs` writes into
