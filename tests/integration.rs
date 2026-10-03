@@ -28,6 +28,7 @@ use tempfile::{tempdir, TempDir};
 mod util;
 use util::{
     is_fusefs,
+    skipped_check,
     waitfor,
     GOLDEN1K,
     GOLDEN4K,
@@ -173,6 +174,31 @@ fn xattr_list_bytes(p: &Path, mut buf: Option<&mut [u8]>) -> isize {
                 .map_or(ptr::null_mut(), |b| b.as_mut_ptr().cast()),
             buf.as_ref().map_or(0, |b| b.len()),
         )
+    }
+}
+
+/// How long this file's whole attribute list is, in the form the running system
+/// would report it.
+///
+/// That is each attribute's name plus a NUL, less the prefix a listing on this
+/// system leaves off: see [`XATTR_LIST_OVERHEAD`], which is the difference
+/// between the two and nothing else.
+fn expected_xattr_list_len(d: &str) -> usize {
+    expected_xattrs_per_file(d)
+        .map(
+            |attr| attr.name.len() - XATTR_LIST_OVERHEAD + 1, /* NUL */
+        )
+        .sum()
+}
+
+/// Is this file's attribute list longer than the running system can name at all?
+///
+/// If it is, the listing cannot be compared against anything, and the tests that
+/// compare it say so instead of failing on a number no daemon could produce.
+fn xattr_list_too_long(d: &str) -> bool {
+    match util::XATTR_LIST_MAX {
+        Some(max) => expected_xattr_list_len(d) > max,
+        None => false,
     }
 }
 
@@ -1084,6 +1110,29 @@ mod lsextattr {
         let harness = h();
         let p = harness.d.path().join(d);
 
+        if xattr_list_too_long(d) {
+            // Assert the boundary, since the listing past it cannot be had.  The
+            // size query is the one that tells us: it is answered by the kernel's
+            // cap rather than by this daemon, so it also confirms the cap is where
+            // the system says it is and not merely where this test assumed.
+            let asked = xattr_list_bytes(&p, None);
+            assert_eq!(
+                util::XATTR_LIST_MAX.unwrap(),
+                usize::try_from(asked).expect("a size query must not fail"),
+                "this system's cap on an attribute name list moved"
+            );
+            assert!(
+                xattr::list(&p).is_err(),
+                "an over-long listing was returned"
+            );
+            skipped_check(&format!(
+                "lsextattr::ok {d}: {} bytes of names exceeds this system's XATTR_LIST_MAX, so \
+                 the names themselves are unchecked here",
+                expected_xattr_list_len(d)
+            ));
+            return;
+        }
+
         let mut all_attrnames = xattr::list(p).unwrap().collect::<Vec<_>>();
         all_attrnames.sort_unstable();
         assert_eq!(expected_xattrs_per_file(d).count(), all_attrnames.len());
@@ -1132,11 +1181,21 @@ mod lsextattr {
 
         let harness = h();
         let p = harness.d.path().join(d);
-        let expected_len: usize = expected_xattrs_per_file(d)
-            .map(
-                |attr| attr.name.len() - XATTR_LIST_OVERHEAD + 1, /* NUL */
-            )
-            .sum();
+        let expected_len = expected_xattr_list_len(d);
+
+        if xattr_list_too_long(d) {
+            let asked = xattr_list_bytes(&p, None);
+            assert_eq!(
+                util::XATTR_LIST_MAX.unwrap(),
+                usize::try_from(asked).expect("a size query must not fail"),
+                "this system's cap on an attribute name list moved"
+            );
+            skipped_check(&format!(
+                "lsextattr::size {d}: {expected_len} bytes of names exceeds this system's \
+                 XATTR_LIST_MAX, so the size reported here is the cap and not the size"
+            ));
+            return;
+        }
 
         let r = xattr_list_bytes(&p, None);
         if let Ok(r) = usize::try_from(r) {

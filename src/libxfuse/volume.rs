@@ -1360,7 +1360,20 @@ impl Filesystem for Volume {
                 reply.data(list.as_slice());
             }
             None => {
-                reply.size(0);
+                // An inode with no attribute fork has an empty list, and the two
+                // ways of asking for an empty list are not the same reply.  A
+                // caller that passed a buffer is asking for the names, and the
+                // answer is "there are none": an empty list.  Replying with a
+                // *size* instead is what `getxattr` above does only when the
+                // caller passed no buffer at all, and sending it either way makes
+                // Linux's `fuse_listxattr_write` fail the copy out and report
+                // EIO -- which is what `lsextattr::empty` saw, for a file that
+                // has no attributes to get wrong.
+                if size == 0 {
+                    reply.size(0);
+                } else {
+                    reply.data(&[]);
+                }
             }
         }
     }

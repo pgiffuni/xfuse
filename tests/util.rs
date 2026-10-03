@@ -122,6 +122,40 @@ pub fn is_fusefs(sfs: &nix::sys::statfs::Statfs) -> bool {
     sfs.filesystem_type() == nix::sys::statfs::FUSE_SUPER_MAGIC
 }
 
+/// A check this platform cannot make, counted and named rather than passed over.
+///
+/// A green run that says how many checks it did not make is honest; one that says
+/// nothing is not, and the number is the whole of the difference.
+#[allow(unused)] // Not used by the write tests
+pub fn skipped_check(what: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SKIPPED: AtomicUsize = AtomicUsize::new(0);
+    let n = SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!("SKIPPED CHECK ({n} so far): {what}");
+}
+
+/// The largest an extended attribute *name list* can be here, if this platform
+/// caps one.
+///
+/// Linux caps it.  `XATTR_SIZE_MAX`, in `include/linux/limits.h`, is 65536, and
+/// `fuse_listxattr_write` compares the size the daemon reports against it and
+/// answers `E2BIG` when the listing is longer -- before the daemon's list is
+/// looked at at all, and whether or not the caller supplied a buffer big enough.
+///
+/// That is worth knowing precisely because it is not a limit this daemon imposes
+/// and no change here can lift it: `xattrs/giant` holds 65536 names totalling
+/// 1572864 bytes, and Linux can name at most 65536 bytes of them.  The listing of
+/// that file is not merely wrong on Linux, it does not exist.
+#[cfg(target_os = "linux")]
+#[allow(unused)] // Not used by the write tests
+pub const XATTR_LIST_MAX: Option<usize> = Some(65536);
+
+/// FreeBSD's `extattr_list_file` reports a size and is given a buffer this test
+/// sizes itself, so no cap was found to assert and none is invented here.
+#[cfg(not(target_os = "linux"))]
+#[allow(unused)] // Not used by the write tests
+pub const XATTR_LIST_MAX: Option<usize> = None;
+
 /// Does this look like a golden image that was extracted properly?
 ///
 /// Not all of the golden images are file systems: `xfs_rt2.img` is a real-time
