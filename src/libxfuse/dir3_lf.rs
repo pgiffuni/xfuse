@@ -227,7 +227,7 @@ impl<'a, R: Reader + BufRead + Seek + 'a> NodeLikeAddressIterator<'a, R> {
         brrc: &'a RefCell<&'a mut R>,
         hash: XfsDahash,
     ) -> Result<Self, i32> {
-        let sb = SUPERBLOCK.get().unwrap();
+        let sb = super::volume::try_superblock().ok_or(libc::ENODEV)?;
         let dblock = sb.get_dir3_leaf_offset();
         let mut buf_reader = brrc.borrow_mut();
         let leaf_btree = {
@@ -267,6 +267,14 @@ impl<'a, R: Reader + BufRead + Seek + 'a> Iterator for NodeLikeAddressIterator<'
                     // Traverse the forw pointer
                     let forw = self.leaf.forw;
                     let mut buf_reader = self.brrc.borrow_mut();
+                    // The last `SUPERBLOCK` in this file that still unwraps, and
+                    // it is an exception rather than an oversight.  `next` is a
+                    // trait method returning `Option`, so it cannot report an
+                    // error; returning `None` here would end the iteration and
+                    // **silently drop every entry after a hash collision**, which
+                    // is worse than stopping.  So this call stays, and the fix is
+                    // to give the iterator a fallible shape and propagate, which
+                    // touches every implementor.
                     let sb = SUPERBLOCK.get().unwrap();
                     let raw = match self.dir.read_dblock(buf_reader.by_ref(), sb, forw) {
                         Ok(raw) => raw,

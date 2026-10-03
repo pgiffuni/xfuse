@@ -309,7 +309,7 @@ pub trait Btree: BtreePriv {
         buf_reader: &mut R,
         logical_block: XfsFileoff,
     ) -> Result<(Option<XfsFsblock>, Option<u64>), i32> {
-        let super_block = SUPERBLOCK.get().unwrap();
+        let super_block = super::volume::try_superblock().ok_or(libc::ENODEV)?;
         let pp = self
             .keys()
             .partition_point(|k| k.br_startoff <= logical_block);
@@ -405,7 +405,7 @@ impl BtreeRoot {
     where
         R: BufRead + Reader + Seek,
     {
-        let sb = SUPERBLOCK.get().unwrap();
+        let sb = super::volume::try_superblock().ok_or(libc::ENODEV)?;
 
         let mut dblock = offset >> sb.sb_blocklog;
         match self.map_block(buf_reader.by_ref(), dblock)? {
@@ -528,7 +528,9 @@ impl Btree for BtreeIntermediate {}
 
 impl<Ctx> Decode<Ctx> for BtreeIntermediate {
     fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, DecodeError> {
-        let blocksize = SUPERBLOCK.get().unwrap().sb_blocksize as usize;
+        let blocksize = super::volume::try_superblock()
+            .ok_or_else(|| DecodeError::OtherString(super::volume::NO_IMAGE.to_string()))?
+            .sb_blocksize as usize;
         let mut raw = vec![0u8; blocksize];
         decoder.reader().read(&mut raw)?;
         let (hdr, mut ofs) = decode::<XfsBmbtLblock>(&raw)?;

@@ -28,7 +28,7 @@
 
 use bincode_next::{de::Decoder, error::DecodeError, Decode};
 
-use super::{definitions::*, volume::SUPERBLOCK};
+use super::{definitions::*};
 
 #[derive(Debug, Clone, Copy)]
 pub struct BmbtRec {
@@ -127,7 +127,7 @@ impl Bmx {
     }
 
     pub fn lseek(&self, offset: u64, whence: i32) -> Result<u64, i32> {
-        let sb = SUPERBLOCK.get().unwrap();
+        let sb = super::volume::try_superblock().ok_or(libc::ENODEV)?;
 
         let dblock = offset >> sb.sb_blocklog;
         match self.0.partition_point(|entry| entry.br_startoff <= dblock) {
