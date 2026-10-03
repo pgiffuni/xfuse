@@ -28,7 +28,7 @@
 
 use bincode_next::{de::Decoder, error::DecodeError, Decode};
 
-use super::{definitions::*};
+use super::definitions::*;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BmbtRec {
