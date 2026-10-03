@@ -1528,40 +1528,40 @@ So `create` has every prerequisite *looked* for.  **It is not ready to be
 written**, and the reason is worth recording because it is not a shortage of work --
 it is that the last measurement does not hold up.
 
-### The entry length formula is wrong for four-character names, in this image
+### The entries' *positions* are measured; what is inside one is not, and a claim
+### about `get_length` here is withdrawn
 
-Building the writer is what found it.  `Dir2DataEntry::get_length` is
-`((namelen + 19) / 8) * 8`, and against the root's own bytes that is right for
-every measurable entry *except* those whose name is 4, 12 or 20 characters long --
-`leaf` and `node` are both four characters, and they are the two the reader gets
-wrong:
+Building the name writer is what turned this up, and the writer is not landed.
+
+First, a correction to the commit that first wrote it down.  It said
+`Dir2DataEntry::get_length` is wrong for names of 4, 12 or 20 characters, on the
+strength of a table whose "measured" column came from **this code's own walk** --
+and that walk uses `get_length`, so the table agreed with the thing it was
+checking and proved nothing.  Withdrawn.
+
+The positions *are* independently measured, because they also come out of the
+block's **hash index**, which is read straight from the image and was never
+computed from a length at all.  Its addresses, in units of eight, give entries at
+offsets
 
 ```text
- 88: 00 00 00 00 00 02 25 c0 | 04 6c 65 61 66 02 00 58 | 00 00 00 00 00 03 00 20
-      inumber 140736           namelen 4, "leaf",        next entry starts at 104
+16, 32, 48, 64, 88, 104, 120, 144, 168, 208, 232, 256, 280, 304
 ```
 
-`leaf` occupies **sixteen** bytes.  The fields it must hold -- an eight-byte inode
-number, a length, four bytes of name, a type, and a tag -- add up to more than that,
-and the only way sixteen works is if the tag is **two** bytes, not four.
+which is exactly what the walk produced.  So the fourteen entries' positions are
+two independent readings agreeing, and `get_length` is consistent with all fourteen
+of them -- including the two four-character names, at 16 bytes each, which is
+exactly what `((4 + 19) / 8) * 8` gives.
 
-Which is consistent with every other entry in the same block:
+What is **not** established is the layout *inside* an entry.  Fourteen bytes of
+fields -- an eight-byte inode number, a one-byte length, four bytes of name and a
+type byte -- will not fit sixteen bytes alongside a four-byte tag, and the tag
+bytes do not read consistently as four.  That is as far as hand-decoding gets, and
+hand-decoding has now produced one wrong claim out of one attempt here, so the
+next step is not another reading of the bytes.
 
-| name | bytes | `get_length` | two-byte tag |
-|:-----|------:|:-------------:|:------------:|
-| `.`, `..`, `sf` | 16 | 16 | 16 |
-| `leaf`, `node` | 16 | **24** | 16 |
-| `block`, `btree3`, `sparse_leaf`, `files`, `xattrs`, `links` | 24 | 24 | 24 |
-| `btree2.2` | 24 | 24 | 24 |
-| `btree_with_single_leaf` | 40 | 40 | 40 |
-
-So this reader computes the length of `leaf` and `node` wrongly, which means it
-walks a directory's entries wrongly, which means **`get_length` is a bug in shipped
-code** and not only a thing a writer would have to work around.
-
-**And the version with two-byte tags still does not satisfy `xfs_repair`.**  The
-writer that uses the measured lengths and a correct hash index produces a block
-whose entries and index both read back exactly as intended, and repair still says:
+**The writer is not landed because `xfs_repair` rejects its output.**  Entries and
+index both read back exactly as intended, and repair still says:
 
 ```text
 corrupt directory block 0 for inode 32
@@ -1569,17 +1569,10 @@ would clear root inode 32
 root inode would be lost
 ```
 
-So there is a rule about this block's entries that neither the reader's formula nor
-a two-byte tag satisfies, and it is not established.  Guessing it would be the
-whole mistake this document exists to prevent, so the writer is **not** landed: the
+Whatever rule this is, it is not the entry positions and it is not the index --
+both of which are verified -- so it is in the part that is not established.  The
 work was thrown away rather than committed half-done, because a `create` that
 produces a directory `xfs_repair` calls corrupt is worse than no `create`.
-
-Two things are worth keeping from it.  The first is that `get_length` is wrong for
-four-character names, which is a live bug in the reader whatever else happens, and
-the root directory of a golden image has two of them.  The second is that
-`xfs_repair` is the only thing that noticed: this code's reader, its hash index
-and a full round trip all agreed that the block it had written was fine.
 
 What would settle it: the entry layout of a directory **XFS itself wrote**.  These
 images are hand-built, and the two facts that do not fit the format -- a tag that
