@@ -33,6 +33,37 @@ Three things follow, and all three have been got wrong here:
 For the measurements, the evidence levels, and the worked examples, see
 [`docs/write-support-progress.md`](docs/write-support-progress.md).
 
+## Linting: run what continuous integration runs
+
+```sh
+cargo clippy --all-targets -- -D warnings
+```
+
+`--all-targets`, and **not** `--bins` or `--bins --tests`.  A `--bins` invocation
+does not build the `#[cfg(test)]` code, which is where most of the warnings in this
+project's test module live, so a narrower command reports a clean tree that
+continuous integration then rejects.  That is not hypothetical: fourteen warnings
+sat in `#[cfg(test)]` code, invisible to every local command that was used, and
+continuous integration's nightly `-D warnings` stopped on all fourteen at once.
+
+`cargo clippy --all-targets` on a Linux host also reports errors in
+`tests/integration.rs` and `benches/`, which are FreeBSD-only and do not compile
+here at all — `EXTATTR_NAMESPACE_USER`, `extattr_list_file` and
+`filesystem_type_name` do not exist in Linux's `libc`.  Those are not findings;
+the two commands that do work on both platforms are
+
+```sh
+cargo clippy --bins --tests -- -D warnings   # everything but the FreeBSD-only files
+cargo test --bins                            # the unit tests
+```
+
+and the `--list` form is worth a glance after adding a test, because a duplicated
+`#[test]` registers one test twice and the *count* cannot tell you:
+
+```sh
+cargo test --bins -- --list | grep ': test$' | sort | uniq -d   # must print nothing
+```
+
 ## How to run the project
 
 1. Check for errors

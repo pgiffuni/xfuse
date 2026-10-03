@@ -44,6 +44,23 @@ jobs:
         run: |
           . $HOME/.cargo/env
           cargo test
+      - name: No test is registered twice
+        shell: freebsd {0}
+        run: |
+          . $HOME/.cargo/env
+          # A duplicated `#[test]` registers one test twice and hides that another
+          # never runs, and the *count* cannot tell you: it goes up by one and
+          # looks fine.  Only the names can.  This has happened in this repository
+          # twice, once with a test silently disabled behind it.
+          listed=$(cargo test --bins -- --list 2>/dev/null | grep ': test$')
+          total=$(printf '%s\n' "$listed" | grep -c .)
+          unique=$(printf '%s\n' "$listed" | sort -u | grep -c .)
+          if [ "$total" != "$unique" ]; then
+            echo "a test is registered more than once:"
+            printf '%s\n' "$listed" | sort | uniq -d
+            exit 1
+          fi
+          echo "$unique tests, each registered once"
       - name: Benchmark
         shell: freebsd {0}
         run: |

@@ -240,6 +240,57 @@ another, set against each other.  Counting tests is not a health check when a
 duplicate attribute is possible, and a count that has been believed for hours is
 exactly the thing a duplicate makes wrong.
 
+### The FreeBSD integration failures are the attribute fork, and it is not mine
+
+`tests/integration.rs` panics in `AttrBtree::new` -- `btree.map_block(0).unwrap().0.unwrap()`,
+so `map_block` was handed logical block 0 and reported a **hole**.  That is worth
+separating from everything above, because it is not a regression:
+
+* at the session baseline the guards in `map_block` were `assert!`; they are now
+  `if .. { return Err(..) }`.  That change can only turn a **panic** into an
+  **error**.  It cannot turn success into `Ok(None)`, which is what the report
+  shows.  So the hole was there before;
+* those tests are FreeBSD-only and have not run in this environment at all, which
+  is why nothing here caught it.
+
+**And the same code is demonstrably wrong on Linux**, which is how it can be
+looked at.  Of the fourteen entries in the root of `xfsv4.img`, exactly one --
+`links` -- has any attribute fork, and:
+
+```text
+links (inode 197283): attribute fork is one block, anextents 0
+links has an attribute block that is never read, because the record count comes
+from the inode and the inode has none
+```
+
+`di_aformat` holds `XFS_ATTR_FORMAT_*` -- the **attribute** fork's format -- and
+the code dispatches on it as if it were `XFS_INODE_FMT_*`, which share their
+*numbers* but not their meanings.  For the block form the number of records is
+**not** `di_anextents`: that field counts shortform entries, so it is zero for a
+file whose attributes live in a block, and the fork decodes as empty.  `get_attrs`
+then sees `anextents == 0` and returns none, so **`links`'s attributes are
+silently never read at all**.
+
+That is very likely the same defect the FreeBSD panic sees from the other side: an
+attribute fork that is not there, decoded as something, and then read.  What is
+*confirmed* here is the silent loss; what is *inferred* is that the FreeBSD panic
+shares its cause, and the inference is labelled as one.
+
+Two things came out of chasing it that are worth more than the fix would have been
+on its own:
+
+* **a test can require a tool it does not have.**  `xfs_db` is absent on FreeBSD,
+  and one test `.expect`ed it, so the suite failed there instead of skipping.  The
+  skip reporting is now uniform, and `have_xfs_db` is one shared function rather
+  than a per-module copy;
+* **a test name registered twice is invisible to a count.**  One stray `#[test]`
+  left behind by an edit made `a_files_btree_fork_decodes_the_same_here_as_in_xfs_db`
+  register twice, so 192 tests were reported where 191 existed.  Continuous
+  integration now compares the listed names against their unique count and fails
+  on a duplicate, because a duplicated registration inflates the number and hides
+  that another test never ran -- and only the *names* can tell you, never the
+  count.  That check found the duplicate on its first run.
+
 ### A skipped check is not a passing check
 
 The project's CI installs `curl fusefs-libs pkgconf` and no XFS tools, so

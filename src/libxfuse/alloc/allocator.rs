@@ -1404,7 +1404,7 @@ mod t {
         block_cache::BlockCache,
         block_device::{Access, BlockDevice},
         btree::BmbtLeafBlock,
-        dinode::{DiU, Dinode},
+        dinode::{DiA, DiU, Dinode},
         dinode_core::XfsDinodeFmt,
         dir3::{Dir2DataEntry, Dir3},
         dir3_block::Dir2Block,
@@ -3756,7 +3756,7 @@ mod t {
             return;
         };
         let sb = sb_of(image.path());
-        crate::libxfuse::volume::SUPERBLOCK.get_or_init(|| sb.clone());
+        crate::libxfuse::volume::SUPERBLOCK.get_or_init(|| sb);
 
         let file = std::fs::File::open(image.path()).unwrap();
         let mut reader = std::io::BufReader::new(file);
@@ -3845,7 +3845,7 @@ mod t {
             // Real entry bytes, so this asks the reader's own formula rather than a
             // copy of it written here.
             let mut entry = vec![0u8; 32];
-            entry[8] = name.as_bytes().len() as u8;
+            entry[8] = name.len() as u8;
             assert_eq!(
                 step as i64,
                 Dir2DataEntry::get_length(&sb, &entry),
@@ -3939,6 +3939,127 @@ mod t {
         assert!(
             index_at - last_end > 64,
             "a name and its hash entry would not fit in what is free"
+        );
+    }
+
+    /// Which files in the golden image have a b-tree attribute fork.
+    ///
+    /// FreeBSD's `tests/integration.rs` panics in `AttrBtree::new` on the btree
+    /// attribute layouts -- `getextattr::enoattr::case_4_btree2`,
+    /// `case_5_btree2_5`, `dev::metadata::case_4_v4` -- with an
+    /// `Option::unwrap()` on `None`, which means `map_block` was handed logical
+    /// block 0 and reported a hole.  Those tests are FreeBSD-only, so this walks
+    /// the image on Linux instead, which is where it can be debugged.
+    ///
+    /// The files are named for their layouts in the FreeBSD suite, and the scan is
+    /// how the right one is found rather than assumed: a file named `btree2.2` has
+    /// no attributes at all, so the name is a hint rather than the answer.
+    /// The one file in the golden image with attributes, and why they are lost.
+    ///
+    /// FreeBSD's `tests/integration.rs` panics in `AttrBtree::new` on the btree
+    /// attribute layouts -- `getextattr::enoattr::case_4_btree2`,
+    /// `case_5_btree2_5`, `dev::metadata::case_4_v4` -- with an `Option::unwrap()`
+    /// on `None`, which means `map_block` was handed logical block 0 and reported a
+    /// hole.  Those tests are FreeBSD-only, so this is the same code on Linux, where
+    /// it can be looked at.
+    ///
+    /// **This is a characterisation, not a statement of intent.**  It pins what the
+    /// image and the code actually do, because they disagree in a way that is
+    /// visible and not yet fixed:
+    ///
+    /// * of the fourteen entries in the root of `xfsv4.img`, exactly one -- `links`
+    ///   -- has any attribute fork at all;
+    /// * that fork decodes as a **single block** (`di_aformat` says block form) --
+    ///   and the code reads a count of records out of the *inode*, which is
+    ///   `di_anextents`, and for block form that is **zero**, because `di_anextents`
+    ///   counts shortform entries only;
+    /// * so the fork decodes as an **empty** one, `get_attrs` sees `anextents == 0`
+    ///   and returns none, and the file's attributes are silently not read at all.
+    ///
+    /// The names in the FreeBSD suite are a hint and a misleading one: `btree2.2`
+    /// has no attributes whatsoever.  The panic there is in the same place --
+    /// an attribute fork that is not there, decoded as something, and then read --
+    /// so this is very likely the same defect seen from the other side.  It is not
+    /// *caused* by the `assert!`-to-`return Err` change in `map_block`, which can
+    /// only turn a panic into an error and cannot turn success into a hole.
+    #[test]
+    fn the_one_file_with_attributes_loses_them() {
+        let Some(image) = copy_of_golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img to copy");
+            return;
+        };
+        let sb = sb_of(image.path());
+        crate::libxfuse::volume::SUPERBLOCK.get_or_init(|| sb);
+
+        let names: Vec<(String, u64)> = {
+            let mut reader = std::io::BufReader::new(std::fs::File::open(image.path()).unwrap());
+            let mut root = Dinode::from(&mut reader, &sb, 32);
+            let dir = root.get_dir(&mut reader, &sb);
+            let mut out = Vec::new();
+            let mut off = 0i64;
+            loop {
+                match dir.next(&mut reader, &sb, off) {
+                    Ok((i, next, _, name)) => {
+                        out.push((name.to_string_lossy().into_owned(), i));
+                        if next < 0 {
+                            break;
+                        }
+                        off = next;
+                    }
+                    Err(e) => {
+                        eprintln!("listing the root stopped: {e}");
+                        break;
+                    }
+                }
+            }
+            out
+        };
+
+        let mut with_attrs = Vec::new();
+        for (name, ino) in &names {
+            let mut reader = std::io::BufReader::new(std::fs::File::open(image.path()).unwrap());
+            let inode = Dinode::from(&mut reader, &sb, *ino);
+            let kind = match &inode.di_a {
+                None => "none",
+                Some(DiA::Attrsf(_)) => "shortform",
+                Some(DiA::Abmx(_)) => "one block",
+                Some(DiA::Abmbt(_)) => "b-tree, root in the inode",
+            };
+            if kind != "none" {
+                with_attrs.push((name.clone(), *ino, kind));
+                eprintln!(
+                    "{name} (inode {ino}): attribute fork is {kind}, anextents {}",
+                    inode.di_core.anextents
+                );
+            }
+        }
+        assert_eq!(
+            with_attrs.len(),
+            1,
+            "the image is supposed to have exactly one file with an attribute fork; it has \
+             {with_attrs:?}"
+        );
+
+        // The fork the inode claims, and the one the code ends up with.
+        let (name, ino, kind) = with_attrs[0].clone();
+        let mut reader = std::io::BufReader::new(std::fs::File::open(image.path()).unwrap());
+        let mut inode = Dinode::from(&mut reader, &sb, ino);
+        assert_eq!(kind, "one block", "{name}'s attribute fork changed shape");
+        assert_eq!(
+            inode.di_core.anextents, 0,
+            "{name} suddenly has shortform attribute entries, which would mean the fork is not \
+             the block form this test is characterising"
+        );
+
+        // And so the attributes are not read, which is the defect.
+        assert!(
+            inode.get_attrs(&mut reader, &sb).is_none(),
+            "the empty attribute fork is no longer silently dropped; this test and AttrBtree::new \
+             both need revisiting"
+        );
+        eprintln!(
+            "{name} (inode {ino}) has an attribute block that is never read, because the record \
+             count comes from the inode and the inode has none"
         );
     }
 
@@ -4216,6 +4337,10 @@ mod t {
     #[test]
     fn the_three_terms_re_derived_from_xfs_db_add_up_to_the_superblock() {
         if !have_xfs_db() {
+            crate::libxfuse::alloc::require_oracle("xfs_db", "xfsprogs");
+            crate::libxfuse::alloc::skipped_oracle_check(
+                "the group accounting, re-derived from xfs_db's own block walk",
+            );
             eprintln!("skipping: no xfs_db to walk the image with");
             return;
         }
@@ -4310,7 +4435,10 @@ mod t {
         for c in commands {
             cmd.arg("-c").arg(c);
         }
-        let out = cmd.arg(image).output().expect("xfs_db");
+        let Ok(out) = cmd.arg(image).output() else {
+            eprintln!("skipping: xfs_db would not run");
+            return String::new();
+        };
         format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
@@ -4348,10 +4476,7 @@ mod t {
 
     /// Whether `xfs_db` is here, for the checks that cannot be done without it.
     fn have_xfs_db() -> bool {
-        std::process::Command::new("xfs_db")
-            .arg("-V")
-            .output()
-            .is_ok()
+        crate::libxfuse::alloc::have_xfs_db()
     }
     /// What XFS does with a free list that is already full.
     ///
@@ -4427,7 +4552,7 @@ mod t {
             // `append_to_the_free_list` keeps a slot in hand -- so the *last* slot
             // can only be reached by giving a block back, which is the operation
             // whose refusal this experiment is about.
-            if u64::from(last) + 1 >= u64::from(slots) - 1 {
+            if u64::from(last) + 1 >= slots - 1 {
                 eprintln!("stocked to last {last} after {rounds} rounds");
                 break;
             }
@@ -4454,7 +4579,7 @@ mod t {
             let (_, last, _, _) = free_list_window(image.path(), &sb, agno);
             pushed += 1;
             eprintln!("  push {pushed}: last {last}, the block went to {block}");
-            if u64::from(last) + 1 >= u64::from(slots) {
+            if u64::from(last) + 1 >= slots {
                 break;
             }
         }
@@ -4466,7 +4591,7 @@ mod t {
         );
         assert_eq!(
             u64::from(last) + 1,
-            u64::from(slots),
+            slots,
             "the list did not fill: its window ends at {last} in a {slots} slot array"
         );
         let before: std::collections::HashSet<u32> = listed.iter().copied().collect();
@@ -4552,48 +4677,6 @@ mod t {
         );
         assert_repair_accepts(image.path(), "after xfs_repair rebuilt a full free list");
     }
-    /// Which inode version a fresh chunk's slots must carry, established by
-    /// asking rather than by choosing.
-    ///
-    /// The audit grades this as an **inference**: the code writes version 2 for a
-    /// 256-byte inode and 3 for a larger one, taken from what `xfs_db` reports
-    /// for the inodes these images already hold.  No chunk in any image here was
-    /// created by a file system, so "what XFS writes" is not directly observable
-    /// here — but "what repair insists on" is, and narrowing a choice to the one
-    /// thing the file system will accept is a great deal better than a preference.
-    ///
-    /// So: allocate a chunk, then write each version into one of its slots and
-    /// ask.  A version repair corrects is a version this code must not write.
-    ///
-    /// The same question for a 512-byte inode is not asked, because no image here
-    /// has one to allocate a chunk in — `xfs_4kn.img` has 4 KiB blocks and so 4 KiB
-    /// inodes, and its groups are not empty of chunks either.  That half of the
-    /// choice stays an inference and the test says so.
-    /// The b-map leaf reader, checked against the records `xfs_repair` printed.
-    ///
-    /// `xfs_repair` prints a record it dislikes in full:
-    ///
-    /// ```text
-    /// bmap rec out of order, inode 100553 entry 1 [o s c] [1 50314 1], 0 [...] [50312 1]
-    /// ```
-    ///
-    /// so there is a *known-good expected value from a source that is neither this
-    /// code nor a hand parser*: entry 0 is offset 0, block 50312, one block long,
-    /// and entry 1 is offset 1, block 50314.  Inode 100553 is a real file in
-    /// `xfsv4.img` whose data fork is a b-tree, and this reads its first leaf.
-    ///
-    /// What the test pins, in order of how badly it would hurt to get it wrong:
-    ///
-    /// * **offsets and lengths are in blocks, not bytes.**  Entries `0, 1, 2` are
-    ///   three consecutive *blocks*, not three 512-byte strides.  This is the
-    ///   measurement that killed the earlier reading of the same bytes as a
-    ///   64-bit value, and it is a factor of 512 out if wrong.
-    /// * the records are sixteen bytes apart with three four-byte fields, so a
-    ///   record read as two 64-bit values straddles three fields;
-    /// * a leaf with a magic this is not, or with more records than fit, is a
-    ///   **corrupt** structure and not a panic — this program reads images it did
-    ///   not write, and the path it replaced had `assert_eq!(bb_level, 0)` and
-    ///   `panic!` on a bad magic in it.
     /// The b-map leaf reader, checked against the records `xfs_repair` printed.
     ///
     /// `xfs_repair` prints a record it dislikes in full, in its own notation:
@@ -4738,6 +4821,25 @@ mod t {
     }
 
     #[test]
+    /// Which inode version a fresh chunk's slots must carry, established by
+    /// asking rather than by choosing.
+    ///
+    /// The audit grades this as an **inference**: the code writes version 2 for a
+    /// 256-byte inode and 3 for a larger one, taken from what `xfs_db` reports for
+    /// the inodes these images already hold.  No chunk in any image here was
+    /// created by a file system, so "what XFS writes" is not directly observable
+    /// here -- but "what repair insists on" is, and narrowing a choice to the one
+    /// thing the file system will accept is a great deal better than a preference.
+    ///
+    /// So: allocate a chunk, then write each version into one of its slots and ask.
+    /// A version repair corrects is a version this code must not write.  It is not
+    /// -- versions 1 and 2 are both accepted and 3 is refused, so version 3 is
+    /// *refuted* for a 256-byte inode and the choice is one refuted and one taken
+    /// rather than a preference between three.
+    ///
+    /// The same question for a 512-byte inode is not asked, because no image here
+    /// has one to allocate a chunk in, and that half of the choice stays an
+    /// inference.
     fn which_inode_version_a_fresh_chunks_slots_must_carry() {
         if !crate::libxfuse::alloc::have_xfs_repair() {
             crate::libxfuse::alloc::require_oracle("xfs_repair", "xfsprogs");
@@ -4801,7 +4903,7 @@ mod t {
             let mentions_version = complaints
                 .lines()
                 .filter(|l| l.contains("version"))
-                .map(|l| format!("{l}"))
+                .map(str::to_string)
                 .collect::<Vec<_>>();
             eprintln!(
                 "  version {version}: {}",
@@ -4888,6 +4990,19 @@ mod t {
     /// else in this document is settled.
     #[test]
     fn a_files_btree_fork_decodes_the_same_here_as_in_xfs_db() {
+        // This one *needs* `xfs_db`: it exists to check that this code and the
+        // tool agree, which is worth nothing without both.  Say so and skip loudly
+        // rather than `expect`ing a program that may not be installed -- a test
+        // that assumes its oracle exists fails on the machines that lack it, which
+        // is the opposite of what a skip is for.
+        if !crate::libxfuse::alloc::have_xfs_db() {
+            crate::libxfuse::alloc::require_oracle("xfs_db", "xfsprogs");
+            crate::libxfuse::alloc::skipped_oracle_check(
+                "that this code and xfs_db agree about a b-tree fork",
+            );
+            eprintln!("skipping: no xfs_db to compare against");
+            return;
+        }
         let Some(path) = crate::libxfuse::alloc::golden("xfsv4.img") else {
             eprintln!("skipping: no unpacked xfsv4.img");
             return;
@@ -4955,7 +5070,7 @@ mod t {
             })
             .collect();
         assert_eq!(
-            pointers.iter().copied().collect::<Vec<_>>(),
+            pointers.to_vec(),
             ptrs_db,
             "the fork's pointers are not what xfs_db reads"
         );
@@ -5071,7 +5186,7 @@ mod t {
         );
 
         for below in [30u16, 16, 8] {
-            let image = patch_leaf(&golden, &sb, 1, leaf, below, &scratch);
+            let image = patch_leaf(&golden, &sb, 1, leaf, below, scratch);
             let complaints = repair_complaints(&image).expect("xfs_repair runs");
             assert!(
                 complaints.contains(&format!("bad btree nrecs ({below}, min=31, max=62)")),
@@ -5084,7 +5199,7 @@ mod t {
         //    together so that they still agree, and the slots outside the new
         //    count are cleared, so the occupancy is the only thing wrong.
         for down_to in [10u16, 3, 1] {
-            let image = shrink_both_roots(&golden, &sb, down_to, &scratch);
+            let image = shrink_both_roots(&golden, &sb, down_to, scratch);
             let complaints = repair_complaints(&image).expect("xfs_repair runs");
             assert!(
                 !complaints.contains("nrecs"),
@@ -5141,7 +5256,7 @@ mod t {
         let header_len = if sb.has_crc() { 56usize } else { 16 };
         let records_at = base + header_len as u64;
         let capacity = u16::try_from((bs - header_len) / 8).unwrap();
-        for i in u16::from(nrecs)..capacity {
+        for i in nrecs..capacity {
             device
                 .write_at(&[0u8; 8], records_at + 8 * u64::from(i))
                 .unwrap();
@@ -5179,7 +5294,7 @@ mod t {
             let header_len = if sb.has_crc() { 56usize } else { 16 };
             let records_at = base + header_len as u64;
             let capacity = u16::try_from((bs - header_len) / 8).unwrap();
-            for i in u16::from(nrecs)..capacity {
+            for i in nrecs..capacity {
                 device
                     .write_at(&[0u8; 8], records_at + 8 * u64::from(i))
                     .unwrap();
