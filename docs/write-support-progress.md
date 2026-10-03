@@ -1528,6 +1528,60 @@ So `create` has every prerequisite *looked* for.  **It is not ready to be
 written**, and the reason is worth recording because it is not a shortage of work --
 it is that the last measurement does not hold up.
 
+### The published format answers the entry layout, and it is not what I was writing
+
+The plan lists **published XFS filesystem documentation** first among the sources to
+prefer.  I had been treating it as a last resort and running experiments instead,
+which is backwards, and it cost several hours.  Reading
+[XFS Algorithms & Data Structures, "Directories"](https://kernel.googlesource.com/pub/scm/fs/xfs/xfs-documentation/+/refs/heads/master/design/XFS_Filesystem_Structure/directories.asciidoc)
+settles what four experiments had not:
+
+```text
++0x00  8  inumber
++0x08  1  namelen          -- one byte
++0x09  n  name             -- not NUL terminated
+       1  filetype         -- only with the ftype feature
+       padding            -- to an eight byte boundary
+    -2  2  tag             -- the entry's own offset in the block
+```
+
+* **The tag is two bytes**, at the entry's **last two bytes**, and it holds the
+  entry's **own starting offset**.  I had it four bytes wide and placed immediately
+  after the fields.  Both are wrong, and the bytes confirm the document rather than
+  the other way round: `.` sits at offset 16 and its tag is `0x0010` at bytes
+  30-31; `block` sits at 64 and its tag is `0x0040` at 86-87.  This code's reader
+  already had it right -- `tag: XfsDir2DataOff` with `XfsDir2DataOff = u16`, and
+  padding computed before it -- so the reader was never the problem and only the
+  writer was.
+* **A wrong tag makes an entry invisible, not malformed**, which is why every failed
+  attempt said `no . entry for directory 32` rather than anything about the tag.
+  That is a much harder symptom to trace back to two bytes, and it is what sent
+  two attempts looking in the wrong place.
+* **`get_length` is confirmed correct.**  The document's formula and this code's
+  `((namelen + 19) / 8) * 8` agree on every entry in the root, and the entry
+  positions read from the hash index agree with both.
+* **The block's shape is as measured**: header, then data entries, then free space,
+  then the leaf index, then the eight-byte tail of `count` and `stale`, with the
+  index **anchored from the end of the block** rather than from a fixed offset
+  after the data.  So the data region's upper boundary moves as the index grows,
+  which is why a writer has to move the index and not the data.
+* **One thing I had entirely wrong, and it is the useful one.**  The free space in
+  a real block is **not a run of zeroes**; it is a marked unused entry.  This
+  image's has `ff ff 0e 40` at offset 328 -- a freetag of `0xffff` and a length of
+  3648, which is exactly the span from there to the hash index.  Writing an entry
+  at 328 without re-declaring what remains leaves the rest of the region
+  unmarked, and a reader cannot tell free space from a name.  It also explains why
+  the pristine block has `stale` at zero: that count is how much is *reclaimable*,
+  and none of it has been used yet.
+
+So the writer is much closer than it was, and the remaining unknown is one field:
+**the leaf index's `address`.**  The document says it is a directory data pointer
+that the native code converts back into an entry's location before dereferencing,
+and this code approximates that as `address << 3`, which reproduces all fourteen
+offsets of the pristine index.  Whether a *new* entry's address should be written
+that way is not something the document settles, and it is the last thing standing
+between here and a `create` that `xfs_repair` accepts.
+
 ### The entries' *positions* are measured; what is inside one is not, and a claim
 ### about `get_length` here is withdrawn
 
