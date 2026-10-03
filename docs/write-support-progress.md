@@ -1524,9 +1524,70 @@ Which is what a writer has to satisfy, and it gives the block's shape precisely:
   at 424 and the index starts at 3976, so there are **3552 bytes free** between
   them.
 
-So `create` now has every prerequisite measured: an inode to point at, a directory
-with room, a byte-exact entry layout, and the index and the count it has to
-maintain.
+So `create` has every prerequisite *looked* for.  **It is not ready to be
+written**, and the reason is worth recording because it is not a shortage of work --
+it is that the last measurement does not hold up.
+
+### The entry length formula is wrong for four-character names, in this image
+
+Building the writer is what found it.  `Dir2DataEntry::get_length` is
+`((namelen + 19) / 8) * 8`, and against the root's own bytes that is right for
+every measurable entry *except* those whose name is 4, 12 or 20 characters long --
+`leaf` and `node` are both four characters, and they are the two the reader gets
+wrong:
+
+```text
+ 88: 00 00 00 00 00 02 25 c0 | 04 6c 65 61 66 02 00 58 | 00 00 00 00 00 03 00 20
+      inumber 140736           namelen 4, "leaf",        next entry starts at 104
+```
+
+`leaf` occupies **sixteen** bytes.  The fields it must hold -- an eight-byte inode
+number, a length, four bytes of name, a type, and a tag -- add up to more than that,
+and the only way sixteen works is if the tag is **two** bytes, not four.
+
+Which is consistent with every other entry in the same block:
+
+| name | bytes | `get_length` | two-byte tag |
+|:-----|------:|:-------------:|:------------:|
+| `.`, `..`, `sf` | 16 | 16 | 16 |
+| `leaf`, `node` | 16 | **24** | 16 |
+| `block`, `btree3`, `sparse_leaf`, `files`, `xattrs`, `links` | 24 | 24 | 24 |
+| `btree2.2` | 24 | 24 | 24 |
+| `btree_with_single_leaf` | 40 | 40 | 40 |
+
+So this reader computes the length of `leaf` and `node` wrongly, which means it
+walks a directory's entries wrongly, which means **`get_length` is a bug in shipped
+code** and not only a thing a writer would have to work around.
+
+**And the version with two-byte tags still does not satisfy `xfs_repair`.**  The
+writer that uses the measured lengths and a correct hash index produces a block
+whose entries and index both read back exactly as intended, and repair still says:
+
+```text
+corrupt directory block 0 for inode 32
+would clear root inode 32
+root inode would be lost
+```
+
+So there is a rule about this block's entries that neither the reader's formula nor
+a two-byte tag satisfies, and it is not established.  Guessing it would be the
+whole mistake this document exists to prevent, so the writer is **not** landed: the
+work was thrown away rather than committed half-done, because a `create` that
+produces a directory `xfs_repair` calls corrupt is worse than no `create`.
+
+Two things are worth keeping from it.  The first is that `get_length` is wrong for
+four-character names, which is a live bug in the reader whatever else happens, and
+the root directory of a golden image has two of them.  The second is that
+`xfs_repair` is the only thing that noticed: this code's reader, its hash index
+and a full round trip all agreed that the block it had written was fine.
+
+What would settle it: the entry layout of a directory **XFS itself wrote**.  These
+images are hand-built, and the two facts that do not fit the format -- a tag that
+is two bytes wide and a length formula that disagrees with the field layout -- are
+both of a piece with that.  `mkfs.xfs` makes no directory with a name in it that
+this suite can reach without mounting a file system, so that measurement needs a
+substrate this environment cannot make, the same answer as the b-map block's and
+the free list's.
 
 Reading it at all needed `SUPERBLOCK` installed, which is not a detail:
 
