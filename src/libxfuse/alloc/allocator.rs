@@ -1406,6 +1406,8 @@ mod t {
         btree::{BmbtLeafBlock, BmbtLeafRecord},
         dinode::{DiU, Dinode},
         dinode_core::XfsDinodeFmt,
+        dir3::Dir3,
+        dir3_block::Dir2Block,
         inode::RawDinode,
         sb::Sb,
         transaction::{CommitMode, Transaction},
@@ -3732,6 +3734,74 @@ mod t {
         );
         assert_repair_accepts(image.path(), "after a chmod through the transaction");
     }
+    /// What the root directory's block looks like, read through this code's own
+    /// decoder.
+    ///
+    /// The first step of `create`, and a measurement: a directory can only be
+    /// written if there is somewhere in it to write, and that is a fact about the
+    /// image before it is a fact about the format.
+    ///
+    /// It needs `SUPERBLOCK` installed, because a directory entry's shape depends on
+    /// the file system's layout -- whether it carries a type -- and every decoder
+    /// here reaches for that global.  `extent.rs`'s tests install one with
+    /// `get_or_init` for the same reason, and this is that convention rather than a
+    /// new one.  Its cost is that whichever image installs first decides for the
+    /// whole process, which is why this test asks for *an* image and checks what it
+    /// is about rather than assuming.
+    #[test]
+    fn the_root_directory_has_room_to_hold_a_name() {
+        let Some(image) = copy_of_golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let sb = sb_of(image.path());
+        crate::libxfuse::volume::SUPERBLOCK.get_or_init(|| sb.clone());
+
+        let file = std::fs::File::open(image.path()).unwrap();
+        let mut reader = std::io::BufReader::new(file);
+        let mut root = Dinode::from(&mut reader, &sb, 32);
+        assert!(
+            matches!(root.di_core.di_format, XfsDinodeFmt::Extents),
+            "the root's mapping is not in its inode, so this is not the directory this is about"
+        );
+        let size = root.di_core.di_size;
+        let (start, len) = root
+            .get_file()
+            .expect("the root's mapping is in its inode")
+            .lookup(reader.by_ref(), &sb, 0)
+            .expect("the root's first block is mapped");
+        let start = start.expect("the root's first block is not a hole");
+        eprintln!(
+            "xfsv4.img root: block {start}, {len} blocks long, file size {size}, directory block \
+             size {}",
+            sb.sb_dirblklog
+        );
+
+        let block = Dir2Block::new(&mut reader, &sb, start);
+        let mut names: Vec<(String, u64)> = Vec::new();
+        let mut off = 0i64;
+        loop {
+            match block.next(&mut reader, &sb, off) {
+                Ok((ino, next, _t, name)) => {
+                    names.push((name.to_string_lossy().into_owned(), ino));
+                    if next < 0 {
+                        break;
+                    }
+                    off = next;
+                }
+                Err(e) => {
+                    eprintln!("listing stopped: {e}");
+                    break;
+                }
+            }
+        }
+        eprintln!("the root holds {} entries: {names:?}", names.len());
+        assert!(
+            names.iter().any(|(n, _)| n == "files"),
+            "the root should hold `files`"
+        );
+    }
+
     /// What a *free* inode's slot looks like on disk, read out of a real image.
     ///
     /// The write-support plan's rule is that inode availability comes from the
