@@ -848,11 +848,38 @@ or inode`.  So the tool that reads every other structure here cannot show the
 records inside a b-map block, and the layout has to be established the way
 everything else in this document now is: build one and ask `xfs_repair`.
 
+The *fork* layout is now pinned, byte for byte, against a real inode:
+
+```text
+  100  level     u16
+  102  numrecs   u16
+  104  keys[0..numrecs]   startoff, u64 each
+  176  ptrs[0..numrecs]   block,    u64 each     (104 + 3*8 + 48 = 176)
+```
+
+and the gap between the arrays is `dfork_btree_ptr_gap(inode size, numrecs)`, so
+the pointer offset is not a constant and cannot be written down as one.  A test now
+asks this code and `xfs_db` the same question about inode 100553's fork and
+requires them to agree about the level, the record count, every key and every
+pointer -- which is **shipped code being checked against a real file for the first
+time**, since every inode any other test reads has its extents *in* the inode.
+
+What is still not established is the record layout *inside* a b-map block, and the
+attempt to settle it by hand is worth recording as a failure of method rather than
+of arithmetic.  Patching a slot and asking repair produces a complaint whose
+numbers can be read several ways, and four candidate layouts all produced
+complaints, none of them clean -- because the experiment was wrong, not the
+candidates: it rewrote one leaf of a three-leaf tree, leaving the interior node
+claiming three children, so repair walked the untouched leaves too and every
+complaint was about something else.  **The setup has to be coherent before the
+question is askable**: point the fork at a single new leaf and rewrite the fork
+header with it, and only then does what repair says mean anything.
+
 Also worth knowing before anyone tries: the b-tree path in this code is not only a
-*writer*.  `BtreeBlockHdr` has no notion of a b-map block, `DiU::Bmbt` is built
-for a fork header rather than for a node's records, and `ExtentMap`'s b-tree arm
-has no way to fetch a leaf.  So a spill is reader-then-writer, in that order, and
-the reader is a milestone of its own rather than a detail of the writer.
+*writer*.  `BtreeBlockHdr` has no notion of a b-map block, `DiU::Bmbt` describes a
+fork header rather than a node's records, and `ExtentMap`'s b-tree arm cannot fetch
+a leaf.  So a spill is reader-then-writer, in that order, and the reader is a
+milestone of its own rather than a detail of the writer.
 
 ### Every directory in these images is in *local* format
 

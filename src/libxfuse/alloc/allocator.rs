@@ -1403,6 +1403,8 @@ mod t {
         },
         block_cache::BlockCache,
         block_device::{Access, BlockDevice},
+        dinode::{DiU, Dinode},
+        dinode_core::XfsDinodeFmt,
         inode::RawDinode,
         sb::Sb,
         transaction::{CommitMode, Transaction},
@@ -4178,7 +4180,7 @@ mod t {
         let before: std::collections::HashSet<u32> = listed.iter().copied().collect();
 
         // Now let XFS rebuild it.
-        let mut device_write = BlockDevice::open(image.path(), Access::ReadWrite).unwrap();
+        let device_write = BlockDevice::open(image.path(), Access::ReadWrite).unwrap();
         let status = std::process::Command::new("xfs_repair")
             .arg(image.path())
             .status()
@@ -4327,7 +4329,7 @@ mod t {
                 std::path::Path::new("/tmp"),
                 &format!("ver-{version}.img"),
             );
-            let mut d = BlockDevice::open(&scratch, Access::ReadWrite).unwrap();
+            let d = BlockDevice::open(&scratch, Access::ReadWrite).unwrap();
             d.write_at(&[version], at + 4).unwrap();
             d.flush().unwrap();
             drop(d);
@@ -4384,6 +4386,118 @@ mod t {
             field(&reported, "core.forkoff"),
             0,
             "a fresh inode has no attribute fork yet"
+        );
+    }
+    /// A real file with a b-tree data fork, decoded here and by `xfs_db`.
+    ///
+    /// Every test in this suite that reads an inode reads one whose extents are
+    /// *in* the inode, so the b-tree fork path -- a level, a record count, that
+    /// many keys, a gap, that many pointers -- has been shipped and never
+    /// exercised against a real file.  `xfsv4.img` has three: inode 100553 is the
+    /// smallest, with three interior children and sixty-four extents.
+    ///
+    /// So this asks two readers the same question about the same bytes.  The
+    /// repository's decoder has to agree with `xfs_db` about the level, the
+    /// record count, every key and every pointer, or one of them is wrong -- and
+    /// `xfs_db` is not being asked about the part neither can read, because
+    /// neither of them can: see the note below on b-map blocks.
+    ///
+    /// The fork's layout, for the record, since it is what this pins:
+    ///
+    /// ```text
+    ///   100  level     u16
+    ///   102  numrecs   u16
+    ///   104  keys[0..numrecs]   startoff, u64 each
+    ///   176  ptrs[0..numrecs]   block,    u64 each     (104 + 3*8 + 48 = 176)
+    /// ```
+    ///
+    /// and the gap between the two arrays is `dfork_btree_ptr_gap(inode size,
+    /// numrecs)`, which is why the pointer offset cannot be written down as a
+    /// constant.
+    ///
+    /// **What this cannot reach.**  The records *inside* a b-map block are a
+    /// separate question and neither reader here has an answer: `xfs_db`'s type
+    /// list has `attr`, `bnobt` and `inobt` and nothing for a file mapping tree,
+    /// and asked about one of those blocks it answers `no current type`.  The
+    /// magic in a real leaf is `BMAP`, and its records are still to be
+    /// established -- by building one and asking `xfs_repair`, the way everything
+    /// else in this document is settled.
+    #[test]
+    fn a_files_btree_fork_decodes_the_same_here_as_in_xfs_db() {
+        let Some(path) = crate::libxfuse::alloc::golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let sb = sb_of(&path);
+        let ino = 100_553u64;
+        let located = sb.locate_ino(ino);
+        assert_eq!(located.agno, 1, "this test was written about inode 100553");
+
+        // What this code makes of it.
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let inode = Dinode::from(&mut reader, &sb, ino);
+        let (level, numrecs, keys, pointers) = match &inode.di_u {
+            DiU::Bmbt((bmdr, keys, pointers)) => (bmdr.bb_level, bmdr.bb_numrecs, keys, pointers),
+            other => panic!("inode {ino} is not a btree fork: {other:?}"),
+        };
+        assert!(
+            matches!(inode.di_core.di_format, XfsDinodeFmt::Btree),
+            "this test is about a btree data fork, and this inode is format {:?}",
+            inode.di_core.di_format
+        );
+        assert_eq!(
+            inode.di_core.nextents, 64,
+            "xfs_db reports this file with 64 extents"
+        );
+
+        // And what `xfs_db` makes of it.
+        let out = xfs_db(
+            &path,
+            &[&format!("inode {ino}"), "p u.bmbt.level u.bmbt.numrecs"],
+        );
+        let level_db = field(&out, "u.bmbt.level") as u16;
+        let numrecs_db = field(&out, "u.bmbt.numrecs") as u16;
+        assert_eq!(
+            (level, numrecs),
+            (level_db, numrecs_db),
+            "the fork's level or record count is not what xfs_db reads"
+        );
+
+        let keys_db: Vec<u64> = xfs_db(&path, &[&format!("inode {ino}"), "p u.bmbt.keys"])
+            .lines()
+            .filter_map(|l| {
+                let (_, v) = l.split_once(':')?;
+                let v = v.trim().trim_start_matches('[').split(']').next()?.trim();
+                v.parse::<u64>().ok()
+            })
+            .collect();
+        assert_eq!(
+            keys.iter().map(|k| k.br_startoff).collect::<Vec<_>>(),
+            keys_db,
+            "the fork's keys are not what xfs_db reads"
+        );
+
+        // The pointers come on one line as `1:50313 2:50315 3:50317`, so every
+        // `index:value` pair on it is one of them; taking the first would give one
+        // pointer and a comparison that passes for the wrong reason only if the
+        // other two happened to match.
+        let ptrs_db: Vec<u64> = xfs_db(&path, &[&format!("inode {ino}"), "p u.bmbt.ptrs"])
+            .lines()
+            .flat_map(|l| {
+                l.split_whitespace()
+                    .filter_map(|tok| tok.rsplit_once(':'))
+                    .filter_map(|(_, v)| v.trim().parse::<u64>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            pointers.iter().copied().collect::<Vec<_>>(),
+            ptrs_db,
+            "the fork's pointers are not what xfs_db reads"
+        );
+        eprintln!(
+            "xfsv4.img inode {ino}: level {level}, {numrecs} children, keys {keys_db:?}, pointers \
+             {ptrs_db:?}"
         );
     }
     /// The occupancy a free space leaf has to keep, measured rather than
