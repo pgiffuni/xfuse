@@ -3353,7 +3353,15 @@ mod t {
         // and are now fixed rather than worked around: an attribute fork left
         // with no format (`bad attribute format 0`) and a free inode whose
         // `next_unlinked` was zero (`bad next_unlinked 0x0`).
-        let complaints = repair_complaints(image.path()).expect("xfs_repair runs");
+        // Skipped where there is no repair tool to ask, like every other repair
+        // check here: a host without `xfs_repair` cannot run this oracle, and
+        // failing because the oracle is missing is not the same as failing because
+        // the image is wrong.  Requiring it is also how this test ended up the
+        // only one in the suite that could not run on the project's own CI.
+        let Some(complaints) = repair_complaints(image.path()) else {
+            eprintln!("skipping the repair check: no xfs_repair to run");
+            return;
+        };
         let mut unexpected: Vec<&str> = complaints
             .lines()
             .filter(|l| !l.contains("disconnected inode"))
@@ -3939,6 +3947,13 @@ mod t {
     /// an image nothing else will produce.
     #[test]
     fn the_occupancy_a_leaf_must_keep_is_what_repair_says_it_is() {
+        // `xfs_repair` *is* this test.  There is nothing here to check without it,
+        // and a host that does not have it cannot run the oracle -- so it skips
+        // rather than failing, which is the same rule the helper below follows.
+        if !crate::libxfuse::alloc::have_xfs_repair() {
+            eprintln!("skipping: no xfs_repair to ask");
+            return;
+        }
         let Some(golden) = crate::libxfuse::alloc::golden("xfsv4.img") else {
             eprintln!("skipping: no unpacked xfsv4.img");
             return;

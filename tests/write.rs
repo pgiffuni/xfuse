@@ -555,12 +555,20 @@ fn a_file_made_shorter_gives_its_blocks_back() {
     // and passed with a bug in place that gave away the file's own block, because
     // seven bytes is not inside any extent.
     let wanted = before + 1500;
-    let blocksize = 1usize
-        << xfs_db_field(&image, &["sb 0"], "blocklog")
-            .parse::<u32>()
-            .expect("the image's block size");
+    // Every `xfs_db` reading below is optional: the project's CI has no `xfs_db`,
+    // and a check that cannot run is a check to skip, not a test to fail.
+    let Some(blocklog) =
+        xfs_db_field(&image, &["sb 0"], "blocklog").and_then(|v| v.parse::<u32>().ok())
+    else {
+        eprintln!("skipping the free-space check: no xfs_db to read the block size with");
+        return;
+    };
+    let blocksize = 1usize << blocklog;
     let held = |size: usize| size.div_ceil(blocksize);
-    let fdblocks_before = xfs_db_field(&image, &["sb 0"], "fdblocks");
+    let Some(fdblocks_before) = xfs_db_field(&image, &["sb 0"], "fdblocks") else {
+        eprintln!("skipping the free-space check: no xfs_db to read the free count with");
+        return;
+    };
     let gave_up = held(before + GROWN) - held(wanted);
     assert!(gave_up > 0, "the test would not shorten a block at all");
 
@@ -577,13 +585,13 @@ fn a_file_made_shorter_gives_its_blocks_back() {
     // free count is the thing that moves, and it is the sum of the free space, the
     // b-tree blocks and the free list -- so freeing four blocks shows up as four
     // more on `sb_fdblocks` whichever of those three took them.
-    assert_eq!(
-        xfs_db_field(&image, &["sb 0"], "fdblocks")
-            .parse::<u64>()
-            .expect("a number"),
-        fdblocks_before.parse::<u64>().expect("a number") + gave_up as u64,
-        "the {gave_up} blocks the file gave up were not given back"
-    );
+    if let Some(after) = xfs_db_field(&image, &["sb 0"], "fdblocks") {
+        assert_eq!(
+            after.parse::<u64>().expect("a number"),
+            fdblocks_before.parse::<u64>().expect("a number") + gave_up as u64,
+            "the {gave_up} blocks the file gave up were not given back"
+        );
+    }
 
     with_ro_mount(&image, "truncate-ro", |mnt| {
         let file = mnt.join("files/hello.txt");
@@ -612,24 +620,24 @@ fn a_file_made_shorter_gives_its_blocks_back() {
 /// thing to do for what a *file* looks like and the wrong thing for what a *file
 /// system* holds: a mount says nothing about whether the blocks a file gave up
 /// went anywhere.
-fn xfs_db_field(image: &std::path::Path, commands: &[&str], field: &str) -> String {
+fn xfs_db_field(image: &std::path::Path, commands: &[&str], field: &str) -> Option<String> {
     let mut cmd = Command::new("xfs_db");
     for c in commands {
         cmd.arg("-c").arg(c);
     }
+    // `None` rather than a panic where the tool is not installed: the project's
+    // own CI has no `xfs_db`, and a test that fails because it cannot run its
+    // oracle has not found anything.  Every caller treats `None` as "skip this
+    // check".
     let out = cmd
         .arg("-c")
         .arg(format!("p {field}"))
         .arg(image)
         .output()
-        .expect("xfs_db");
+        .ok()?;
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     text.lines()
         .find_map(|l| l.split_once('=').map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| {
-            eprintln!("skipping: xfs_db did not report {field} for {commands:?}:\n{text}");
-            String::new()
-        })
 }
 
 /// Where a file's extents stop fitting in its inode, which is now measured.
@@ -734,11 +742,13 @@ fn a_file_with_more_extents_than_its_inode_holds_is_refused() {
 /// A skip where there is no repair tool to ask, because a test that cannot run its
 /// oracle should say so rather than pass quietly.
 fn repair_accepts(image: &std::path::Path, what: &str) {
-    let out = Command::new("xfs_repair")
-        .arg("-n")
-        .arg(image)
-        .output()
-        .expect("xfs_repair");
+    // Skipped, with a word, where `xfs_repair` is not installed -- which is the
+    // case on the project's CI, and which is a fact about the host rather than
+    // about the image.
+    let Ok(out) = Command::new("xfs_repair").arg("-n").arg(image).output() else {
+        eprintln!("skipping the repair check for {what}: no xfs_repair to run");
+        return;
+    };
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
