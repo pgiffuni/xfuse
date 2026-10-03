@@ -691,7 +691,19 @@ impl RawDinode {
         let limit = self.attribute_fork_offset().unwrap_or(self.bytes.len());
         let room = limit.saturating_sub(start) / EXTENT_REC_SIZE;
         if extents.len() > room {
-            return Err(FsError::NoSpace);
+            // Saying *why* is worth the words even though the caller only gets
+            // `ENOSPC`: this is not the group running out, and a file that has
+            // nine extents and wants a tenth has a problem no amount of free
+            // space solves.  The format's answer is a b-tree rooted in the inode,
+            // which needs a reader as well as a writer -- there is no b-map block
+            // decoder in this code yet -- so the honest answer is to refuse and say
+            // so.
+            return Err(FsError::unsupported(format!(
+                "a {} byte inode holds {room} extent records and this file needs {}: its data \
+                 fork has to become a b-tree, which is not implemented",
+                self.bytes.len(),
+                extents.len()
+            )));
         }
         for (i, extent) in extents.iter().enumerate() {
             let at = start + i * EXTENT_REC_SIZE;

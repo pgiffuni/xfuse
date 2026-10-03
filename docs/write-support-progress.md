@@ -203,7 +203,7 @@ What is left in order:
 | Area |
 |:-----|
 | Root collapse (an interior root left with one child) |
-| BMBT growth (inode btree interior nodes) |
+| BMBT growth: a data fork that has to become a b-tree |
 | `create`, `unlink`, directory and namespace mutation |
 | Journal, log recovery, crash safety |
 | Real-time device allocation |
@@ -606,28 +606,108 @@ chunk therefore cannot be placed by any formula at all — it has to be searched
 for, and what it has to be searched against is the group's own free space and its
 own metadata.
 
-### A free inode's slot is entirely zero
+### A free inode's slot is **not** all zeroes, and `xfs_repair` says exactly what
 
-`xfsv4.img`'s group 1 has 52 free inodes, and **every one of their slots is a run
-of zeroes — magic included**.  The inodes in use in the same group carry `494e`
-at the head of their slot followed by a mode of `81a4`, so the difference is
-between a slot XFS has written and one it has not.
+The first reading of this was wrong and is worth recording because it nearly
+became the implementation.  `xfsv4.img`'s group 1 has 52 free inodes and their
+slots *looked* like runs of zeroes — a hand parser read them out of bounds, and the
+mistake survived a good while — so a chunk's 64 slots were duly written that way.
+`xfs_repair -n` refused:
 
-Two things follow, and the second is the one that matters:
+```text
+bad magic number 0x0 on inode 95, would reset magic number
+bad version number 0x0 on inode 95, would reset version number
+bad next_unlinked 0x0 on inode 95, would reset next_unlinked
+free inode 95 contains errors, would correct
+```
 
-* All-zero is a state XFS leaves behind and `xfs_repair -n` accepts, on an image
-  with 52 of them.
-* **What XFS writes when it creates a new chunk is unmeasured.**  No chunk in any
-  image here was created by an operation this suite can watch.  All-zero is
-  consistent with the evidence and is the obvious thing to try, but "consistent
-  with the slots XFS happened not to write" is not the same as "what XFS writes",
-  and the difference is exactly the kind this project has been wrong about before.
+So the layout was **measured**, field by field, by asking the tool:
 
-That also corrects a comment in `allocate_ino`, which says "a slot that has never
-been used is all zeroes, so every field has to be set rather than assumed".  That
-is right about a *used* inode, where every field has to be written.  For a *free*
-one it is the other way round: there is nothing to read and nothing to assume, and
-an all-zero slot is a legal thing to find and a legal thing to write.
+| field | offset | value | how |
+|:------|:-------|:------|:----|
+| inode magic | 0 | `0x494e` | named by repair |
+| version | 4 | 2 for a 256-byte inode, 3 for a larger one | `xfs_db` on the image's own inodes |
+| `next_unlinked` | **96** | `0xffffffff` | repair names the field; its offset and value found by writing a recognisable value at each offset and asking which one repair read |
+
+The offset is the one that would not have been guessed: `next_unlinked` sits
+**immediately after the core, at 96**, not at the end of the inode, which is where
+the obvious guess puts it and where the first version wrote `0xffffffff` — and
+which is why the first attempt still got a `bad next_unlinked 0x0`.  The value is
+the list's end marker, and nothing else is accepted: zero, one, the inode's own
+number and `0xfffffffe` were each tried and each refused.
+
+What is still **unmeasured** is what XFS writes when it *creates* a chunk: no chunk
+in any image here was created by an operation this suite can watch.  What is above
+is what a chunk must look like for repair to accept it, which is the most that can
+be established here and is enough to write one.
+
+### The record's `startino` is counted from the start of the group
+
+Another thing that is invisible until something reads the record back and turns it
+into an inode number.  `allocate_new_chunk` first wrote an *absolute* inode number,
+and a sweep over the field's whole plausible range showed what `xfs_repair -n`
+accepts:
+
+```text
+startino <  307200:  "inode chunk claims used block" -- the number is in range
+startino >= 307200:  "bad starting inode"            -- the number is not
+```
+
+307200 is `153600 × 2`, the number of inodes **in the group**.  So the field is
+bounded by the group's own inode count, not the file system's: it is a
+group-relative number, and `Sb::make_ino` adds the base.  The repository's existing
+code already did this correctly — `xfsv4.img`'s group 1 holds a chunk recorded at
+35008 and its hint says 35008, both far below that group's absolute first inode of
+65536 — so the mistake was mine, and the lesson it produced is recorded: I first
+concluded that XFS and `Sb::locate_ino` disagreed about where a group's inodes
+start.  They do not.  The disagreement was that a group-relative field had been
+given an absolute number.
+
+### An allocated inode is *disconnected*, and no test can ask repair to accept it
+
+Allocating an inode without a `create` to link it into a directory leaves an
+inode no directory can reach, and XFS's word for that is **disconnected**:
+
+```text
+disconnected inode 524352, would move to lost+found
+```
+
+`xfs_repair -n`'s remedy is to move it to lost+found.  So an image on which this
+program has allocated an inode cannot be one repair accepts, and the only honest
+arrangement is to ask repair while the chunk exists and every one of its inodes is
+still free — which it accepts — and then to assert that the inode's allocation is
+the *only* thing repair objects to afterwards.
+
+### A 256-byte inode holds nine extents, and the tenth is refused
+
+Worth writing down because the number is small, it is not what it looks like, and
+the wrong answer is silent.  A 256-byte inode's local area starts at byte 100 and
+an extent record is 16 bytes, so `(256 − 100) / 16` is **nine** of them.  Measured
+end to end: nine sparse writes succeed and the tenth is refused.
+
+The refusal is the point as much as the limit.  A file whose extents do not fit
+has to be either moved into a b-tree or refused, because the alternatives —
+writing a tenth record over the attribute fork, or over the inode's own tail —
+produce a file that reads back as something else.  And the refusal is `ENOSYS`
+rather than `ENOSPC`, because this is not the device running out and a caller told
+"no space" would go looking for space that is not the problem.
+
+What is **not** established is what happens on the other side.  The format's answer
+is a b-tree rooted in the inode, and that needs a *reader* as well as a writer:
+this code has no b-map block decoder at all, so even a spill that wrote a
+well-formed leaf could not read the file back.  Neither is written, deliberately —
+a second b-tree that cannot be read is the kind of thing that should not land.
+
+### Every directory in these images is in *local* format
+
+`xfs_db` on `xfsv4.img` reports `/files` with `core.format = 1 (local)`, and the
+same for the root: their entries are packed into the inode's data area rather than
+into blocks.  So `create` here would be implementing insertion into a
+*local-format* directory — hashed entry order, not the flat block layout that would
+be easier — and none of the images exercises the block-directory case at all.
+That is a finding about the substrate rather than about the code, and it is the
+reason `create` has not been built on top of a guess about what these directories
+look like.
 
 ### What the subtree therefore needs
 
@@ -965,6 +1045,7 @@ metadata — hand-editing is for tests whose subject *is* malformed metadata.
 | a new inode chunk can be allocated | done |
 | a file whose data fork is a B+tree can be written | not started |
 | files can be truncated and their blocks returned | done |
+| a file's extents that outgrow its inode are refused rather than mislaid | done |
 | files can be created, unlinked and renamed | not started |
 | directories can be created and removed | not started |
 | the journal works, and recovery from a torn write | not started |
