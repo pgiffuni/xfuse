@@ -912,10 +912,53 @@ remain and this suite cannot currently choose between them:
 3. the field is a block number in a unit or width this suite has not identified.
 
 Option 2 is the one that would invalidate everything above, and it is cheap to
-settle: build a single leaf with one record whose startoff is unambiguous, and ask
-`xfs_repair` what block it thinks the extent lives at.  That is the next
-experiment, and it is described in the failed attempt below so it does not have to
-be rediscovered.
+settle: build a single leaf with one record whose startoff is unambiguous, point
+the fork at it, and ask `xfs_repair` what block it thinks the extent lives at.
+That experiment has now been run, in a setup that is **verified coherent**, and it
+has eliminated six candidate layouts while producing no accepted one.
+
+#### The setup, and the verification that it is coherent
+
+`xfs_db` confirms the fork after the rewrite, which is the part that was wrong
+before and made every earlier result meaningless:
+
+```text
+u.bmbt.level = 1     u.bmbt.numrecs = 3
+u.bmbt.ptrs[1-3] = 1:35817 2:35818 3:35819
+core.nextents = 3    core.nblocks = 67
+```
+
+The fork is untouched apart from its three pointers, so its keys still say its
+children begin at blocks 0, 30 and 45, and each new leaf holds one extent
+beginning at the matching file offset.  The blocks used are ag1's 3049 to 3051,
+which the bno tree records as free, so nothing is allocated twice.
+
+#### Six candidates, all refused, each with repair's own words
+
+| record | where | what `xfs_repair -n` said |
+|:-------|:------|:-----------------------|
+| block, then file offset | 24 | `zero length extent (off = 69, fsbno = 4301289487859712)` |
+| file offset, then block | 24 | `bad extent overflows - start 0, end 35816, offset 0` |
+| file offset, block, length | 24 | `bad extent overflows - start 0, end 35816, offset 0` |
+| file offset, block, length | 16 | `bad extent starting block number 4301289487859712, offset 69` |
+| file offset, length, block | 24 | `bad extent starting block number 0, offset 0` |
+| block, file offset, length | 16 | `bad extent starting block number 0, offset 0` |
+
+#### And the thing that matters most, because it is not a candidate failing
+
+**The numbers in those messages do not match the bytes that were written.**
+`35816` is the block *before* the first leaf, and `4301289487859712` appears in
+two different candidates whose written bytes differ; `off = 0, fsbno = 0` means
+repair read zeroes from a place the record was not put.  A record that is *read*
+produces a message naming what it read.  These do not, so **repair is not reading
+the record these constructions write at all**, and the six refusals say the
+constructures are wrong rather than that six layouts are wrong.
+
+That is a better place to be than a table of rejected layouts, and a much worse
+place to keep guessing from.  What is needed next is to find out where repair looks
+for the record — which is answerable, by taking the *pristine*, accepted leaves and
+altering one field of one record at a time, so that the message can only be about
+that field.  Everything above is what not to do.
 
 ### The attempt that failed, and why it is worth writing down
 
