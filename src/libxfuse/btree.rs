@@ -112,69 +112,139 @@ impl<T: Decode<Ctx> + PrimInt + Unsigned, Ctx> Decode<Ctx> for BtreeBlockHdr<T> 
 /// worth, the same value `xfs_db`'s own type table calls `bmapbta`/`bmapbtd`.
 pub const BMBT_MAGIC: u32 = XFS_BMAP_MAGIC;
 
-/// Bytes from the start of a b-map block to its first record.
+/// Bytes from the start of a non-CRC b-map block to its first record.
 ///
-/// A 24-byte header: a magic, a level, a record count, and a left and right
-/// sibling of eight bytes each.  That the siblings are eight bytes is what makes
-/// the total 24, and it is measured rather than assumed -- perturbing offset 16 of
-/// a real leaf changed nothing about its extents, so the eight bytes there are not
-/// a record field, which is only consistent with a header that runs past them.
+/// A long-form header without a checksum: a magic, a level and a record count,
+/// then a left and a right sibling of eight bytes each, which is
+/// `XFS_BTREE_LBLOCK_LEN` in `xfs_format.h`.
+///
+/// This is the length a b-map block had before `xfs_repair` added a checksum to
+/// it, and it is *not* the length any image here has.  See
+/// [`BMBT_CRC_HEADER_LEN`], which is the one that is measured.
 pub const BMBT_HEADER_LEN: usize = 24;
+
+/// Bytes from the start of a checksummed b-map block to its first record.
+///
+/// `XFS_BTREE_LBLOCK_CRC_LEN`: the eight bytes of magic, level and count, then a
+/// long-form header carrying a block number, an LSN, the file system's UUID, the
+/// owning inode, the checksum and four bytes of padding.
+///
+/// This is 72, and reading the records from offset 24 instead -- which is what
+/// this used to do -- reads them from the middle of the header.  Nothing there
+/// looks like a record, which is why it went unnoticed: the values it produced
+/// were small, orderly and wrong.
+///
+/// Which of the two lengths a block has is decided by its magic, not guessed:
+/// see [`BmbtLeafBlock::from_bytes`].
+pub const BMBT_CRC_HEADER_LEN: usize = 72;
 
 /// Bytes per record in a b-map leaf.
 ///
-/// Sixteen, with three of them not yet attributed.  The stride is not the record
-/// size in the way one would expect: the fields are four bytes each, and eight
-/// bytes of each record are something else, so a sixteen-byte record read as two
-/// 64-bit values straddles three fields and reads as nonsense.  That was the
-/// mistake that cost this layout most of its investigation.
+/// Sixteen: two eight-byte words.  The stride is the record size, but the
+/// record is *not* four four-byte fields, which is what reading it as one
+/// amounts to.  See [`BmbtLeafRecord`].
 pub const BMBT_RECORD_LEN: usize = 16;
 
-/// One extent as a b-map leaf records it, as four four-byte words.
+/// Where in a b-map record the extent flag sits, and its width.
 ///
-/// `xfs_repair` prints these as `[o s c]` — offset, start block, count — but the
-/// *order within the record is not established*, and this type deliberately does
-/// not pretend otherwise.  What is established:
+/// `l0:63`, one bit, and it is one only for an extent that is not an ordinary
+/// mapped run.
+pub const BMBT_EXNTFLAG_BITLEN: u32 = 1;
+
+/// Where in a b-map record the file offset sits, and its width.
 ///
-/// * records are **sixteen bytes** apart starting at offset 24, and each holds four
-///   four-byte words.  Perturbing the word at 24 changes entry 0 of the leaf,
-///   the word at 40 changes entry 1, and so on up to entry 4 — which is what fixes
-///   the stride, since any other arrangement would put two entries in one word.
-/// * the **second word is the extent's file offset in bytes**.  Read across all three
-///   leaves of inode 100553 it runs 0 to 32256 for a 32768-byte file, one entry per
-///   512-byte block, with no break at a leaf boundary — which is `xfs_repair`'s
-///   printed offsets 0, 1, 2, 3 after a division by the block size.  So the
-///   *record* is in bytes and the *diagnostic* is in blocks, and a reader that took
-///   the printed form for the stored one would be out by a factor of the block
-///   size.
-/// * the **fourth word is `(entry << 16) | length in blocks`**: its low half is 1 in
-///   every record of every leaf, and the extents are one block each; its high half
-///   counts entries, 0x9100 through 0xa0c0 over the sixty-four extents of that file,
-///   continuing across leaf boundaries.  A block number would not survive a leaf
-///   boundary like that.
-/// * the first and third words are constant across every record: `00000000` and
-///   `00000018`.
+/// `l0:9-62`, fifty-four bits, counted in blocks.
+pub const BMBT_STARTOFF_BITLEN: u32 = 54;
+
+/// Where in a b-map record the block count sits, and its width.
 ///
-/// **So the record does not hold the extent's data block.**  That is the finding
-/// that closes this search rather than narrowing it: there is nothing else in a
-/// record to read, and `xfs_repair` can still name a block for every entry, so the
-/// block comes from somewhere this has not looked.
-/// * the **second word is the extent's file offset, in bytes**: it reads
-///   `0, 512, 1024, 1536` across the first four records, which are the entries
-///   `xfs_repair` prints as offsets `0, 1, 2, 3` — the same numbers, and repair
-///   converts.  So the record holds a byte offset and the *diagnostic* is in blocks,
-///   which is a distinction worth keeping: a reader that took the printed form for
-///   the stored one would be out by a factor of the block size.
+/// `l1:0-20`, twenty-one bits, counted in blocks.  It is twenty-one because that
+/// is as long as an extent may be: the length was a signed field once, and the
+/// sign bit is still spent.
+pub const BMBT_BLOCKCOUNT_BITLEN: u32 = 21;
+
+/// Where in a b-map record the low half of the start block sits, and its width.
 ///
-/// So the words are [`words[0..4]`](BmbtLeafRecord::words), the second is the
-/// file offset in bytes, the fourth carries the entry counter and the length, and
-/// the data block is not among them.  A record decoded as `[o s c]` in the
-/// notation's order reads `0, 0, 24` where repair prints `0, 50312, 1`, which is how
-/// the order was found to be wrong rather than merely unexamined — and, having been
-/// read in the notation's order, where the block went.
+/// `l0:0-8`, nine bits.
+pub const BMBT_STARTBLOCK_LOW_BITLEN: u32 = 9;
+
+/// Where in a b-map record the high half of the start block sits, and its width.
+///
+/// `l1:21-63`, forty-three bits.  Nine and forty-three make the fifty-two bits
+/// the start block has between the two words.
+pub const BMBT_STARTBLOCK_HIGH_BITLEN: u32 = 43;
+
+/// How far the stored start block is from the block number the rest of this
+/// program uses.
+///
+/// `l0:0-8` together with `l1:21-63` make a fifty-two-bit start block, and in
+/// every leaf of `xfs4096.img` that fifty-two-bit field is the file system block
+/// number scaled up by 512: a record holding start block 17833 holds
+/// 17833 * 512, and 17833 * 512 >> 9 is 17833 again.  Read unshifted it reads as
+/// a block number 512 times too large, which lands outside the image.
+pub const BMBT_STARTBLOCK_SCALE_SHIFT: u32 = 9;
+
+/// One extent as a b-map leaf records it: two eight-byte words.
+///
+/// The fields are not byte-aligned within them.  `xfs_format.h` says where they
+/// are, and this is that layout rather than a guess:
+///
+/// ```text
+///   l0:63      is an extent flag (one means the extent is not an ordinary run)
+///   l0:9-62    are the startoff, in blocks
+///   l0:0-8     and l1:21-63 together are the start block
+///   l1:0-20    are the block count, in blocks
+/// ```
+///
+/// The start block straddles the two words because the record is squeezed: an
+/// offset wants fifty-four bits, a block count twenty-one and a flag one, and
+/// fifty-four plus fifty-two plus twenty-one plus one is 128, which is exactly the
+/// record.  Nothing is spare, so the fields interleave rather than sit beside
+/// each other.
+///
+/// [`BmbtLeafRecord::as_extent`] is the only way to read one, and it is the only
+/// thing in this file that turns a record into a block number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BmbtLeafRecord {
-    pub words: [u32; 4],
+    pub l0: u64,
+    pub l1: u64,
+}
+
+impl BmbtLeafRecord {
+    /// This record's extent flag: is this an ordinary mapped run?
+    pub const fn extent_flag(&self) -> bool {
+        self.l0 >> (64 - BMBT_EXNTFLAG_BITLEN) != 0
+    }
+
+    /// This record's file offset, in blocks.
+    pub const fn startoff(&self) -> u64 {
+        (self.l0 >> BMBT_STARTBLOCK_LOW_BITLEN) & ((1 << BMBT_STARTOFF_BITLEN) - 1)
+    }
+
+    /// This record's block count, in blocks.
+    pub const fn blockcount(&self) -> u64 {
+        self.l1 & ((1 << BMBT_BLOCKCOUNT_BITLEN) - 1)
+    }
+
+    /// This record's start block, as the rest of this program counts blocks.
+    ///
+    /// The stored field is the block number scaled by
+    /// [`BMBT_STARTBLOCK_SCALE_SHIFT`] bits; this undoes that.
+    pub const fn startblock(&self) -> u64 {
+        let low = self.l0 & ((1 << BMBT_STARTBLOCK_LOW_BITLEN) - 1);
+        let high = (self.l1 >> BMBT_BLOCKCOUNT_BITLEN) & ((1 << BMBT_STARTBLOCK_HIGH_BITLEN) - 1);
+        ((high << BMBT_STARTBLOCK_LOW_BITLEN) | low) >> BMBT_STARTBLOCK_SCALE_SHIFT
+    }
+
+    /// This record as the extent the rest of this program works with.
+    pub const fn as_extent(&self) -> BmbtRec {
+        BmbtRec {
+            br_startoff:   self.startoff(),
+            br_startblock: self.startblock(),
+            br_blockcount: self.blockcount(),
+            br_flag:       self.extent_flag(),
+        }
+    }
 }
 
 /// A b-map leaf block: the header, and the extents it holds.
@@ -187,10 +257,16 @@ pub struct BmbtLeafBlock {
 impl BmbtLeafBlock {
     /// Read a leaf block's bytes.
     ///
-    /// The records are read as three four-byte fields at a sixteen-byte stride
-    /// from the end of the header, which is what perturbation of a real leaf
-    /// established: `xfs_repair` prints a record as `[o s c]`, and making one
-    /// record unorderable prints it whole.
+    /// The records are [`BMBT_RECORD_LEN`] bytes apart, beginning at
+    /// [`BMBT_CRC_HEADER_LEN`] in a checksummed block and [`BMBT_HEADER_LEN`] in
+    /// one without.  Which a block is, its magic says: `xfs_format.h` gives a
+    /// version 5 block [`XFS_BMAP_CRC_MAGIC`] and an older one [`BMBT_MAGIC`],
+    /// and the checksummed header is the longer one, so the magic that carries a
+    /// checksum is the magic that costs forty-eight more bytes of header.
+    ///
+    /// Both are needed.  `xfs4096.img` and `xfs1024.img` are version 5 and every
+    /// b-map block in them is checksummed; `xfsv4.img` is version 4 and none of
+    /// its hundred-odd b-map blocks is.
     ///
     /// A block that is too short for what its header claims, carries a magic this
     /// is not, or has more records than fit, is a **corrupt** structure rather than
@@ -206,32 +282,41 @@ impl BmbtLeafBlock {
             });
         }
         let magic = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        if magic != BMBT_MAGIC && magic != XFS_BMAP_CRC_MAGIC {
-            return Err(FsError::Corrupt {
-                what: format!("a b-map block carries magic {magic:#x}"),
-            });
-        }
+        let header_len = match magic {
+            m if m == XFS_BMAP_CRC_MAGIC => BMBT_CRC_HEADER_LEN,
+            m if m == BMBT_MAGIC => BMBT_HEADER_LEN,
+            m => {
+                return Err(FsError::Corrupt {
+                    what: format!("a b-map block carries magic {m:#x}"),
+                });
+            }
+        };
         let level = u16::from_be_bytes([bytes[4], bytes[5]]);
         let numrecs = u16::from_be_bytes([bytes[6], bytes[7]]) as usize;
-        let fit = (bytes.len() - BMBT_HEADER_LEN) / BMBT_RECORD_LEN;
+        let fit = bytes.len().saturating_sub(header_len) / BMBT_RECORD_LEN;
         if numrecs > fit {
             return Err(FsError::Corrupt {
                 what: format!("a b-map block claims {numrecs} records and holds room for {fit}"),
             });
         }
+        let word = |at: usize| {
+            u64::from_be_bytes([
+                bytes[at],
+                bytes[at + 1],
+                bytes[at + 2],
+                bytes[at + 3],
+                bytes[at + 4],
+                bytes[at + 5],
+                bytes[at + 6],
+                bytes[at + 7],
+            ])
+        };
         let mut records = Vec::with_capacity(numrecs);
         for i in 0..numrecs {
-            let at = BMBT_HEADER_LEN + i * BMBT_RECORD_LEN;
-            let word = |k: usize| {
-                u32::from_be_bytes([
-                    bytes[at + 4 * k],
-                    bytes[at + 4 * k + 1],
-                    bytes[at + 4 * k + 2],
-                    bytes[at + 4 * k + 3],
-                ])
-            };
+            let at = header_len + i * BMBT_RECORD_LEN;
             records.push(BmbtLeafRecord {
-                words: [word(0), word(1), word(2), word(3)],
+                l0: word(at),
+                l1: word(at + 8),
             });
         }
         Ok(BmbtLeafBlock { level, records })
@@ -239,31 +324,10 @@ impl BmbtLeafBlock {
 
     /// The extents as the rest of this program represents them.
     ///
-    /// The extents as the rest of this program represents them.
-    ///
-    /// **Provisional, and marked as such.**  The file offset is measured — the
-    /// record's second word, in bytes, divided by the block size — and the data
-    /// block is *not*: the fourth word ascends by `0x400000` per record, which is
-    /// not a block number in any image this repository holds.  Until it is
-    /// attributed, this maps the offset correctly and reports every extent as
-    /// starting at block zero, which makes `get_extent` right about *which* extent
-    /// covers a block and wrong about *which block* it is.  That is strictly less
-    /// wrong than what it replaced, which read the inode's packed form here and had
-    /// never been run, and it is visibly provisional rather than looking settled.
-    ///
-    /// The length is taken as one block, which is what these leaves hold; a leaf
-    /// whose records vary their length is not one this has seen.
-    pub fn extents(&self, block_size: u32) -> Bmx {
-        let recs: Vec<BmbtRec> = self
-            .records
-            .iter()
-            .map(|r| BmbtRec {
-                br_startoff:   u64::from(r.words[1]) / u64::from(block_size.max(1)),
-                br_startblock: u64::from(r.words[3]),
-                br_blockcount: 1,
-                br_flag:       false,
-            })
-            .collect();
+    /// Each record carries its own block count, so nothing here is assumed about
+    /// how long an extent is.
+    pub fn extents(&self) -> Bmx {
+        let recs: Vec<BmbtRec> = self.records.iter().map(BmbtLeafRecord::as_extent).collect();
         Bmx::new(&recs)
     }
 }
@@ -600,7 +664,7 @@ impl BtreeLeaf {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
         match BmbtLeafBlock::from_bytes(bytes) {
             Ok(block) if block.level == 0 => Ok(Self {
-                bmx: block.extents(512),
+                bmx: block.extents(),
             }),
             Ok(block) => Err(DecodeError::OtherString(format!(
                 "a b-map leaf claims to be {} levels down",
