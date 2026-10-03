@@ -260,9 +260,25 @@ how it works" and "this is how it happens to work here":
 * **The free slots of a new chunk are repair-validated, not confirmed.**  Repair
   says what it will accept, and the layout here is what it accepts.  That is not
   the same as knowing it is what XFS writes, because no chunk in any image in
-  this repository was created by an operation anyone here can watch.  The version
-  in particular is a choice — 2 for a 256-byte inode, 3 for a larger one — taken
-  from `xfs_db`'s report of the inodes these images already hold.
+  this repository was created by an operation anyone here can watch.
+
+  Narrowed as far as it can be from here, though.  The version is no longer a
+  free choice: patching a fresh slot to version 3 and asking gets
+
+  ```text
+  bad version number 0x3 on inode 524352, would reset version number
+  ```
+
+  so **3 is refuted for a 256-byte inode**, while 1 and 2 are both accepted.  The
+  code writes 2, which is what every inode in these images that a file system
+  *did* write reads.  The 512-byte half of the choice stays an inference, because
+  no image here has one to allocate a chunk in.
+
+  The same experiment separates two things that were easy to conflate: a **free**
+  slot's attribute fork reads `aformat = 0` and repair accepts it, while an inode
+  `allocate_ino` has handed out must have it set — `bad attribute format 0` is what
+  that was fixed for.  Zero is right for one state and wrong for the other, and both
+  are now measured rather than assumed.
 
 * **"AGFL → ordinary free space" is real, but the actor is the recovery
   tool.**  Every image `mkfs.xfs` produced here has never consumed a list entry,

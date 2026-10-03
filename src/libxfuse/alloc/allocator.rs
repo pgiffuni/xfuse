@@ -4028,16 +4028,30 @@ mod t {
         )
     }
 
-    /// One `name = value` out of what `xfs_db` printed.
+    /// One `name = value` out of what `xfs_db` printed, as a number.
+    ///
+    /// `xfs_db` decorates: `core.aformat = 0 (dev)` and `core.magic = 0x494e` are
+    /// both numbers with something after them.  A reader that insists on a bare
+    /// decimal refuses to parse what the tool plainly printed; one that is
+    /// loosened until it parses the decoration calls the decoration a fault.
+    /// So the value is taken up to the first space, a hex prefix is honoured, and
+    /// anything else says so rather than quietly becoming zero.
     fn field(text: &str, name: &str) -> u64 {
         text.lines()
             .find_map(|l| {
                 let (k, v) = l.split_once('=')?;
-                (k.trim() == name).then(|| {
-                    v.trim().parse::<u64>().unwrap_or_else(|_| {
-                        panic!("xfs_db printed {name} as {v:?}, which is not a number:\n{text}")
-                    })
-                })
+                if k.trim() != name {
+                    return None;
+                }
+                let v = v.trim().split(' ').next().unwrap_or("").trim();
+                Some(
+                    v.strip_prefix("0x")
+                        .map(|h| u64::from_str_radix(h, 16))
+                        .unwrap_or_else(|| v.parse::<u64>())
+                        .unwrap_or_else(|_| {
+                            panic!("xfs_db printed {name} as {v:?}, which is not a number:\n{text}")
+                        }),
+                )
             })
             .unwrap_or_else(|| panic!("xfs_db did not print {name}:\n{text}"))
     }
@@ -4198,11 +4212,6 @@ mod t {
             .copied()
             .filter(|b| !after.contains(b) && !free_after.contains(b))
             .collect();
-        let gone: Vec<u32> = before
-            .iter()
-            .copied()
-            .filter(|b| !after.contains(b) && !free_after.contains(b))
-            .collect();
         eprintln!(
             "xfs_repair rebuilt the list: window ({first},{last},{count}) with {} entries",
             after.len()
@@ -4248,6 +4257,134 @@ mod t {
             before.len()
         );
         assert_repair_accepts(image.path(), "after xfs_repair rebuilt a full free list");
+    }
+    /// Which inode version a fresh chunk's slots must carry, established by
+    /// asking rather than by choosing.
+    ///
+    /// The audit grades this as an **inference**: the code writes version 2 for a
+    /// 256-byte inode and 3 for a larger one, taken from what `xfs_db` reports
+    /// for the inodes these images already hold.  No chunk in any image here was
+    /// created by a file system, so "what XFS writes" is not directly observable
+    /// here — but "what repair insists on" is, and narrowing a choice to the one
+    /// thing the file system will accept is a great deal better than a preference.
+    ///
+    /// So: allocate a chunk, then write each version into one of its slots and
+    /// ask.  A version repair corrects is a version this code must not write.
+    ///
+    /// The same question for a 512-byte inode is not asked, because no image here
+    /// has one to allocate a chunk in — `xfs_4kn.img` has 4 KiB blocks and so 4 KiB
+    /// inodes, and its groups are not empty of chunks either.  That half of the
+    /// choice stays an inference and the test says so.
+    #[test]
+    fn which_inode_version_a_fresh_chunks_slots_must_carry() {
+        if !crate::libxfuse::alloc::have_xfs_repair() {
+            eprintln!("skipping: no xfs_repair to ask");
+            return;
+        }
+        let Some(image) = copy_of_golden("xfs_writable.img") else {
+            eprintln!("skipping: no unpacked xfs_writable.img");
+            return;
+        };
+        let sb = sb_of(image.path());
+        let agno = 1u32;
+        let device = Arc::new(BlockDevice::open(image.path(), Access::ReadWrite).unwrap());
+        let mut cache = BlockCache::new(sb.sb_blocksize as usize, 256);
+        assert_eq!(
+            sb.inode_size(),
+            256,
+            "this test asks about a 256-byte inode"
+        );
+
+        let startino = {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let ino = allocate_new_chunk(&mut tx, &sb, agno).expect("room for a chunk");
+            tx.commit().expect("commit");
+            ino
+        };
+        device.flush().unwrap();
+
+        // What the code wrote, as `xfs_db` reads it back.
+        let reported = xfs_db(
+            image.path(),
+            &[
+                &format!("inode {startino}"),
+                "p core.version core.magic core.aformat core.forkoff",
+            ],
+        );
+        eprintln!("xfs_writable.img: inode {startino} reads as:\n{reported}");
+        assert_eq!(
+            field(&reported, "core.version"),
+            2,
+            "the chunk's slots were written with the wrong version"
+        );
+
+        // And now the same slot with each version in turn, asked about.
+        let at = sb.ino_to_offset(startino);
+        let mut accepted = Vec::new();
+        for version in [1u8, 2, 3] {
+            let scratch = copy_image(
+                image.path(),
+                std::path::Path::new("/tmp"),
+                &format!("ver-{version}.img"),
+            );
+            let mut d = BlockDevice::open(&scratch, Access::ReadWrite).unwrap();
+            d.write_at(&[version], at + 4).unwrap();
+            d.flush().unwrap();
+            drop(d);
+            let complaints = repair_complaints(&scratch).expect("xfs_repair runs");
+            let mentions_version = complaints
+                .lines()
+                .filter(|l| l.contains("version"))
+                .map(|l| format!("{l}"))
+                .collect::<Vec<_>>();
+            eprintln!(
+                "  version {version}: {}",
+                if mentions_version.is_empty() {
+                    "accepted".to_string()
+                } else {
+                    mentions_version.join("; ")
+                }
+            );
+            if mentions_version.is_empty() {
+                accepted.push(version);
+            }
+            let _ = std::fs::remove_file(&scratch);
+        }
+        // **Version 3 is excluded, by experiment.**  Repair refuses it on a
+        // 256-byte inode:
+        //
+        // ```text
+        // bad version number 0x3 on inode 524352, would reset version number
+        // ```
+        //
+        // and accepts 1 and 2.  So the choice is no longer a preference between
+        // three: one of them is refuted.  Between 1 and 2, repair has nothing to
+        // say -- it is XFS, not the recovery tool, that writes 1, and every inode
+        // in this image that a file system did write reads 2, which is what this
+        // code writes.
+        assert_eq!(
+            accepted,
+            vec![1, 2],
+            "repair's opinion on the version a 256-byte inode carries has changed; the code \
+             writes 2"
+        );
+
+        // The same image says something else useful about a *free* slot: its
+        // attribute fork reads `aformat = 0`, and repair accepts that.  So zero is
+        // right for the attribute fork of an inode nobody has allocated, and wrong
+        // for one that has been -- `allocate_ino` sets it, and `bad attribute
+        // format 0` is what it was fixed for.  Two states, two different answers,
+        // both measured rather than assumed.
+        assert_eq!(
+            field(&reported, "core.aformat"),
+            0,
+            "a free inode's attribute fork should read as it does in the image"
+        );
+        assert_eq!(
+            field(&reported, "core.forkoff"),
+            0,
+            "a fresh inode has no attribute fork yet"
+        );
     }
     /// The occupancy a free space leaf has to keep, measured rather than
     /// inferred from the B+tree literature.
