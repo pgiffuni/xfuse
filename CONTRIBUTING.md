@@ -33,6 +33,33 @@ Three things follow, and all three have been got wrong here:
 For the measurements, the evidence levels, and the worked examples, see
 [`docs/write-support-progress.md`](docs/write-support-progress.md).
 
+### Where the oracle is, and what follows from that
+
+Continuous integration installs no XFS tools, so `xfs_db`, `xfs_bmap` and
+`xfs_repair` are absent there and **every oracle check skips**.  What that costs is
+set out in
+[the progress document](docs/write-support-progress.md#a-skipped-check-is-not-a-passing-check);
+the consequence for *reading* structures is this:
+
+* **A green CI run is not a statement about the format.**  It says nothing crashed
+  and nothing was misread *loudly*.  A reader that returns orderly nonsense passes
+  CI exactly as it passed for six months: the b-map leaf reader was reading records
+  from the middle of the header, and every run was green because nothing asserted
+  what the records *mean*.  What CI could do was count 86 failing integration tests;
+  what it could not do was say why.
+
+* **So an interpretation has to be verified where the tools are.**  A host with
+  xfsprogs installed is the only place this project can ask, and asking it is the
+  whole of the technique above.  That is a host capability, not a CI capability,
+  and no amount of green makes up its absence.
+
+This is why the test that pins a decode compares against `xfs_db`'s *own output for
+the same block* rather than against a hand-copied constant.
+`a_bmap_leaf_decodes_the_extents_xfs_db_reports` exists because its predecessor
+asserted four exact words and passed happily on a reader that had the fields wrong.
+A shape test pins the bytes; only a comparison pins the meaning.  If you change how
+a structure is read, keep the comparison.
+
 ## Linting: run what continuous integration runs
 
 ```sh
