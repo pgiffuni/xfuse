@@ -212,14 +212,90 @@ What is left in order:
 
 ---
 
+## How strong each measurement is, and how to read one
+
+The claim that started this section's audit was wrong twice: a free inode's slot
+was said to be all zeroes because a hand-written parser read it that way, and the
+parser had read *out of bounds*.  The numbers it produced were plausible, they
+agreed with a familiar structure, and nothing caught it for a long time.
+
+So: **a hand parser is a measurement instrument, not a specification.**  Being
+independent of `xfuse` does not make it an oracle — it makes it a second opinion
+from the same kind of reader, and it can be wrong in the same plausible way.
+
+Every claim below therefore carries a level, and the levels mean this:
+
+| level | what it is | example |
+|:------|:-----------|:--------|
+| **tool** | a native tool printed it, or its answer to a controlled experiment | `xfs_db`'s `blockget` walk; repair's `bad next_unlinked 0x0` |
+| **corroborated** | this code's reader and a native tool agree about the same field | `xfs_db`'s inobt dump and `chunks_in_order` |
+| **derived** | arithmetic over measured quantities | the nine extents a 256-byte inode holds |
+| **inference** | a conclusion from documented behaviour, with no experiment behind it | that an unmeasured transition behaves like a measured one |
+| **instrument** | a hand parser, for exploring | the throwaway walker this document used to cite |
+
+### The audit
+
+Each numerical claim in this document, what it rests on, and where it now stands.
+
+| claim | level | independent confirmation | status |
+|:------|:------|:-----------------------|:-------|
+| `agf_freeblks` is the bno tree's record total | tool | `xfs_db`'s `blockget` walk counts 90277 free blocks in the by-block tree, and the headers sum to 90277 | **confirmed** |
+| both free space trees hold the same free blocks | tool | the same walk counts 90277 in each of `free1` and `free2` | **confirmed** |
+| `agf_btreeblks` is the trees' blocks less two roots | tool | the walk finds 333 tree nodes and the headers charge 325, which is 333 − 2 roots in each of 4 groups | **confirmed** |
+| `sb_fdblocks` is the three terms summed | tool | 90277 + 325 + 22 = 90624, all from `xfs_db`, on all three images | **confirmed** |
+| AGFL blocks are not in the free space trees | corroborated | the walk's `freelist` label and its `free1`/`free2` labels are disjoint | **confirmed** |
+| the live window is a slice that does not start at zero | tool | `xfs_db` prints `flfirst = 85` for `xfsv4.img` group 1 | **confirmed** |
+| a non-root leaf needs 31 records, a root leaf none | tool | repair's `bad btree nrecs (30, min=31, max=62)`, and silence for a root | **confirmed** |
+| `next_unlinked` is at offset 96 and holds `0xffffffff` | tool | repair names the field; its offset found by writing a value at each offset and asking which it read | **confirmed** |
+| `startino` is counted from the group | tool | repair accepts below `153600 × 2` and refuses at or above it | **confirmed** |
+| a 256-byte inode holds nine extents | derived + tool | `(256 − 100) / 16`, and nine sparse writes succeed before the tenth is refused | **confirmed** |
+| the free slots of a new chunk: magic, version, `next_unlinked` | tool | repair's complaints, item by item | **repair-validated only** |
+| — the *version* XFS picks for a new chunk's slots | inference | none: no image here has a chunk XFS created | **unmeasured** |
+| AGFL → ordinary free space | — | none: no `mkfs.xfs` image has consumed a list entry | **unmeasured**, and may not exist |
+| root collapse | — | unreachable, so nothing to confirm | **not written** |
+
+Two rows are worth dwelling on, because they are the difference between "this is
+how it works" and "this is how it happens to work here":
+
+* **The free slots of a new chunk are repair-validated, not confirmed.**  Repair
+  says what it will accept, and the layout here is what it accepts.  That is not
+  the same as knowing it is what XFS writes, because no chunk in any image in
+  this repository was created by an operation anyone here can watch.  The version
+  in particular is a choice — 2 for a 256-byte inode, 3 for a larger one — taken
+  from `xfs_db`'s report of the inodes these images already hold.
+
+* **"AGFL → ordinary free space" may not be a transition at all.**  Every image
+  `mkfs.xfs` produced here has never consumed a list entry, so there is nothing
+  to observe; and the one image that has consumed entries is hand-built.  The
+  honest position is that a block leaving the list becomes a node, which is what
+  62 of 84 consumed slots in `xfsv4.img` group 1 name.
+
+### What the audit changed
+
+* The identity and both of its component claims moved from "measured" to
+  **confirmed**, on the evidence of `xfs_db`'s own block walk rather than a
+  parser.  `blockget -v -s` labels every block in a file system with what owns
+  it, and three of those labels are the three terms, so the whole identity is now
+  arithmetic on numbers `xfs_db` produced.
+* `RawDinode::unused` no longer describes itself as "a slot that has never been
+  used".  It is a zeroed buffer for building an inode in; a free inode's *state*
+  is recorded by the tree of used inode numbers and not by its bytes, and this
+  repository's images show its bytes are not zero.
+* One trap named: the third term is the group header's **free list** count
+  (`flcount`), and the field beside it with a similar name, `agi freecount`, is
+  the group's *free inodes*, which on `xfsv4.img` sums to 2824.  Reading that one
+  gives 2824 where the identity wants 22, and it looks exactly like the identity
+  being wrong.
+
+---
+
 ## Measured invariants
 
 Everything in this section was established by reading images produced by
-`mkfs.xfs` or shipped in `resources/`, and by letting `xfs_repair` rebuild
-them.  The instrument was a small independent parser
-(superblock → group header → free-space B+trees) written from the published
-on-disk format; it shares no code with `xfuse` and none with `xfsprogs`.  Where
-a number is quoted it is the number the tool or the image gave.
+`mkfs.xfs` or shipped in `resources/`, and by letting `xfs_repair` rebuild them.
+The numbers are quoted from a native tool wherever one can be asked -- see
+[How strong each measurement is](#how-strong-each-measurement-is-and-how-to-read-one)
+for what stands behind each one and what does not.
 
 ### `agf_freeblks` is exactly the sum of the bno tree's records
 
@@ -565,6 +641,12 @@ Concretely, in order:
    shorter gives its blocks back, and `xfs_repair -n` accepts the image, which is
    the first operation here judged end to end on a file the rest of the file
    system can still find.
+
+   The extent boundary in front of the first is pinned rather than crossed: a file
+   needing a tenth extent is refused with `ENOSYS`, and the layout of a fresh
+   chunk's slots is repair-validated but not confirmed against a chunk XFS made.
+   Both are rows in the
+   [audit](#how-strong-each-measurement-is-and-how-to-read-one).
 
    Two things it found, both of them things a shorter file gets wrong quietly:
 

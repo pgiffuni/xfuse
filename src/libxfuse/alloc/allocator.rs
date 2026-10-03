@@ -3896,6 +3896,159 @@ mod t {
         assert!(checked > 0, "no image was unpacked, so nothing was checked");
     }
 
+    /// The three-term identity, re-derived from `xfs_db`'s own block walk.
+    ///
+    /// This exists because every other statement of the identity in this file was
+    /// first read with a hand-written parser, and that parser was then found to be
+    /// reading out of bounds and inventing plausible-looking numbers about free
+    /// inode slots.  A hand parser is an instrument, not a specification, so the
+    /// claim needs a reader that is neither it nor this code.
+    ///
+    /// `xfs_db -c 'blockget -v -s'` walks **every** block in the file system and
+    /// labels it with what owns it.  Three of those labels are the three terms:
+    ///
+    /// ```text
+    /// free1     one block per record in the by-block free space tree
+    /// free2     one block per record in the by-length one
+    /// btbno     a node of the by-block free space tree
+    /// btcnt     a node of the by-length one
+    /// freelist  a block reserved on a group's free list
+    /// ```
+    ///
+    /// so on `xfsv4.img` it reports 90277 and 90277 free blocks, 333 free space
+    /// tree nodes and 22 reserved list entries.  The group headers, read
+    /// separately by `xfs_db`, report 90277 free blocks, `btreeblks` totalling
+    /// 325 and 22 live list entries -- so the tree nodes are the 325 plus two
+    /// roots per group, and 90277 + 325 + 22 is the superblock's 90624.
+    ///
+    /// Every number in that paragraph comes from `xfs_db`.  None comes from this
+    /// code's reader, and none from a parser written for the purpose.
+    #[test]
+    fn the_three_terms_re_derived_from_xfs_db_add_up_to_the_superblock() {
+        if !have_xfs_db() {
+            eprintln!("skipping: no xfs_db to walk the image with");
+            return;
+        }
+        let mut checked = 0usize;
+        for name in ["xfsv4.img", "xfs_writable.img", "xfs_4kn.img"] {
+            let Some(path) = crate::libxfuse::alloc::golden(name) else {
+                eprintln!("skipping {name}: not unpacked");
+                continue;
+            };
+            let sb = sb_of(&path);
+
+            // What `xfs_db`'s own walk says, tallied by what owns each block.
+            let out = xfs_db(&path, &["blockget -v -s"]);
+            let mut free_by_block = 0u64;
+            let mut free_by_length = 0u64;
+            let mut tree_nodes = 0u64;
+            let mut listed = 0u64;
+            for line in out.lines() {
+                let Some(label) = line.split(" to ").nth(1).map(|l| l.trim()) else {
+                    continue;
+                };
+                match label {
+                    "free1" => free_by_block += 1,
+                    "free2" => free_by_length += 1,
+                    "btbno" | "btcnt" => tree_nodes += 1,
+                    "freelist" => listed += 1,
+                    _ => {}
+                }
+            }
+            assert!(
+                free_by_block > 0,
+                "{name}: xfs_db's walk labelled no free blocks"
+            );
+
+            // And what the group headers say, read by the same tool.
+            //
+            // The third term is the group header's **free list** count, and the
+            // field next to it with a similar name is not that: `agi freecount`
+            // is the group's *free inodes*, which on `xfsv4.img` sums to 2824 --
+            // the superblock's `sb_ifree`, a different quantity entirely.  Reading
+            // that one here gives 2824 where the identity wants 22, and it is the
+            // kind of mistake that looks like the identity being wrong.
+            let (mut free, mut btree, mut list_entries) = (0u64, 0u64, 0u64);
+            for agno in 0..sb.agcount() {
+                let header = xfs_db(&path, &[&format!("agf {agno}"), "p freeblks btreeblks"]);
+                free += field(&header, "freeblks");
+                btree += field(&header, "btreeblks");
+                let header = xfs_db(&path, &[&format!("agf {agno}"), "p flcount"]);
+                list_entries += field(&header, "flcount");
+            }
+            let fdblocks = field(&xfs_db(&path, &["sb 0", "p fdblocks"]), "fdblocks");
+
+            assert_eq!(
+                free_by_block, free,
+                "{name}: xfs_db's walk and the group headers disagree about free blocks"
+            );
+            assert_eq!(
+                free_by_length, free,
+                "{name}: the two free space trees do not hold the same free blocks"
+            );
+            assert_eq!(
+                tree_nodes,
+                btree + 2 * u64::from(sb.agcount()),
+                "{name}: the free space trees hold {} nodes and the headers charge {} for them, \\
+                 less two roots in each of {} groups",
+                tree_nodes,
+                btree,
+                sb.agcount()
+            );
+            assert_eq!(
+                listed, list_entries,
+                "{name}: the reserved free list entries and the headers' counts disagree"
+            );
+            assert_eq!(
+                free + btree + list_entries,
+                fdblocks,
+                "{name}: the superblock's free count is not the groups' three terms"
+            );
+            eprintln!(
+                "{name}: xfs_db says free {free} + tree nodes {tree_nodes} ({btree} charged) + \\
+                 listed {listed} = {} (sb_fdblocks {fdblocks})",
+                free + btree + list_entries
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no image was unpacked, so nothing was checked");
+    }
+
+    /// Run `xfs_db` over an image and give back what it printed.
+    fn xfs_db(image: &std::path::Path, commands: &[&str]) -> String {
+        let mut cmd = std::process::Command::new("xfs_db");
+        for c in commands {
+            cmd.arg("-c").arg(c);
+        }
+        let out = cmd.arg(image).output().expect("xfs_db");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
+
+    /// One `name = value` out of what `xfs_db` printed.
+    fn field(text: &str, name: &str) -> u64 {
+        text.lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once('=')?;
+                (k.trim() == name).then(|| {
+                    v.trim().parse::<u64>().unwrap_or_else(|_| {
+                        panic!("xfs_db printed {name} as {v:?}, which is not a number:\n{text}")
+                    })
+                })
+            })
+            .unwrap_or_else(|| panic!("xfs_db did not print {name}:\n{text}"))
+    }
+
+    /// Whether `xfs_db` is here, for the checks that cannot be done without it.
+    fn have_xfs_db() -> bool {
+        std::process::Command::new("xfs_db")
+            .arg("-V")
+            .output()
+            .is_ok()
+    }
     /// The occupancy a free space leaf has to keep, measured rather than
     /// inferred from the B+tree literature.
     ///
