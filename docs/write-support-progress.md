@@ -1370,13 +1370,35 @@ with `called Option::unwrap() on a None value` — in code that panics, on a
 structure a caller supplied, inside a program whose whole job is reading images it
 did not write.
 
-That is worth two things.  The first is that the panic is a real robustness defect
-whatever the test says: `SUPERBLOCK.get()` on a path reachable only after a
-successful `Volume::open` is defensible, but a reader that cannot say "I do not know
-this file system's layout" and must therefore crash is not.  The second is
-practical: **the directory readers here can only be exercised through an opened
-volume**, which in practice means through a mount, so `create` has to be developed
-at that level rather than against a hand-opened image.
+The panic is a real robustness defect whatever the test says, and it is now fixed:
+`SUPERBLOCK.get().unwrap()` appeared at **nine** places, and each one turned "nobody
+opened an image in this process" into a crash inside a program whose whole job is
+reading images other people wrote.  Every one of them that has a way to report an
+error now has one.  `try_superblock()` returns `ENODEV` where the function speaks
+`errno`, and a decode error where it speaks `DecodeError` -- `ENODEV` rather than
+`EUCLEAN`, because there is no device and no image and the file system has not done
+anything wrong.
+
+Three calls remain, and each is there because the function has **no error channel
+at all**, which is worth listing rather than leaving as an audit finding:
+
+* `Dir2Leaf`'s hash-collision iterator's `next`, a trait method returning
+  `Option`.  Returning `None` would end the iteration and **silently drop every
+  entry after a collision**, which is worse than stopping and the one outcome a
+  directory reader must not have.  Fixing it means giving the iterator a fallible
+  shape and propagating, which touches every implementor.
+* `AttrLeafNameRemote::value`, which returns `&[u8]` and already unwraps its seek,
+  its decode and its read.  The same shape of work.
+* two tests, which install the superblock themselves and can rely on it.
+
+So the rule is: **a decoder that cannot report an error may not have one invented
+for it, and where the signature prevents reporting, that is a defect in the
+signature.**
+
+The other half is practical and unchanged: **the directory readers here can only be
+exercised through an opened volume**, which in practice means through a mount, so
+`create` has to be developed at that level rather than against a hand-opened
+image.
 
 ### An inode's mode field carries the file type, and `xfs_repair` checks it
 
