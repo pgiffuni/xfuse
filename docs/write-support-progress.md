@@ -1494,8 +1494,39 @@ in the test as well, because pairing a name with the offset it was asked for
 rather than the one it was given makes every length wrong for the wrong name --
 which is a test that would have failed for a reason nobody could read.
 
-So `create` now has all three of its prerequisites measured: an inode to point at, a
-directory with room, and a byte-exact entry layout.
+And the two trailers the same block carries, read straight from the image rather
+than through the parser, so this cross-checks the parser instead of agreeing with
+it:
+
+```text
+magic 0x58443242 ("XD2B", the dir2 block magic)
+tail, at the end of the block: 14 hash entries, 0 stale bytes
+hash index, immediately before the tail: starts at 3976, sorted by hash
+
+(46, 2) (5934, 4) (14822, 6) (228159718, 11) (232518245, 13) (513620661, 35)
+(765194733, 8) (1314484644, 18) (1550402724, 15) (1832596213, 32)
+(2625413939, 26) (3289751233, 21) (3443242485, 38) (3698677803, 29)
+```
+
+Every one of those addresses is a data entry's offset **in units of eight** --
+which is how `get_addresses` turns one back into an offset, and is what makes this
+a check of the two halves against each other rather than a second reading of one.
+Fourteen entries for fourteen names, the index sorted, every name pointed at, and
+the tail's count agreeing with both.
+
+Which is what a writer has to satisfy, and it gives the block's shape precisely:
+
+* the data entries are written **upwards** from after the header and the hash
+  index;
+* the hash index is written **downwards** from the tail, so adding a name to it
+  means shifting the entries after the insertion point down by eight bytes;
+* and the room between them is what makes that possible.  The last data entry ends
+  at 424 and the index starts at 3976, so there are **3552 bytes free** between
+  them.
+
+So `create` now has every prerequisite measured: an inode to point at, a directory
+with room, a byte-exact entry layout, and the index and the count it has to
+maintain.
 
 Reading it at all needed `SUPERBLOCK` installed, which is not a detail:
 
