@@ -822,6 +822,38 @@ this code has no b-map block decoder at all, so even a spill that wrote a
 well-formed leaf could not read the file back.  Neither is written, deliberately —
 a second b-tree that cannot be read is the kind of thing that should not land.
 
+### A real b-tree data fork exists in `xfsv4.img`, and neither this code nor `xfs_db` can decode its blocks
+
+The next thing in order is a file whose extents no longer fit in its inode.  The
+format's answer is a b-tree rooted in the inode, and that turns out to be
+*reachable* rather than hypothetical: `xfsv4.img` has three regular files whose
+data fork is a b-tree, and one of them is small enough to read comfortably.
+
+```text
+inode 100553  mode 0100644 fmt btree  nex 64  nblk 67  sz 32768
+              u.bmbt.level = 1   u.bmbt.numrecs = 3
+              u.bmbt.keys[1-3] = [startoff]   1:[0]  2:[30]  3:[45]
+              u.bmbt.ptrs[1-3] = 1:50313  2:50315  3:50317
+```
+
+So the **fork** layout is settled by `xfs_db`'s own print of a real inode and
+agrees with what this code decodes: a level, a record count, that many keys, and
+that many pointers.  That much is confirmed.
+
+The **block** layout is not, and the reason is worth recording: **`xfs_db` has no
+b-map block reader either.**  Its type list has `attr`, `bnobt` and `inobt` but
+nothing for a file mapping tree; asked to dump one of those blocks it answers
+`no current type`, and asked to `btdump` it says `type "data" is not a btree type
+or inode`.  So the tool that reads every other structure here cannot show the
+records inside a b-map block, and the layout has to be established the way
+everything else in this document now is: build one and ask `xfs_repair`.
+
+Also worth knowing before anyone tries: the b-tree path in this code is not only a
+*writer*.  `BtreeBlockHdr` has no notion of a b-map block, `DiU::Bmbt` is built
+for a fork header rather than for a node's records, and `ExtentMap`'s b-tree arm
+has no way to fetch a leaf.  So a spill is reader-then-writer, in that order, and
+the reader is a milestone of its own rather than a detail of the writer.
+
 ### Every directory in these images is in *local* format
 
 `xfs_db` on `xfsv4.img` reports `/files` with `core.format = 1 (local)`, and the

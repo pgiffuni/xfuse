@@ -211,7 +211,7 @@ pub static GOLDEN_ATTRV1: LazyLock<PathBuf> = LazyLock::new(|| prepare_image("xf
 /// The golden images are shared by every test in the binary, so a test that
 /// writes must never touch the original.  The copy is made in the target
 /// directory, and its name says where it came from.
-pub fn writable_copy(golden: &std::path::Path, tag: &str) -> PathBuf {
+pub fn writable_copy(golden: &std::path::Path, tag: &str) -> WritableCopy {
     let name = golden.file_name().expect("golden image has a name");
     let mut copy = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     copy.push(format!(
@@ -222,7 +222,52 @@ pub fn writable_copy(golden: &std::path::Path, tag: &str) -> PathBuf {
     // Start from the golden image every time, so that a failed test cannot
     // leave a half-written image behind for the next one.
     fs::copy(golden, &copy).expect("copying the golden image");
-    copy
+    WritableCopy { path: copy }
+}
+
+/// A writable copy of a golden image, deleted when it goes out of scope.
+///
+/// This used to be a bare `PathBuf`, and that was a leak worth 129 gigabytes:
+/// nothing ever removed the copies, so every run of every test left one behind,
+/// and `CARGO_TARGET_TMPDIR` accumulated 1656 of them across images that are up
+/// to 300 MiB each.  A path has no way to say when it is finished with, and no
+/// caller was going to remember.
+///
+/// So the copy owns itself.  It derefs to a path, so `&image` and `image.path()`
+/// keep working unchanged at every call site, and it removes the file when it is
+/// dropped -- including when a test panics, which is when a leaked image is
+/// least wanted.
+#[derive(Debug)]
+pub struct WritableCopy {
+    path: PathBuf,
+}
+
+impl std::ops::Deref for WritableCopy {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for WritableCopy {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for WritableCopy {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.path.as_os_str()
+    }
+}
+
+impl Drop for WritableCopy {
+    fn drop(&mut self) {
+        // Best effort: a file that cannot be removed is not worth failing a test
+        // that has already passed, and `cargo clean` will still get it.
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
