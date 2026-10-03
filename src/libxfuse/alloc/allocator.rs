@@ -1401,10 +1401,11 @@ mod t {
             },
             inobt::{chunks_in_order, InobtNode, INODES_PER_CHUNK},
         },
+        attr::Attr,
         block_cache::BlockCache,
         block_device::{Access, BlockDevice},
         btree::BmbtLeafBlock,
-        dinode::{DiU, Dinode},
+        dinode::{DiA, DiU, Dinode},
         dinode_core::XfsDinodeFmt,
         dir3::{Dir2DataEntry, Dir3},
         dir3_block::Dir2Block,
@@ -3942,6 +3943,127 @@ mod t {
         );
     }
 
+    /// Which files in the golden image have a b-tree attribute fork.
+    ///
+    /// FreeBSD's `tests/integration.rs` panics in `AttrBtree::new` on the btree
+    /// attribute layouts -- `getextattr::enoattr::case_4_btree2`,
+    /// `case_5_btree2_5`, `dev::metadata::case_4_v4` -- with an
+    /// `Option::unwrap()` on `None`, which means `map_block` was handed logical
+    /// block 0 and reported a hole.  Those tests are FreeBSD-only, so this walks
+    /// the image on Linux instead, which is where it can be debugged.
+    ///
+    /// The files are named for their layouts in the FreeBSD suite, and the scan is
+    /// how the right one is found rather than assumed: a file named `btree2.2` has
+    /// no attributes at all, so the name is a hint rather than the answer.
+    /// The one file in the golden image with attributes, and why they are lost.
+    ///
+    /// FreeBSD's `tests/integration.rs` panics in `AttrBtree::new` on the btree
+    /// attribute layouts -- `getextattr::enoattr::case_4_btree2`,
+    /// `case_5_btree2_5`, `dev::metadata::case_4_v4` -- with an `Option::unwrap()`
+    /// on `None`, which means `map_block` was handed logical block 0 and reported a
+    /// hole.  Those tests are FreeBSD-only, so this is the same code on Linux, where
+    /// it can be looked at.
+    ///
+    /// **This is a characterisation, not a statement of intent.**  It pins what the
+    /// image and the code actually do, because they disagree in a way that is
+    /// visible and not yet fixed:
+    ///
+    /// * of the fourteen entries in the root of `xfsv4.img`, exactly one -- `links`
+    ///   -- has any attribute fork at all;
+    /// * that fork decodes as a **single block** (`di_aformat` says block form) --
+    ///   and the code reads a count of records out of the *inode*, which is
+    ///   `di_anextents`, and for block form that is **zero**, because `di_anextents`
+    ///   counts shortform entries only;
+    /// * so the fork decodes as an **empty** one, `get_attrs` sees `anextents == 0`
+    ///   and returns none, and the file's attributes are silently not read at all.
+    ///
+    /// The names in the FreeBSD suite are a hint and a misleading one: `btree2.2`
+    /// has no attributes whatsoever.  The panic there is in the same place --
+    /// an attribute fork that is not there, decoded as something, and then read --
+    /// so this is very likely the same defect seen from the other side.  It is not
+    /// *caused* by the `assert!`-to-`return Err` change in `map_block`, which can
+    /// only turn a panic into an error and cannot turn success into a hole.
+    #[test]
+    fn the_one_file_with_attributes_loses_them() {
+        let Some(image) = copy_of_golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img to copy");
+            return;
+        };
+        let sb = sb_of(image.path());
+        crate::libxfuse::volume::SUPERBLOCK.get_or_init(|| sb.clone());
+
+        let names: Vec<(String, u64)> = {
+            let mut reader = std::io::BufReader::new(std::fs::File::open(image.path()).unwrap());
+            let mut root = Dinode::from(&mut reader, &sb, 32);
+            let mut dir = root.get_dir(&mut reader, &sb).clone();
+            let mut out = Vec::new();
+            let mut off = 0i64;
+            loop {
+                match dir.next(&mut reader, &sb, off) {
+                    Ok((i, next, _, name)) => {
+                        out.push((name.to_string_lossy().into_owned(), i));
+                        if next < 0 {
+                            break;
+                        }
+                        off = next;
+                    }
+                    Err(e) => {
+                        eprintln!("listing the root stopped: {e}");
+                        break;
+                    }
+                }
+            }
+            out
+        };
+
+        let mut with_attrs = Vec::new();
+        for (name, ino) in &names {
+            let mut reader = std::io::BufReader::new(std::fs::File::open(image.path()).unwrap());
+            let inode = Dinode::from(&mut reader, &sb, *ino);
+            let kind = match &inode.di_a {
+                None => "none",
+                Some(DiA::Attrsf(_)) => "shortform",
+                Some(DiA::Abmx(_)) => "one block",
+                Some(DiA::Abmbt(_)) => "b-tree, root in the inode",
+            };
+            if kind != "none" {
+                with_attrs.push((name.clone(), *ino, kind));
+                eprintln!(
+                    "{name} (inode {ino}): attribute fork is {kind}, anextents {}",
+                    inode.di_core.anextents
+                );
+            }
+        }
+        assert_eq!(
+            with_attrs.len(),
+            1,
+            "the image is supposed to have exactly one file with an attribute fork; it has \
+             {with_attrs:?}"
+        );
+
+        // The fork the inode claims, and the one the code ends up with.
+        let (name, ino, kind) = with_attrs[0].clone();
+        let mut reader = std::io::BufReader::new(std::fs::File::open(image.path()).unwrap());
+        let mut inode = Dinode::from(&mut reader, &sb, ino);
+        assert_eq!(kind, "one block", "{name}'s attribute fork changed shape");
+        assert_eq!(
+            inode.di_core.anextents, 0,
+            "{name} suddenly has shortform attribute entries, which would mean the fork is not \
+             the block form this test is characterising"
+        );
+
+        // And so the attributes are not read, which is the defect.
+        assert!(
+            inode.get_attrs(&mut reader, &sb).is_none(),
+            "the empty attribute fork is no longer silently dropped; this test and AttrBtree::new \
+             both need revisiting"
+        );
+        eprintln!(
+            "{name} (inode {ino}) has an attribute block that is never read, because the record \
+             count comes from the inode and the inode has none"
+        );
+    }
+
     /// What a *free* inode's slot looks like on disk, read out of a real image.
     ///
     /// The write-support plan's rule is that inode availability comes from the
@@ -4216,6 +4338,10 @@ mod t {
     #[test]
     fn the_three_terms_re_derived_from_xfs_db_add_up_to_the_superblock() {
         if !have_xfs_db() {
+            crate::libxfuse::alloc::require_oracle("xfs_db", "xfsprogs");
+            crate::libxfuse::alloc::skipped_oracle_check(
+                "the group accounting, re-derived from xfs_db's own block walk",
+            );
             eprintln!("skipping: no xfs_db to walk the image with");
             return;
         }
@@ -4310,7 +4436,10 @@ mod t {
         for c in commands {
             cmd.arg("-c").arg(c);
         }
-        let out = cmd.arg(image).output().expect("xfs_db");
+        let Ok(out) = cmd.arg(image).output() else {
+            eprintln!("skipping: xfs_db would not run");
+            return String::new();
+        };
         format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
@@ -4348,10 +4477,7 @@ mod t {
 
     /// Whether `xfs_db` is here, for the checks that cannot be done without it.
     fn have_xfs_db() -> bool {
-        std::process::Command::new("xfs_db")
-            .arg("-V")
-            .output()
-            .is_ok()
+        crate::libxfuse::alloc::have_xfs_db()
     }
     /// What XFS does with a free list that is already full.
     ///
@@ -4888,6 +5014,19 @@ mod t {
     /// else in this document is settled.
     #[test]
     fn a_files_btree_fork_decodes_the_same_here_as_in_xfs_db() {
+        // This one *needs* `xfs_db`: it exists to check that this code and the
+        // tool agree, which is worth nothing without both.  Say so and skip loudly
+        // rather than `expect`ing a program that may not be installed -- a test
+        // that assumes its oracle exists fails on the machines that lack it, which
+        // is the opposite of what a skip is for.
+        if !crate::libxfuse::alloc::have_xfs_db() {
+            crate::libxfuse::alloc::require_oracle("xfs_db", "xfsprogs");
+            crate::libxfuse::alloc::skipped_oracle_check(
+                "that this code and xfs_db agree about a b-tree fork",
+            );
+            eprintln!("skipping: no xfs_db to compare against");
+            return;
+        }
         let Some(path) = crate::libxfuse::alloc::golden("xfsv4.img") else {
             eprintln!("skipping: no unpacked xfsv4.img");
             return;
