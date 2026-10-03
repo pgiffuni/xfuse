@@ -140,10 +140,25 @@ pub const BMBT_RECORD_LEN: usize = 16;
 ///   four-byte words.  Perturbing the word at 24 changes entry 0 of the leaf,
 ///   the word at 40 changes entry 1, and so on up to entry 4 — which is what fixes
 ///   the stride, since any other arrangement would put two entries in one word.
-/// * two of the four words ascend from record to record: the second
-///   (`00000200, 00000400, 00000600, …`) and the fourth
-///   (`91000001, 91400001, 91800001, …`).  The first and third are constant across
-///   records: `00000000` and `00000018`.
+/// * the **second word is the extent's file offset in bytes**.  Read across all three
+///   leaves of inode 100553 it runs 0 to 32256 for a 32768-byte file, one entry per
+///   512-byte block, with no break at a leaf boundary — which is `xfs_repair`'s
+///   printed offsets 0, 1, 2, 3 after a division by the block size.  So the
+///   *record* is in bytes and the *diagnostic* is in blocks, and a reader that took
+///   the printed form for the stored one would be out by a factor of the block
+///   size.
+/// * the **fourth word is `(entry << 16) | length in blocks`**: its low half is 1 in
+///   every record of every leaf, and the extents are one block each; its high half
+///   counts entries, 0x9100 through 0xa0c0 over the sixty-four extents of that file,
+///   continuing across leaf boundaries.  A block number would not survive a leaf
+///   boundary like that.
+/// * the first and third words are constant across every record: `00000000` and
+///   `00000018`.
+///
+/// **So the record does not hold the extent's data block.**  That is the finding
+/// that closes this search rather than narrowing it: there is nothing else in a
+/// record to read, and `xfs_repair` can still name a block for every entry, so the
+/// block comes from somewhere this has not looked.
 /// * the **second word is the extent's file offset, in bytes**: it reads
 ///   `0, 512, 1024, 1536` across the first four records, which are the entries
 ///   `xfs_repair` prints as offsets `0, 1, 2, 3` — the same numbers, and repair
@@ -151,13 +166,12 @@ pub const BMBT_RECORD_LEN: usize = 16;
 ///   which is a distinction worth keeping: a reader that took the printed form for
 ///   the stored one would be out by a factor of the block size.
 ///
-/// So the words are [`words[0..4]`](BmbtLeafRecord::words): the second is the
-/// file offset in bytes.  The first and third are constant across records
-/// (`00000000` and `00000018`), and the fourth ascends by `0x400000` — none of
-/// which is an extent's data block, so where that lives is the next thing to
-/// settle.  A record decoded as `[o s c]` in the notation's order reads
-/// `0, 0, 24` where repair prints `0, 50312, 1`, which is how the order was found
-/// to be wrong rather than merely unexamined.
+/// So the words are [`words[0..4]`](BmbtLeafRecord::words), the second is the
+/// file offset in bytes, the fourth carries the entry counter and the length, and
+/// the data block is not among them.  A record decoded as `[o s c]` in the
+/// notation's order reads `0, 0, 24` where repair prints `0, 50312, 1`, which is how
+/// the order was found to be wrong rather than merely unexamined — and, having been
+/// read in the notation's order, where the block went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BmbtLeafRecord {
     pub words: [u32; 4],
