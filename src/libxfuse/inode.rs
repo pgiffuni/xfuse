@@ -218,13 +218,26 @@ impl RawDinode {
     }
 
     /// Take ownership of an inode's bytes.
-    /// A slot of the right size that no file system has written into.
+    /// A zeroed buffer the size of an inode, for building a new one in.
     ///
-    /// Not an inode: it has no magic and no version, so reading it back is an
-    /// error, which is the point.  It is what an allocator starts from when the
-    /// tree has said an inode is free and the slot turns out to hold nothing, and
-    /// every field that is not set on it is then zero rather than inherited from
-    /// whatever used to be there.
+    /// **This is not a description of a free inode on disk, and must not be read
+    /// as one.**  Two different things were being confused here:
+    ///
+    /// * this function: an in-memory buffer every field of which is zero, so that
+    ///   an allocator starts from a known state rather than from whatever a slot
+    ///   used to hold;
+    ///
+    /// * a free inode in an existing file system: whose allocatable state is
+    ///   recorded by the group's tree of used inode numbers and **not** by its
+    ///   bytes.  Its slot on disk must not be assumed to be zero, and on these
+    ///   images it is not -- `xfs_repair -n` asks for an inode magic, a version
+    ///   and a `next_unlinked` of `0xffffffff`, and complains
+    ///   (`bad magic number 0x0`, `bad next_unlinked 0x0`) when a fresh chunk's
+    ///   slots are written as zeroes.
+    ///
+    /// So reading it back is an error, which is the point: a caller that wants to
+    /// know whether a slot holds an inode must ask, and the only answer is the
+    /// tree.
     pub fn unused(inode_size: usize) -> Self {
         RawDinode {
             bytes:   vec![0u8; inode_size].into_boxed_slice(),
