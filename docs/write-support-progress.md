@@ -987,12 +987,38 @@ that is demonstrably a composite is exactly the failure mode this document now
 exists to prevent: a plausible answer, assembled from the wrong pieces, that would
 have become an implementation.
 
-What the next person has: the setup recipe, the verification that makes it
-trustworthy, six ruled-out candidates, the confirmed fact that the start is at
-offset 24, and the observation that the reported block number is composite.  What
-is needed next is one more perturbation that isolates a single field -- changing
-*only* the low bytes of offset 16, for instance -- so that repair's composite can
-be taken apart rather than guessed at.
+That isolation step was then taken, and it is the real advance of this line.
+Perturbing the *pristine* leaves one eight-byte field at a time:
+
+```text
+offset 12 -> 777777:  no extent complaint      (a sibling field, not a record)
+offset 20 -> 777777:  correcting nextents only
+offset 28 -> 777777:  bad extent starting block number 1592888456, offset 0
+offset 36 -> 777777:  zero length extent (off = 0, fsbno = 49152)
+offset 44 -> 777777:  no extent complaint
+```
+
+Two things follow, and the second is the one worth having:
+
+* **The reported block number is a composite**, and the probes show which bytes go
+  into it: patching the low half of offset 32's field turns
+  `0x188000000c488` into `1592888456`, and patching the high half turns it into
+  `49152`.  Both changes move the reported number, and both leave the extent's
+  *start* at 0 — so the field at offset 32 participates in the number repair reports
+  without being a block number itself.
+* **Perturbing a pristine leaf reaches the record; constructing a new one does
+  not.**  That is the methodological correction, and it is why six constructed
+  candidates said nothing: they were not being read, and a table of their refusals
+  would have read as evidence about the format when it was evidence about the
+  construction.  Perturbing something the file system already accepts removes that
+  entire class of mistake, because the only difference is the field under test.
+
+So the next person has: the setup recipe; the verification that makes it
+trustworthy; six ruled-out candidates *and why they were uninformative*; the start
+confirmed at offset 24; offsets 12 and 44 excluded; offset 20 and the two halves
+of offset 32 identified as feeding a composite that repair calls a block number;
+and a method — perturb what is already accepted — that produces answers on the
+first try where building produced none.
 
 ### The attempt that failed, and why it is worth writing down
 
