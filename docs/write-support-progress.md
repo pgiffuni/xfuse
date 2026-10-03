@@ -258,7 +258,8 @@ Each numerical claim in this document, what it rests on, and where it now stands
 | the "starting block number" repair reports is composite | tool | the low half of offset 32 changes it to `1592888456` and the high half to `49152`; neither is any byte range | **confirmed** |
 | a b-map extent's *length* is at offset 32 | tool | patching it moves repair's reported start and end, which is what a length does | **confirmed** |
 | offsets 16 and 44 hold no validated field | tool | an unmistakable value at either produces no extent complaint | **confirmed** |
-| the b-map extent's block number: where it is | — | excluded from offsets 16, 24, 32 and 40; so the record is wider than 16 bytes or the block follows the start and length | **unmeasured, narrowed** |
+| a b-map record's *size* | — | starts are 16 bytes apart, which no record holding a block can be; the bytes beside them cannot be a length | **the stride is not the record size** |
+| the b-map extent's block number: where it is | — | excluded from offsets 16, 24, 32 and 40 | **unmeasured, narrowed** |
 | root collapse | — | unreachable, so nothing to confirm | **not written** |
 
 **Two rows are still open**, and both are the difference between "this is how it
@@ -1115,23 +1116,42 @@ Read as attributions rather than as numbers:
 * **Offset 24 is the extent's start, in bytes** — confirmed earlier, and confirmed
   again here: 777777 / 512 is the 1519 it reported.
 * **Offset 32 is not a block number.**  Patching it moves the reported *start* and
-  *end*, which is what a length does and is not what a block does.  So the extent's
-  length lives there.
+  *end*, which is what a length does and is not what a block does.
 * **Offset 40 behaves like a start**, giving the same shape of message as offset 24
   with the composite differing by two.
 
-Which leaves the one thing still open, and it is now a narrow question rather than
-a broad one: **the block number is at none of offsets 16, 24, 32 or 40.**  For a
-16-byte record starting at 24 that is impossible — those four bytes are two whole
-fields — so either the record is wider than 16 bytes, or the block number follows
-the start and length rather than sitting between them.  Perturbing offset 48 and
-beyond, and checking whether the composite moves at all, separates those two.
+**And the stride does not fit, which is the sharpest thing in this whole line.**
+Starts appear every sixteen bytes, so a sixteen-byte record would be
+`{start, length}` and would hold **no block number at all** — which no mapping
+record can do.  Either the record is *narrower* than sixteen bytes and the
+ascending values belong to consecutive records with something else between them, or
+it is sixteen bytes and the block number lives somewhere this has not looked.
+
+The eight bytes beside the starts are the lever, and they are the clue.  In the
+pristine leaves they are
+
+```text
+0x0000001891000001   0x0000001891400001   0x0000001891800001
+```
+
+— a high half that never changes and a low half that steps by four — and **no
+reading of them is a length of a 32 KiB file.**  A record whose second field cannot
+be a length is not a `{start, length}` record, which means the sixteen-byte stride
+is not the record size.  The earlier reading of this line, which called them
+lengths, was wrong for exactly that reason, and the wrongness was in the data the
+whole time.
+
+So the next probe is cheap and specific: **read offsets 32, 48 and 64 as three
+separate four-byte fields and perturb each one**, rather than as one 64-bit value.
+One of them moving the reported end while another moves nothing would make the
+record twelve bytes and settle it.
 
 So the next person has: the setup recipe; the verification that makes it
 trustworthy; six ruled-out candidates *and why they were uninformative*; the start
-at offset 24; the length at offset 32; offset 16 and 44 excluded as fields; and a
-single well-posed question left — where the block number is — with the next probe
-named.
+at offset 24; offsets 16, 32, 40 and 44 each attributed to what repair reports;
+and three negative results that each close a reading — the stride is not the record
+size, the bytes beside a start are not a length, and the block number is at none
+of 16, 24, 32 or 40 — with the probe that decides between them named.
 
 ### The attempt that failed, and why it is worth writing down
 
