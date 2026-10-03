@@ -653,6 +653,60 @@ The substrate exists and is repair-clean: `xfs_writable.img`'s groups 1, 2 and 3
 have an **empty** inode tree (`count = 0`, `freecount = 0`, one leaf with no
 records), so a first chunk in a group is a case with no overlap hazards in it.
 
+### Letting the tree grow, and what that cost
+
+The tree had to grow before any of the above was worth much, and it was not a
+corner case: a leaf in a 512-byte block holds 31 records and `xfsv4.img`'s group 1
+has **seven of its nine leaves already full**, so the eighth chunk inserted there
+is the one that splits.  `insert_chunk` walks to the leaf, splits it in half, links
+the new node into the sibling chain **on both sides**, gives the parent a new
+child, recurses when the parent has no room, and grows a new root when the tree was
+a single leaf.
+
+Three bugs it took, and each is a thing only a walk or the oracle could see:
+
+* **The successful insert path never wrote the leaf back.**  The insert succeeded,
+  the tree was unchanged, the caller believed the chunk was there, and nothing
+  anywhere reported an error.  The tree also never grew, because the leaf it kept
+  landing in was never any fuller — found by a test that added two hundred chunks to
+  a group whose leaves were full and watched none of them split.
+
+* **The split dropped the record it was asked to insert.**  A split makes room; it
+  does not use it.  The chunk went on the floor, which shows up a whole chunk short
+  in two counters:
+
+  ```text
+  agi_count 16960, counted 16896 in ag 1
+  sb_icount 22656, counted 22592
+  ```
+
+* **An inode-tree node is charged differently from a free-space node**, and neither
+  way is what taking one assumed:
+
+  ```text
+  agf_btreeblks 59, counted 58 in ag 1
+  sb_fdblocks 90368, counted 90367
+  ```
+
+  `agf_btreeblks` counts the blocks the two **free space** trees hold, and a node of
+  the inode tree is not one of those, so charging it charges the group for a tree it
+  does not have.  And a block that has become an inode tree node is in none of the
+  three places a free block is accounted for, so the device's free count falls by one
+  — unlike a free-space node, which trades one term for another and leaves the total
+  alone.  That is a fourth term the [three-term identity](#the-superblocks-free-count-has-three-terms-and-all-three-are-measured)
+  did not have, and it is there because an inode tree node is counted nowhere.
+
+And one bug in the *check* rather than in the code, which is worth recording
+because it makes a real fault look like an imaginary one: the sibling-chain check
+compared the chain against a list of leaf blocks **sorted by block number**, which is
+not the chain's order, and so reported the pristine untouched image's own chain as
+broken.  The chain now gives the order — start at the leaf with no left neighbour and
+walk right — and both sides are checked at every step.
+
+Root collapse is still not written, and that is not an oversight: nothing empties a
+parent, because a parent always holds at least two children and the merge branch
+refuses to take the last one.  It will be written when a test reaches it.
+
 ## The AGFL → ordinary free space question is unmeasured
 
 The plan asks what the "AGFL → ordinary free space" transition is: what happens
