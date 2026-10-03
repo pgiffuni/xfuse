@@ -4049,6 +4049,206 @@ mod t {
             .output()
             .is_ok()
     }
+    /// What XFS does with a free list that is already full.
+    ///
+    /// The plan asks what happens when a metadata block is released and the list
+    /// cannot accept it, and records the answer as *unmeasured*: no image here has
+    /// a consumed list entry, and the only ones with consumed entries are
+    /// hand-built.  There is a way to get the observation without mounting
+    /// anything, and it is the tool rather than this code that has to answer.
+    ///
+    /// `xfs_repair` **rebuilds** the free list -- phase 5 writes it from the
+    /// group's free space.  So a list that is already full is a state repair has
+    /// to have an opinion about, and what it does with the blocks on it is XFS's
+    /// own answer rather than this project's guess.
+    ///
+    /// Which is the point of the experiment: the alternatives were "the transition
+    /// may not exist" and "implement it and hope".  Neither is a measurement.
+    ///
+    /// The list is filled the way the group fills it -- by freeing blocks it is
+    /// honestly offering -- so the image is otherwise a file system, and every
+    /// block on the list afterwards is one this test allocated.
+    #[test]
+    fn what_xfs_does_with_a_full_free_list() {
+        if !crate::libxfuse::alloc::have_xfs_repair() {
+            eprintln!("skipping: no xfs_repair to ask");
+            return;
+        }
+        let Some(image) = copy_of_golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let sb = sb_of(image.path());
+        let agno = 1u32;
+        let device = Arc::new(BlockDevice::open(image.path(), Access::ReadWrite).unwrap());
+        let mut cache = BlockCache::new(sb.sb_blocksize as usize, 256);
+
+        // Fill the list.  The capacity of a 512-byte list is 128 slots and the
+        // window's last is at 90, so there is room for about 37 more before it
+        // refuses -- which is the refusal this is after.
+        // A 512-byte list is 128 slots, and the window starts at 85, so there is
+        // room for about 43 more entries before `give_back` refuses.
+        let slots = u64::from(sb.sb_blocksize) / 4;
+        let mut rounds = 0u32;
+        loop {
+            rounds += 1;
+            assert!(rounds < 200, "the list never filled");
+            let run = {
+                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                match allocate(&mut tx, &sb, agno, 32) {
+                    Ok(run) => {
+                        free_in_group(&mut tx, &sb, agno, run).expect("free it back");
+                        tx.commit().expect("commit");
+                        Some(run)
+                    }
+                    Err(e) => {
+                        // The group cannot spare a run any more; that is a
+                        // different end to this and not the one being looked for.
+                        tx.abort();
+                        eprintln!("the group ran out after {rounds} rounds: {e}");
+                        None
+                    }
+                }
+            };
+            if run.is_none() {
+                break;
+            }
+            device.flush().unwrap();
+            let (_, last, _, _) = free_list_window(image.path(), &sb, agno);
+            // Stocking stops one slot short of the end on purpose --
+            // `append_to_the_free_list` keeps a slot in hand -- so the *last* slot
+            // can only be reached by giving a block back, which is the operation
+            // whose refusal this experiment is about.
+            if u64::from(last) + 1 >= u64::from(slots) - 1 {
+                eprintln!("stocked to last {last} after {rounds} rounds");
+                break;
+            }
+        }
+        // Into the slot that stocking kept.  Each of these is a real take and give
+        // back, and the last one is the one that finds the list with no room.
+        let mut pushed = 0;
+        for _ in 0..4 {
+            let block = {
+                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
+                let taken = store.take_btree_block().expect("the list has an entry");
+                store
+                    .put(
+                        taken,
+                        leaf(XFS_ABTB_MAGIC, &[(taken, 1)]).into_boxed_slice(),
+                    )
+                    .expect("write the node");
+                let went = store.give_back_btree_block(taken).expect("give it back");
+                tx.commit().expect("commit");
+                went
+            };
+            device.flush().unwrap();
+            let (_, last, _, _) = free_list_window(image.path(), &sb, agno);
+            pushed += 1;
+            eprintln!("  push {pushed}: last {last}, the block went to {block}");
+            if u64::from(last) + 1 >= u64::from(slots) {
+                break;
+            }
+        }
+        let (first, last, count, listed) = free_list_window(image.path(), &sb, agno);
+        eprintln!(
+            "xfsv4.img ag1: the list is ({first},{last},{count}) holding {} entries, and a \
+             {slots}-slot array",
+            listed.len()
+        );
+        assert_eq!(
+            u64::from(last) + 1,
+            u64::from(slots),
+            "the list did not fill: its window ends at {last} in a {slots} slot array"
+        );
+        let before: std::collections::HashSet<u32> = listed.iter().copied().collect();
+
+        // Now let XFS rebuild it.
+        let mut device_write = BlockDevice::open(image.path(), Access::ReadWrite).unwrap();
+        let status = std::process::Command::new("xfs_repair")
+            .arg(image.path())
+            .status()
+            .expect("xfs_repair");
+        assert!(
+            status.success(),
+            "xfs_repair refused the image it was asked to rebuild"
+        );
+        device_write.flush().unwrap();
+        drop(device_write);
+
+        // And now: where did the blocks that were on the list go?
+        let (first, last, count, after) = free_list_window(image.path(), &sb, agno);
+        let free_after = free_blocks_in_group(image.path(), &sb, agno, true);
+        // Where each block that was on the list ended up.  The two questions --
+        // "is it on the rebuilt list" and "is it free space" -- are asked
+        // independently, because a block on both would itself be an answer, and a
+        // classification that only ever counted one at a time would miss it.
+        let still_listed: Vec<u32> = before
+            .iter()
+            .copied()
+            .filter(|b| after.contains(b))
+            .collect();
+        let now_free: Vec<u32> = before
+            .iter()
+            .copied()
+            .filter(|b| free_after.contains(b))
+            .collect();
+        let neither: Vec<u32> = before
+            .iter()
+            .copied()
+            .filter(|b| !after.contains(b) && !free_after.contains(b))
+            .collect();
+        let gone: Vec<u32> = before
+            .iter()
+            .copied()
+            .filter(|b| !after.contains(b) && !free_after.contains(b))
+            .collect();
+        eprintln!(
+            "xfs_repair rebuilt the list: window ({first},{last},{count}) with {} entries",
+            after.len()
+        );
+        eprintln!(
+            "  of the {} blocks that were on the list: {} on the rebuilt list, {} now free space, \
+             {} neither",
+            before.len(),
+            still_listed.len(),
+            now_free.len(),
+            neither.len()
+        );
+        assert_eq!(
+            now_free.len() + neither.len(),
+            before.len(),
+            "the blocks that were on the list are unaccounted for"
+        );
+        // **The finding.**  Every block that was on the full list came back as
+        // ordinary free space, and none of them is on the rebuilt list.  So a free
+        // list that cannot hold more does not keep its blocks: they become free
+        // space, which is where a released node goes when the list is full and
+        // what the allocator's own fallback branch does.
+        //
+        // The actor here is `xfs_repair`, which is XFS's own code, so this is
+        // XFS's answer rather than this project's guess -- but it is the *recovery*
+        // tool discarding and rebuilding a list, not the running file system
+        // deciding where to put a node it has finished with.  Those are different
+        // operations and this does not say the second one behaves the same way.
+        // What it settles is that the transition is real and what it accounts
+        // for: the blocks on a full list are free blocks, counted in the free
+        // space trees and not anywhere else.
+        assert_eq!(
+            still_listed.len(),
+            0,
+            "some of the blocks that were on the full list survived onto the rebuilt one, so the \
+             list was not discarded"
+        );
+        assert_eq!(
+            now_free.len(),
+            before.len(),
+            "not every block that was on the full list came back as free space: {} of {} did",
+            now_free.len(),
+            before.len()
+        );
+        assert_repair_accepts(image.path(), "after xfs_repair rebuilt a full free list");
+    }
     /// The occupancy a free space leaf has to keep, measured rather than
     /// inferred from the B+tree literature.
     ///

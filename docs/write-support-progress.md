@@ -251,7 +251,7 @@ Each numerical claim in this document, what it rests on, and where it now stands
 | a 256-byte inode holds nine extents | derived + tool | `(256 − 100) / 16`, and nine sparse writes succeed before the tenth is refused | **confirmed** |
 | the free slots of a new chunk: magic, version, `next_unlinked` | tool | repair's complaints, item by item | **repair-validated only** |
 | — the *version* XFS picks for a new chunk's slots | inference | none: no image here has a chunk XFS created | **unmeasured** |
-| AGFL → ordinary free space | — | none: no `mkfs.xfs` image has consumed a list entry | **unmeasured**, and may not exist |
+| AGFL → ordinary free space, when the list is full | tool | a full list handed to `xfs_repair` comes back with **every** one of its 42 blocks as ordinary free space | **confirmed**, with a caveat about who did it |
 | root collapse | — | unreachable, so nothing to confirm | **not written** |
 
 Two rows are worth dwelling on, because they are the difference between "this is
@@ -264,11 +264,37 @@ how it works" and "this is how it happens to work here":
   in particular is a choice — 2 for a 256-byte inode, 3 for a larger one — taken
   from `xfs_db`'s report of the inodes these images already hold.
 
-* **"AGFL → ordinary free space" may not be a transition at all.**  Every image
-  `mkfs.xfs` produced here has never consumed a list entry, so there is nothing
-  to observe; and the one image that has consumed entries is hand-built.  The
-  honest position is that a block leaving the list becomes a node, which is what
-  62 of 84 consumed slots in `xfsv4.img` group 1 name.
+* **"AGFL → ordinary free space" is real, but the actor is the recovery
+  tool.**  Every image `mkfs.xfs` produced here has never consumed a list entry,
+  so the transition could not be observed on one -- and then it was observed by
+  *making* one.  Stock a list until its window reaches the end of the array, hand
+  the image to `xfs_repair`, and see:
+
+  ```text
+  before:  the list is (86,127,42) holding 42 entries in a 128-slot array
+  after:   xfs_repair rebuilt the list: window (0,7,8) with 8 entries
+           of the 42 blocks that were on the list:
+             0 on the rebuilt list, 42 now free space, 0 neither
+  ```
+
+  **Every block that was on the full list came back as ordinary free space.**  So
+  a free list that cannot hold more does not keep its blocks: they become free
+  blocks, counted in the free space trees and nowhere else.  That is what a
+  released node has to do when the list is full, and it is what the allocator's
+  fallback branch already does.
+
+  The caveat is about *who did it*.  `xfs_repair` is XFS's own code, so this is
+  XFS's answer rather than this project's guess -- but it is the **recovery tool**
+  discarding and rebuilding a list, not the running file system deciding where to
+  put a node it has finished with.  Those are different operations and this does
+  not show the second behaves the same way.  What it settles is that the
+  transition exists and what it accounts for; what it leaves open is whether the
+  running file system ever *creates* the condition, given that stocking stops one
+  slot short of the end by design.
+
+  The row it replaces said the transition "may not exist".  It does -- and the way
+  it was found is worth recording: the missing ingredient was not a mount, it was
+  a state the *tool* could be asked about.
 
 ### What the audit changed
 
@@ -550,7 +576,7 @@ Concretely, in order:
    and given back, with the trees, the list and the identity all checked.  The
    repair check is the one claim still outstanding, and it is outstanding for a
    reason that turned out to be about the evidence rather than about the code —
-   see [The AGFL → ordinary free space question](#the-agfl--ordinary-free-space-question-is-unmeasured).
+   see [The AGFL → ordinary free space question](#the-agfl--ordinary-free-space-question-answered).
    Short version: clearing a stocked list's window orphans the blocks it was
    holding, and there is no *established* operation that puts them back, so there
    is no honest way to build the state on an image whose list had something in
@@ -869,7 +895,7 @@ Root collapse is still not written, and that is not an oversight: nothing emptie
 parent, because a parent always holds at least two children and the merge branch
 refuses to take the last one.  It will be written when a test reaches it.
 
-## The AGFL → ordinary free space question is unmeasured
+## The AGFL → ordinary free space question, answered
 
 The plan asks what the "AGFL → ordinary free space" transition is: what happens
 when a metadata block is released and the list cannot accept it.  The way to
@@ -897,14 +923,44 @@ to be the script's doing as a file system's, and this suite cannot settle which.
 Calling those fourteen observations of the transition would be reading a number
 as an answer.
 
-So the transition is **unmeasured**, and that is the finding.  It has one
-consequence worth stating plainly, because it looks like work and is not: **do not
-build an "AGFL → ordinary free space" operation on the strength of the plan's
-question.**  There is a good chance XFS has no such operation — a block on the
-list is reserved for the group's b-trees, and a block that leaves it has become a
-node, which is what the 62 and 119 above are.  What would settle it is an image
-with a consumed list entry that `mkfs.xfs` built, and this environment cannot
-mount one.
+That search came up empty, and for a while the conclusion written here was that
+the transition was unmeasured and might not exist — which would have meant *not*
+building the fallback branch on the strength of the plan's question.
+
+It exists.  The ingredient the search was missing is not a mount: it is a state
+the **tool** can be asked about.  `xfs_repair` rebuilds the free list, so a list
+that is already full is a state repair has to have an opinion about, and what it
+does with the blocks on it is XFS's own answer:
+
+```text
+before:  the list is (86,127,42) holding 42 entries in a 128-slot array
+after:   xfs_repair rebuilt the list: window (0,7,8) with 8 entries
+         of the 42 blocks that were on the list:
+           0 on the rebuilt list, 42 now free space, 0 neither
+```
+
+**Every block that was on the full list came back as ordinary free space.**  A free
+list that cannot hold more does not keep its blocks: they become free blocks,
+counted in the free space trees and nowhere else.  So the accounting the fallback
+branch already implements is the right one — the block leaves the list's term and
+enters the free space term, and `sb_fdblocks` does not move.
+
+What the experiment does **not** settle, and what it would be wrong to read into
+it:
+
+* **The actor is the recovery tool.**  `xfs_repair` discarding and rebuilding a
+  list is a different operation from the running file system deciding where to put
+  a node it has finished with.  Both would move the same counters; this does not
+  show the second one ever *creates* the condition.
+* **Stocking keeps a slot in hand**, so the running file system's own path may
+  never fill the list at all.  `append_to_the_free_list` stops one slot short of
+  the end on purpose, which is why filling this one took a deliberate
+  take-and-give-back rather than 43 rounds of freeing.
+
+The lesson worth keeping is about method rather than about the free list: a
+question about a transition looked for evidence of the transition *happening
+naturally*, and found none, and nearly recorded "it does not exist".  The
+question was answerable by putting a file system in that state and asking.
 
 ### One difference from XFS, recorded because it was measured
 
