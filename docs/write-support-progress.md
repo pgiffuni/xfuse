@@ -256,7 +256,9 @@ Each numerical claim in this document, what it rests on, and where it now stands
 | a b-map extent's start is at offset 24, in bytes | tool | writing 777777 there produced `offset 1519`, and 777777 / 512 is 1519 | **confirmed** |
 | offsets 12 and 44 are not record fields | tool | perturbing either produced no extent complaint | **confirmed** |
 | the "starting block number" repair reports is composite | tool | the low half of offset 32 changes it to `1592888456` and the high half to `49152`; neither is any byte range | **confirmed** |
-| the b-map extent's block number: where it is | — | not yet; the field it lives in has not been isolated | **unmeasured** |
+| a b-map extent's *length* is at offset 32 | tool | patching it moves repair's reported start and end, which is what a length does | **confirmed** |
+| offsets 16 and 44 hold no validated field | tool | an unmistakable value at either produces no extent complaint | **confirmed** |
+| the b-map extent's block number: where it is | — | excluded from offsets 16, 24, 32 and 40; so the record is wider than 16 bytes or the block follows the start and length | **unmeasured, narrowed** |
 | root collapse | — | unreachable, so nothing to confirm | **not written** |
 
 **Two rows are still open**, and both are the difference between "this is how it
@@ -1090,12 +1092,46 @@ Two things follow, and the second is the one worth having:
   construction.  Perturbing something the file system already accepts removes that
   entire class of mistake, because the only difference is the field under test.
 
+Pushing that one step further, with a value chosen so that every byte of it is
+unmistakable, attributes each field to what repair then reports:
+
+```text
+leaf+16 = 1122334455667788:  in inode 100553 (data fork) bmap btree block 50313
+                            and no extent complaint at all
+leaf+24 = 1122334455667788:  bad extent starting block number <composite>, offset 1519
+leaf+32 = 0000000000abcdef:  bad extent overflows - start 5, end 773619, offset 0
+leaf+32 = aabbccddeeff0011:  bad extent overflows - start 5866361646967, end ...
+leaf+40 = 1122334455667788:  bad extent starting block number <composite + 2>, offset 1519
+```
+
+Read as attributions rather than as numbers:
+
+* **Offset 16 is not a field repair validates.**  An unmistakable value there
+  changes nothing about the extents.  Its pristine value in these leaves happens
+  to be `0x000000000000c48b` = 50315, which is the *next node's* daddr — and the
+  three leaves are at consecutive odd daddrs, so that was always a coincidence of
+  allocation rather than a field.  The earlier reading that treated it as the first
+  extent's block was wrong, and this is what killed it.
+* **Offset 24 is the extent's start, in bytes** — confirmed earlier, and confirmed
+  again here: 777777 / 512 is the 1519 it reported.
+* **Offset 32 is not a block number.**  Patching it moves the reported *start* and
+  *end*, which is what a length does and is not what a block does.  So the extent's
+  length lives there.
+* **Offset 40 behaves like a start**, giving the same shape of message as offset 24
+  with the composite differing by two.
+
+Which leaves the one thing still open, and it is now a narrow question rather than
+a broad one: **the block number is at none of offsets 16, 24, 32 or 40.**  For a
+16-byte record starting at 24 that is impossible — those four bytes are two whole
+fields — so either the record is wider than 16 bytes, or the block number follows
+the start and length rather than sitting between them.  Perturbing offset 48 and
+beyond, and checking whether the composite moves at all, separates those two.
+
 So the next person has: the setup recipe; the verification that makes it
 trustworthy; six ruled-out candidates *and why they were uninformative*; the start
-confirmed at offset 24; offsets 12 and 44 excluded; offset 20 and the two halves
-of offset 32 identified as feeding a composite that repair calls a block number;
-and a method — perturb what is already accepted — that produces answers on the
-first try where building produced none.
+at offset 24; the length at offset 32; offset 16 and 44 excluded as fields; and a
+single well-posed question left — where the block number is — with the next probe
+named.
 
 ### The attempt that failed, and why it is worth writing down
 
