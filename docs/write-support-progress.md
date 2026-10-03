@@ -1233,7 +1233,31 @@ and ask what repair reports for the blocks:
 
 Either answer is decisive, and the second would send the search back to the tree —
 because a mapping that tracks the offsets and is not in the leaf is in the *interior*
-nodes, or in the fork, and the fork's keys have not been perturbed either.  The reader that
+nodes, or in the fork, and the fork's keys have not been perturbed either.
+
+**Run, and it did not decide it.**  Perturbing the third word of each leaf's first
+record with the same value produces, per leaf:
+
+```text
+leaf 50313 (entries  0..29):  bad extent overflows - start 50933, end 951779, offset 0
+leaf 50315 (entries 30..44):  bad extent overflows - start 50933, end 951779, offset 30
+leaf 50317 (entries 45..63):  bad extent overflows - start 50933, end 951779, offset 45
+```
+
+Two things, and neither is the answer.  The `offset` tracks the fork's keys —
+0, 30, 45 — which is the leaf's start offset in blocks and so is *not* the block
+the extent lives at.  And the `start` and `end` are identical across all three
+leaves despite the three records differing, so they are derived from the perturbed
+word and not from anything that distinguishes one leaf from another.  The message
+form is not the one that prints a block number — that came from perturbing the
+third word of *entry 0 of the first leaf only* earlier — so the test needs the word
+that produces `fsbno`, and which word that is depends on the value put in it.
+
+That is where this stops, and it is a better place than any of the guesses this line
+has been through: the record's shape and its offset field are measured and pinned
+by a test, the block is known not to be in the record, and the question that remains
+is precisely "does repair read the block or reconstruct it", with a method that can
+answer it and a first attempt that did not.  The reader that
 exists maps the file offset correctly and reports every extent as starting at
 block zero, so it is right about *which* extent covers a block and wrong about
 *which block* it is.  That is strictly less wrong than the decoder it replaced —
