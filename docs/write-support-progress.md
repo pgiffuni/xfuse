@@ -1379,21 +1379,32 @@ error now has one.  `try_superblock()` returns `ENODEV` where the function speak
 `EUCLEAN`, because there is no device and no image and the file system has not done
 anything wrong.
 
-Three calls remain, and each is there because the function has **no error channel
-at all**, which is worth listing rather than leaving as an audit finding:
+**Every production call is now fallible.**  The last two needed their *signatures*
+changed rather than a `?` added, and both turned out to be hiding a silent failure
+as well as a crash:
 
-* `Dir2Leaf`'s hash-collision iterator's `next`, a trait method returning
-  `Option`.  Returning `None` would end the iteration and **silently drop every
-  entry after a collision**, which is worse than stopping and the one outcome a
-  directory reader must not have.  Fixing it means giving the iterator a fallible
-  shape and propagating, which touches every implementor.
-* `AttrLeafNameRemote::value`, which returns `&[u8]` and already unwraps its seek,
-  its decode and its read.  The same shape of work.
-* two tests, which install the superblock themselves and can rely on it.
+* `AttrLeafNameRemote::value` returned `&[u8]` and unwrapped four things.  It
+  returns `Result<&[u8], i32>` now, and each failure reports itself: no image,
+  `ENODEV`; a seek, its own errno; a header that did not decode, `EUCLEAN`; a
+  short read, its own errno.
+
+* `Dir2Leaf`'s hash-collision iterator's `next` is a trait method returning
+  `Option`, which is why it could only unwrap.  **Returning `None` there would end
+  the listing and silently drop every entry after a collision** -- the one outcome
+  a directory reader must not have.  It now holds the superblock the caller
+  already had, which moves the failure to `new` where there is a `Result` for it.
+  And the caller above it, `get_addresses`, was **swallowing that failure into an
+  empty iterator** -- so "I could not look" was being reported as "this name is not
+  here", which is how a name that is present becomes invisible.  It returns a
+  `Result` now.
+
+Two calls remain and both are in tests, which install the superblock themselves and
+can rely on it.
 
 So the rule is: **a decoder that cannot report an error may not have one invented
 for it, and where the signature prevents reporting, that is a defect in the
-signature.**
+signature** -- and the second half of that is what the two changes above turned up,
+a swallowed error that a signature change exposed and an `unwrap` alone would not.
 
 The other half is practical and unchanged: **the directory readers here can only be
 exercised through an opened volume**, which in practice means through a mount, so

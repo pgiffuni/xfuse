@@ -50,7 +50,6 @@ use super::{
     dir3::{Dir2DataEntry, Dir2DataHdr, Dir2DataUnused, Dir3, Dir3DataHdr, XfsDir2Dataptr},
     sb::Sb,
     utils::{decode, get_file_type, FileKind},
-    volume::SUPERBLOCK,
 };
 
 /// All of the different ways that a directory can store its data fork.
@@ -219,6 +218,16 @@ struct NodeLikeAddressIterator<'a, R: Reader + BufRead + Seek + 'a> {
     leaf:       Dir2LeafNDisk,
     leaf_range: Range<usize>,
     brrc:       &'a RefCell<&'a mut R>,
+    /// The superblock, held here rather than looked up per step.
+    ///
+    /// `next` is an `Iterator::next` and so returns `Option`, which is why the one
+    /// reach for the process-global superblock inside it could only be an
+    /// `unwrap`: a failure there had nowhere to go, and returning `None` would
+    /// **silently end the listing**, dropping every entry after the hash collision
+    /// that put the walk into a second leaf.  Holding the superblock the caller
+    /// already has moves the failure to `new`, which returns a `Result` and is
+    /// where it belongs.
+    sb:         &'a Sb,
 }
 
 impl<'a, R: Reader + BufRead + Seek + 'a> NodeLikeAddressIterator<'a, R> {
@@ -226,8 +235,8 @@ impl<'a, R: Reader + BufRead + Seek + 'a> NodeLikeAddressIterator<'a, R> {
         dir: &'a Dir2Lf,
         brrc: &'a RefCell<&'a mut R>,
         hash: XfsDahash,
+        sb: &'a Sb,
     ) -> Result<Self, i32> {
-        let sb = super::volume::try_superblock().ok_or(libc::ENODEV)?;
         let dblock = sb.get_dir3_leaf_offset();
         let mut buf_reader = brrc.borrow_mut();
         let leaf_btree = {
@@ -244,6 +253,7 @@ impl<'a, R: Reader + BufRead + Seek + 'a> NodeLikeAddressIterator<'a, R> {
             leaf,
             leaf_range,
             brrc,
+            sb,
         })
     }
 }
@@ -267,16 +277,7 @@ impl<'a, R: Reader + BufRead + Seek + 'a> Iterator for NodeLikeAddressIterator<'
                     // Traverse the forw pointer
                     let forw = self.leaf.forw;
                     let mut buf_reader = self.brrc.borrow_mut();
-                    // The last `SUPERBLOCK` in this file that still unwraps, and
-                    // it is an exception rather than an oversight.  `next` is a
-                    // trait method returning `Option`, so it cannot report an
-                    // error; returning `None` here would end the iteration and
-                    // **silently drop every entry after a hash collision**, which
-                    // is worse than stopping.  So this call stays, and the fix is
-                    // to give the iterator a fallible shape and propagate, which
-                    // touches every implementor.
-                    let sb = SUPERBLOCK.get().unwrap();
-                    let raw = match self.dir.read_dblock(buf_reader.by_ref(), sb, forw) {
+                    let raw = match self.dir.read_dblock(buf_reader.by_ref(), self.sb, forw) {
                         Ok(raw) => raw,
                         Err(e) => {
                             // It would be nice to print inode number here
@@ -327,19 +328,22 @@ impl Dir2Lf {
         Dir2Lf { dfork, blocks }
     }
 
+    /// The addresses a name with this hash may be stored at.
+    ///
+    /// A `Result` rather than an empty iterator for a failure, because the two mean
+    /// different things: one is "this name is not here" and the other is "I could
+    /// not look".  Returning an empty iterator for the second reports the first,
+    /// and a name that *is* present becomes invisible.
     fn get_addresses<'a, R>(
         &'a self,
         buf_reader: &'a RefCell<&'a mut R>,
         hash: XfsDahash,
-    ) -> Box<dyn Iterator<Item = XfsDir2Dataptr> + 'a>
+        sb: &'a Sb,
+    ) -> Result<Box<dyn Iterator<Item = XfsDir2Dataptr> + 'a>, i32>
     where
         R: Reader + BufRead + Seek + 'a,
     {
-        if let Ok(ai) = NodeLikeAddressIterator::new(self, buf_reader, hash) {
-            Box::new(ai)
-        } else {
-            Box::new(std::iter::empty())
-        }
+        NodeLikeAddressIterator::new(self, buf_reader, hash, sb).map(|ai| Box::new(ai) as _)
     }
 
     fn read_dblock<'a, R>(
@@ -396,7 +400,7 @@ impl Dir3 for Dir2Lf {
         let hash = hashname(name);
 
         let brrc = RefCell::new(buf_reader);
-        for address in self.get_addresses(&brrc, hash) {
+        for address in self.get_addresses(&brrc, hash, sb)? {
             let blk_offset =
                 (address & ((1u32 << (sb.sb_dirblklog + sb.sb_blocklog)) - 1)) as usize;
             let dblock = (address >> sb.sb_blocklog) & !((1u32 << sb.sb_dirblklog) - 1);
