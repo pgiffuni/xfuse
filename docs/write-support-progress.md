@@ -954,11 +954,45 @@ produces a message naming what it read.  These do not, so **repair is not readin
 the record these constructions write at all**, and the six refusals say the
 constructures are wrong rather than that six layouts are wrong.
 
-That is a better place to be than a table of rejected layouts, and a much worse
-place to keep guessing from.  What is needed next is to find out where repair looks
-for the record — which is answerable, by taking the *pristine*, accepted leaves and
-altering one field of one record at a time, so that the message can only be about
-that field.  Everything above is what not to do.
+A better way to ask follows from that: instead of building leaves, **perturb the
+pristine, accepted ones**, where a message can only be about the field that was
+changed.  Four one-field changes to leaf 50313, each accepted except the one named:
+
+```text
+offset 16 -> 777777:  in inode 100553 (data fork) bmap btree block 50313
+offset 24 -> 777777:  bad extent starting block number 431008558138504, offset 1519
+offset 32 -> 777777:  bad extent overflows - start 0, end 777776, offset 0
+offset 40 -> 777777:  bad extent starting block number 431008558138506, offset 1519
+```
+
+Two of those are readable immediately, and they are the most useful thing this line
+has produced:
+
+* **offset 24 is a file offset, in bytes.**  Writing 777777 there produced
+  `offset 1519`, and 777777 / 512 is 1519.  So the eight bytes at 24 are the
+  extent's start, exactly as the three-leaf analysis said.
+* **offset 32 is not the block number, and neither is offset 16.**  Writing
+  777777 at 32 produced `end 777776` against a `start 0` — so repair read it as
+  something *derived from* a start and a length, with the value it read one less
+  than what was written.  And the "starting block number" it reports,
+  `0x188000000c488`, is not any eight bytes of the block: it shares `c48b` with
+  offset 16's `0000c48b` (which is 50315, the daddr of the *next* node) and
+  `18` with offset 32's `00000018`, but it is neither, so it is **assembled** from
+  more than one field.
+
+So repair is reading this leaf, it reads the start at offset 24, and the block
+number it reports is a composite it derives rather than a field it reads.  That is
+a real lead — and it is as far as this line goes.  Guessing a layout from a number
+that is demonstrably a composite is exactly the failure mode this document now
+exists to prevent: a plausible answer, assembled from the wrong pieces, that would
+have become an implementation.
+
+What the next person has: the setup recipe, the verification that makes it
+trustworthy, six ruled-out candidates, the confirmed fact that the start is at
+offset 24, and the observation that the reported block number is composite.  What
+is needed next is one more perturbation that isolates a single field -- changing
+*only* the low bytes of offset 16, for instance -- so that repair's composite can
+be taken apart rather than guessed at.
 
 ### The attempt that failed, and why it is worth writing down
 
