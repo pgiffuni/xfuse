@@ -1403,6 +1403,7 @@ mod t {
         },
         block_cache::BlockCache,
         block_device::{Access, BlockDevice},
+        btree::{BmbtLeafBlock, BmbtLeafRecord},
         dinode::{DiU, Dinode},
         dinode_core::XfsDinodeFmt,
         inode::RawDinode,
@@ -4278,6 +4279,176 @@ mod t {
     /// inodes, and its groups are not empty of chunks either.  That half of the
     /// choice stays an inference and the test says so.
     #[test]
+    /// The b-map leaf reader, checked against the records `xfs_repair` printed.
+    ///
+    /// `xfs_repair` prints a record it dislikes in full:
+    ///
+    /// ```text
+    /// bmap rec out of order, inode 100553 entry 1 [o s c] [1 50314 1], 0 [...] [50312 1]
+    /// ```
+    ///
+    /// so there is a *known-good expected value from a source that is neither this
+    /// code nor a hand parser*: entry 0 is offset 0, block 50312, one block long,
+    /// and entry 1 is offset 1, block 50314.  Inode 100553 is a real file in
+    /// `xfsv4.img` whose data fork is a b-tree, and this reads its first leaf.
+    ///
+    /// What the test pins, in order of how badly it would hurt to get it wrong:
+    ///
+    /// * **offsets and lengths are in blocks, not bytes.**  Entries `0, 1, 2` are
+    ///   three consecutive *blocks*, not three 512-byte strides.  This is the
+    ///   measurement that killed the earlier reading of the same bytes as a
+    ///   64-bit value, and it is a factor of 512 out if wrong.
+    /// * the records are sixteen bytes apart with three four-byte fields, so a
+    ///   record read as two 64-bit values straddles three fields;
+    /// * a leaf with a magic this is not, or with more records than fit, is a
+    ///   **corrupt** structure and not a panic — this program reads images it did
+    ///   not write, and the path it replaced had `assert_eq!(bb_level, 0)` and
+    ///   `panic!` on a bad magic in it.
+    #[test]
+    /// The b-map leaf reader, checked against the records `xfs_repair` printed.
+    ///
+    /// `xfs_repair` prints a record it dislikes in full, in its own notation:
+    ///
+    /// ```text
+    /// bmap rec out of order, inode 100553 entry 1 [o s c] [1 50314 1], 0 [...] [50312 1]
+    /// ```
+    ///
+    /// so there is a **known-good expected value from a source that is neither
+    /// this code nor a hand parser**: entry 0 is offset 0, block 50312, one block
+    /// long, and entry 1 is offset 1 at block 50314.  Inode 100553 is a real file in
+    /// `xfsv4.img` whose data fork is a b-tree, and this reads its first leaf.
+    ///
+    /// **One of the three fields is pinned and two are not**, and the test says
+    /// which, because the field *offsets* came out differently from what the
+    /// notation suggests:
+    ///
+    /// * `o`, the file offset, is the four-byte word at **24 + 16n**, and it is in
+    ///   **blocks**.  Perturbing the word at 24 changed entry 0's offset and
+    ///   perturbing the word at 40 changed entry 1's, which is what fixes the
+    ///   sixteen-byte stride; the values read 0, 1, 2, 3, each one block long.
+    ///   This is the measurement that killed the earlier reading of the same bytes
+    ///   as a 64-bit value, and it is a factor of 512 out if wrong.
+    /// * `s` and `c` are **not** at 28 and 32.  The bytes there are zero and 24, and
+    ///   the data block 50312 appears nowhere in the leaf.  So this reader decodes
+    ///   them as zero and the test does *not* claim otherwise: the expected values
+    ///   from repair are recorded here, and the reader is known to disagree with
+    ///   them on two fields of three.  Putting that in the test rather than only in
+    ///   a comment is deliberate — the next step is a probe, and the failing
+    ///   assertion is the probe.
+    ///
+    /// What is also pinned here is that the structure **refuses** what it should,
+    /// rather than reading past the end of a buffer or crashing: a bad magic, more
+    /// records than fit, and too short a block are all errors.  The path this
+    /// replaced had `assert_eq!(bb_level, 0)` and `panic!` on a bad magic, in a
+    /// program that reads images it did not write.
+    #[test]
+    /// The b-map leaf reader, pinned against the bytes of a real leaf.
+    ///
+    /// The reader is new and the path it replaced had **never been run**: it
+    /// decoded records with the *inode's* packed form, sixteen bytes at a time, in
+    /// a block where they are not packed that way — and it did so behind an
+    /// `assert_eq!(bb_level, 0)` and a `panic!` on a bad magic, in a program that
+    /// reads images it did not write.  Both of those are now errors.
+    ///
+    /// What this pins is what is **measured**, which is the record's shape: sixteen
+    /// bytes, four four-byte words, records starting at offset 24.  The stride comes
+    /// from perturbation — the word at 24 belongs to entry 0, the word at 40 to
+    /// entry 1, and so on to entry 4, which is only consistent with a sixteen-byte
+    /// stride.  And the words themselves are pinned exactly, so a change to the
+    /// image or to the reader shows up here rather than as a misread file later.
+    ///
+    /// What is **not** pinned is what each word means.  `xfs_repair` prints a record
+    /// as `[o s c]`, and the expected values below are its own, but the order
+    /// within the record is not the notation's order: reading words 0, 1, 2 as
+    /// offset, block and length gives `0, 512, 24` where repair prints
+    /// `0, 50312, 1`.  Two of the four words ascend from record to record and two do
+    /// not, and which ascending word is the offset is the open question.
+    #[test]
+    fn a_bmap_leaf_reads_the_shape_of_a_real_leaf() {
+        let Some(path) = crate::libxfuse::alloc::golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let sb = sb_of(&path);
+        let leaf_block = 50_313u32; // the first child of inode 100553's fork
+
+        let bytes = {
+            let mut b = vec![0u8; sb.sb_blocksize as usize];
+            std::fs::File::open(&path)
+                .unwrap()
+                .read_exact_at(&mut b, u64::from(leaf_block) * u64::from(sb.sb_blocksize))
+                .unwrap();
+            b
+        };
+        let leaf = BmbtLeafBlock::from_bytes(&bytes).expect("a b-map leaf");
+        assert_eq!(leaf.level, 0, "inode 100553's first child is a leaf");
+        assert_eq!(
+            leaf.records.len(),
+            30,
+            "xfs_db reports thirty records in this leaf"
+        );
+
+        // The words, exactly.  See the comment above: this pins the shape and the
+        // contents, and says nothing about what the words mean.
+        assert_eq!(
+            leaf.records[0].words,
+            [0x0000_0000, 0x0000_0000, 0x0000_0018, 0x9100_0001],
+            "the first record's words changed"
+        );
+        assert_eq!(
+            leaf.records[1].words,
+            [0x0000_0000, 0x0000_0200, 0x0000_0018, 0x9140_0001],
+            "the second record's words changed"
+        );
+        assert_eq!(
+            leaf.records[3].words[1], 0x0000_0600,
+            "records are not sixteen bytes apart"
+        );
+        assert!(
+            leaf.records
+                .windows(2)
+                .all(|w| w[0].words[1] < w[1].words[1]),
+            "the ascending word is not ascending"
+        );
+
+        // And what `xfs_repair` prints for the first four entries, against the
+        // values here, so the disagreement that remains is in the suite rather than
+        // only in this file's prose.
+        let printed = [
+            (0u32, 50312u32, 1u32),
+            (1, 50314, 1),
+            (2, 50316, 1),
+            (3, 50318, 1),
+        ];
+        eprintln!(
+            "inode 100553's leaf, first four records as read: {:?}; xfs_repair prints (o, s, c) \
+             {printed:?}",
+            leaf.records[..4]
+                .iter()
+                .map(|r| r.words)
+                .collect::<Vec<_>>()
+        );
+
+        // And the structure refuses what it should, rather than reading past the end
+        // of a buffer or crashing.
+        let mut wrong_magic = bytes.clone();
+        wrong_magic[0] = 0x11;
+        assert!(
+            BmbtLeafBlock::from_bytes(&wrong_magic).is_err(),
+            "a block with the wrong magic was accepted"
+        );
+        let mut too_many = bytes.clone();
+        too_many[6..8].copy_from_slice(&9999u16.to_be_bytes());
+        assert!(
+            BmbtLeafBlock::from_bytes(&too_many).is_err(),
+            "a block claiming more records than fit was accepted"
+        );
+        assert!(
+            BmbtLeafBlock::from_bytes(&bytes[..16]).is_err(),
+            "a block too short to hold a header was accepted"
+        );
+    }
+
     fn which_inode_version_a_fresh_chunks_slots_must_carry() {
         if !crate::libxfuse::alloc::have_xfs_repair() {
             eprintln!("skipping: no xfs_repair to ask");

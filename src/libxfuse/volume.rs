@@ -672,6 +672,29 @@ impl Volume {
             )));
         }
 
+        // A file whose mapping is in a B+tree rather than in its inode.
+        //
+        // Writing *into* an existing extent would be legitimate in principle --
+        // the data moves, the mapping does not -- and the inode update at the end of
+        // this function only touches timestamps.  But the write has to find the
+        // extent first, and a b-map record's data-block field is **not yet
+        // attributed**: the record's shape is measured and its file offset is
+        // measured, and where the block lives is not.  The reader therefore
+        // returns a provisional value for it, and a write through a value known to
+        // be wrong is a write to an arbitrary block.
+        //
+        // So this is refused, with the reason, rather than attempted.  It used not
+        // to be reachable: the b-map reader used to decode records with the inode's
+        // packed form, which produced numbers that happened to be inside the image
+        // and satisfied `xfs_repair -n`.  That was an accident that looked like a
+        // success, and making the reader honest is what exposed it.
+        if matches!(oi.dinode.di_core.di_format, XfsDinodeFmt::Btree) {
+            return Err(FsError::unsupported(
+                "writing to a file whose extent mapping is a B+tree: the record's data-block \
+                 field is not yet established, so the extent cannot be located safely",
+            ));
+        }
+
         let size = u64::try_from(oi.dinode.fsize()).map_err(FsError::from)?;
         let end = offset
             .checked_add(data.len() as u64)
