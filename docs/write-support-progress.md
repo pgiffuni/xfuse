@@ -263,7 +263,7 @@ Each numerical claim in this document, what it rests on, and where it now stands
 | a b-map record's shape: 16 bytes, four 4-byte words, from offset 24 | tool | perturbing the word at 24 changes entry 0, at 40 changes entry 1, through entry 4 | **confirmed** |
 | a b-map extent's file offset is the record's **second** word, in **bytes** | tool | it reads 0, 512, 1024, 1536 — the offsets 0, 1, 2, 3 that repair *prints* | **confirmed** |
 | a b-map record's fourth word is `(entry << 16) \| length in blocks`, not a block | tool | its low half is 1 in all 64 entries and its high half counts 0..63 across three leaves without a break | **confirmed** |
-| a b-map extent's data block: where it is | — | **not in the record** — both constant words and the counter are excluded | **unmeasured, narrowed** |
+| a b-map extent's data block: where it is | — | **not in the record**; and repair may be reconstructing rather than reading it | **unmeasured**, with a one-perturbation test named |
 | root collapse | — | unreachable, so nothing to confirm | **not written** |
 
 **Two rows are still open**, and both are the difference between "this is how it
@@ -1203,7 +1203,37 @@ which is the same trap as the composite: the checker's numbers are decoded value
 not the bytes on the disk.
 
 **So the record is `{unused, offset in bytes, unused, entry counter and length}`**,
-and where an extent's block comes from is the open question.  The reader that
+and where an extent's block comes from is the open question.
+
+### The leading candidate for where it comes from, and the test that decides it
+
+`xfs_repair` can name a block for every entry in a leaf that does not contain
+one.  So either it reads it from somewhere this has not looked, **or it is
+reconstructing it and printing what it built rather than what it read** — and the
+second is more likely than it looks, because a message that accompanies a repair is
+a message about the repair.
+
+The numbers fit the reconstruction reading suspiciously well.  For entries 0, 1, 2
+and 3 of leaf 50313, repair printed blocks 50312, 50314, 50316 and 50318, and
+`leaf_daddr + 2 * entry - 1` gives exactly those four: the leaves of this file sit
+at 50313, 50315 and 50317, so the blocks repair reported are the ones interleaved
+with them.  A builder that allocated a data block and a tree node alternately would
+produce exactly that, and a reader that inferred the mapping from the entry's
+position would land on the same four numbers for the wrong reason.
+
+**Which is testable, and the test is one perturbation.**  Make a leaf's offsets
+non-uniform — say entries 0 and 1 claim offsets 0 and 5120 rather than 0 and 512 —
+and ask what repair reports for the blocks:
+
+* if the blocks follow the **entry index** rather than the **offset**, repair is
+  reconstructing them, and this hand-built image's leaves do not carry a mapping at
+  all, which is a finding about `xfsv4.img` rather than about the format;
+* if the blocks follow the **offset**, there is a real mapping somewhere and the
+  offsets are what drive it.
+
+Either answer is decisive, and the second would send the search back to the tree —
+because a mapping that tracks the offsets and is not in the leaf is in the *interior*
+nodes, or in the fork, and the fork's keys have not been perturbed either.  The reader that
 exists maps the file offset correctly and reports every extent as starting at
 block zero, so it is right about *which* extent covers a block and wrong about
 *which block* it is.  That is strictly less wrong than the decoder it replaced —
