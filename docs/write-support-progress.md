@@ -258,8 +258,9 @@ Each numerical claim in this document, what it rests on, and where it now stands
 | the "starting block number" repair reports is composite | tool | the low half of offset 32 changes it to `1592888456` and the high half to `49152`; neither is any byte range | **confirmed** |
 | a b-map extent's *length* is at offset 32 | tool | patching it moves repair's reported start and end, which is what a length does | **confirmed** |
 | offsets 16 and 44 hold no validated field | tool | an unmistakable value at either produces no extent complaint | **confirmed** |
-| a b-map record's *size* | — | starts are 16 bytes apart, which no record holding a block can be; the bytes beside them cannot be a length | **the stride is not the record size** |
-| the b-map extent's block number: where it is | — | excluded from offsets 16, 24, 32 and 40 | **unmeasured, narrowed** |
+| a b-map record's fields | tool | `xfs_repair` prints them: `bmap rec out of order ... [o s c]` — offset, start block, count | **confirmed** |
+| a b-map record's size and field offsets | tool | 16 bytes; `o` at 24+16n, `s` at 28+16n, `c` at 32+16n | **confirmed** |
+| a b-map extent's file offset is in **blocks**, not bytes | tool | entries 0, 1, 2, 3 each one block, at blocks 50312, 50314, 50316, 50318 | **confirmed** |
 | root collapse | — | unreachable, so nothing to confirm | **not written** |
 
 **Two rows are still open**, and both are the difference between "this is how it
@@ -1120,38 +1121,56 @@ Read as attributions rather than as numbers:
 * **Offset 40 behaves like a start**, giving the same shape of message as offset 24
   with the composite differing by two.
 
-**And the stride does not fit, which is the sharpest thing in this whole line.**
-Starts appear every sixteen bytes, so a sixteen-byte record would be
-`{start, length}` and would hold **no block number at all** — which no mapping
-record can do.  Either the record is *narrower* than sixteen bytes and the
-ascending values belong to consecutive records with something else between them, or
-it is sixteen bytes and the block number lives somewhere this has not looked.
+**And the stride does not fit** — starts appear every sixteen bytes, so a
+sixteen-byte record would be `{start, length}` and would hold no block number at
+all, which no mapping record can do.  So the next probe was to read the region as
+four-byte words and perturb each, instead of as 64-bit values.
 
-The eight bytes beside the starts are the lever, and they are the clue.  In the
-pristine leaves they are
+That probe answers it, in the checker's own vocabulary rather than by inference.
+`xfs_repair` prints b-map records as:
 
 ```text
-0x0000001891000001   0x0000001891400001   0x0000001891800001
+bmap rec out of order, inode 100553 entry 1 [o s c] [1 50314 1], 0 [13324841687973888 50312 1]
 ```
 
-— a high half that never changes and a low half that steps by four — and **no
-reading of them is a length of a 32 KiB file.**  A record whose second field cannot
-be a length is not a `{start, length}` record, which means the sixteen-byte stride
-is not the record size.  The earlier reading of this line, which called them
-lengths, was wrong for exactly that reason, and the wrongness was in the data the
-whole time.
+**`[o s c]`: offset, start block, count.**  Entries are numbered from zero, and
+perturbing one 4-byte word makes one entry's record unorderable and prints the
+whole of it.  So the layout is read off the message rather than guessed:
 
-So the next probe is cheap and specific: **read offsets 32, 48 and 64 as three
-separate four-byte fields and perturb each one**, rather than as one 64-bit value.
-One of them moving the reported end while another moves nothing would make the
-record twelve bytes and settle it.
+```text
+  offset 24 + 16n   o   the extent's file offset
+  offset 28 + 16n   s   its first data block
+  offset 32 + 16n   c   its length
+```
 
-So the next person has: the setup recipe; the verification that makes it
-trustworthy; six ruled-out candidates *and why they were uninformative*; the start
-at offset 24; offsets 16, 32, 40 and 44 each attributed to what repair reports;
-and three negative results that each close a reading — the stride is not the record
-size, the bytes beside a start are not a length, and the block number is at none
-of 16, 24, 32 or 40 — with the probe that decides between them named.
+which is three 4-byte fields in a 16-byte record, and it is why every reading
+that treated the eight bytes at offset 32 as a 64-bit value failed: it spans two
+fields and a half.
+
+**And the offsets are in blocks, not bytes** — entries 0, 1, 2, 3, each one block
+long, with their data blocks at 50312, 50314, 50316, 50318 interleaved with the
+tree nodes at 50313, 50315, 50317.  That is what a builder allocating a data block
+and a tree node alternately produces, and it is the last of the values this line
+first read as `0x0000001891000001` and could not account for: `00 00 00 18` is a
+different field from `91 00 00 01`, and both were being read as one number.
+
+So the layout is:
+
+| offset | field | note |
+|:-------|:------|:-----|
+| 0 | `BMAP` (`0x424d4150`) | measured in three leaves |
+| 4 | level (u16), record count (u16) | |
+| 8, 12 | left and right sibling | |
+| 16 | nothing repair validates | pristine contents here are the next node's daddr, by coincidence |
+| 24 + 16n | `o` — file offset, **in blocks** | measured |
+| 28 + 16n | `s` — first data block | measured |
+| 32 + 16n | `c` — length, in blocks | measured |
+| 36 + 16n | not yet attributed | |
+
+The last row is the only loose end, and it is small: one 4-byte word per record
+that has not been perturbed, and it does not change any of the three that matter.
+Whatever the record's fourth word is, the record is 16 bytes with three named
+4-byte fields, and that is enough to write a reader.
 
 ### The attempt that failed, and why it is worth writing down
 
