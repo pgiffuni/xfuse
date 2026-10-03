@@ -3779,11 +3779,13 @@ mod t {
 
         let block = Dir2Block::new(&mut reader, &sb, start);
         let mut names: Vec<(String, u64)> = Vec::new();
+        let mut offsets: Vec<i64> = Vec::new();
         let mut off = 0i64;
         loop {
             match block.next(&mut reader, &sb, off) {
                 Ok((ino, next, _t, name)) => {
                     names.push((name.to_string_lossy().into_owned(), ino));
+                    offsets.push(off);
                     if next < 0 {
                         break;
                     }
@@ -3796,9 +3798,21 @@ mod t {
             }
         }
         eprintln!("the root holds {} entries: {names:?}", names.len());
+        // Where each entry starts is what a writer needs: a new name goes into the
+        // free space after the last entry, so the offsets say how much there is.
+        let last = offsets.last().copied().unwrap_or(0) as usize;
+        let dblksize = 1usize << (sb.sb_blocklog + sb.sb_dirblklog);
+        eprintln!(
+            "entries start at {offsets:?}; the last is at {last}, leaving {} bytes",
+            dblksize.saturating_sub(last)
+        );
         assert!(
             names.iter().any(|(n, _)| n == "files"),
             "the root should hold `files`"
+        );
+        assert!(
+            dblksize.saturating_sub(last) > 64,
+            "there is no room after the last entry for a name and its tag"
         );
     }
 

@@ -1453,10 +1453,23 @@ fourteen names:
 sparse_leaf  sparse_btree  files  xattrs  links
 ```
 
-so there is room in it for more than one of the names `create` would add, and
-`create` does not have to grow the directory to be useful on these images.  That is
-a fact about this image and not a general one: whether a directory has room depends
-on how full it is, and the code has to handle the case where it does not.
+and where each one starts, which is the number a writer needs:
+
+```text
+0, 16, 32, 48, 64, 88, 104, 120, 144, 168, 208, 232, 256, 280
+```
+
+so the last entry begins at 280 of a 4096-byte block and **3816 bytes are free**
+after it.  `create` therefore does not have to grow the directory to be useful on
+these images, which is the fact that matters for the order of work.
+
+That is a fact about this image and not a general one: whether a directory has
+room depends on how full it is, and the code still has to grow one that has none.
+And the entry offsets are 16 bytes apart for the short names, which is *smaller*
+than a full directory entry -- `inumber`, the name length, the type, the name and
+the tag do not fit in sixteen bytes for `sf` -- so these offsets are not yet
+understood well enough to write into, and that is the next thing to establish
+before `create` can be built rather than guessed at.
 
 Reading it at all needed `SUPERBLOCK` installed, which is not a detail:
 
