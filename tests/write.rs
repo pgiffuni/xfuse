@@ -632,6 +632,103 @@ fn xfs_db_field(image: &std::path::Path, commands: &[&str], field: &str) -> Stri
         })
 }
 
+/// Where a file's extents stop fitting in its inode, which is now measured.
+///
+/// This used to be a test of a thing that did not exist.  It is now a test of the
+/// boundary, which is the part that can be established without a b-tree
+/// implementation: a 256-byte inode's local area holds **nine** extent records, so
+/// a file written sparsely enough to need a tenth extent cannot be written by
+/// this file system, and it is refused rather than written wrongly.
+///
+/// The refusal matters as much as the limit.  A file whose extents do not fit
+/// has to be either moved into a b-tree or refused, because the alternative --
+/// writing an eleventh record over the attribute fork, or over the inode's own
+/// tail -- produces a file that reads back as something else.  `set_core_extents`
+/// refuses, so the boundary is a clean `ENOSPC` and the image is untouched, which
+/// is what this pins.
+///
+/// What is *not* established here is what happens on the other side: the format's
+/// answer is a b-tree rooted in the inode, which needs both a writer and a reader
+/// -- the read side has no b-map block decoder at all -- and neither is written.
+/// The repository's directories are all in *local* format, so this is also not a
+/// boundary `create` would have to respect either.
+#[test]
+fn a_file_with_more_extents_than_its_inode_holds_is_refused() {
+    require_fusefs!();
+    let image = writable_copy(&GOLDENV4, "extents");
+    let blocksize = 512u64;
+
+    // How far it gets, and where it stops.  Measured rather than assumed: the
+    // number of sparse writes that succeed is the local area's capacity.
+    let mut got = 0usize;
+    let mut refused_at = None;
+    with_rw_mount_at(&image, "extents", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let mut f = open_rw(&file);
+        for i in 0..20 {
+            // Twice the block size apart, so the extents are never adjacent and
+            // never joined: a write that landed beside the last one would make
+            // one extent rather than two, and the file would never overflow.
+            f.seek(SeekFrom::Start(i as u64 * 2 * blocksize)).unwrap();
+            match f.write_all(&[b'A' + (i % 26) as u8]) {
+                Ok(()) => got += 1,
+                Err(e) => {
+                    // `ENOSYS`, not `ENOSPC`: this is not the device running out,
+                    // and a caller told "no space" would look for space.
+                    assert_eq!(
+                        e.raw_os_error(),
+                        Some(libc::ENOSYS),
+                        "the refusal was reported as something other than 'not implemented': {e:?}"
+                    );
+                    eprintln!("refused after {got} sparse writes: {e}");
+                    refused_at = Some(i);
+                    break;
+                }
+            }
+        }
+        drop(f);
+    });
+    let Some(where_it_stopped) = refused_at else {
+        panic!(
+            "{got} sparse writes all succeeded, so this file's inode holds more extents than the \
+             boundary this records"
+        );
+    };
+    // Nine, and the arithmetic says why: a 256-byte inode's local area starts at
+    // byte 100 and an extent record is 16 bytes, so `(256 - 100) / 16` is nine of
+    // them.  The file started with one extent, so the first sparse write -- which
+    // lands in the block the file already had -- adds none, and writes one
+    // through nine add the eight that take it to the limit.  The tenth is the one
+    // that does not fit.
+    assert_eq!(
+        got, 9,
+        "a 256-byte inode's local area does not hold {got} extents"
+    );
+    assert_eq!(
+        where_it_stopped, 9,
+        "the refusal came at a different extent than the capacity"
+    );
+
+    // And the image is untouched by the refusal: the file still reads, and the
+    // file system is still one repair accepts.
+    with_ro_mount(&image, "extents-ro", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let content = std::fs::read(&file).unwrap();
+        for i in 0..got {
+            let at = i * 2 * blocksize as usize;
+            assert_eq!(
+                content.get(at).copied(),
+                Some(b'A' + (i % 26) as u8),
+                "byte {i} did not survive the refused write that followed it"
+            );
+        }
+    });
+    repair_accepts(
+        &image,
+        "after a write past the inode's extent capacity was refused",
+    );
+}
+
 /// The image is a file system `xfs_repair -n` accepts, or the reason it does not.
 ///
 /// A skip where there is no repair tool to ask, because a test that cannot run its
