@@ -1560,19 +1560,38 @@ bytes do not read consistently as four.  That is as far as hand-decoding gets, a
 hand-decoding has now produced one wrong claim out of one attempt here, so the
 next step is not another reading of the bytes.
 
-**The writer is not landed because `xfs_repair` rejects its output.**  Entries and
-index both read back exactly as intended, and repair still says:
+**The writer is not landed, and the second attempt ruled out the one variable
+that looked like the answer.**  The entry was built both ways -- four bytes after
+the type, and the two bytes a sixteen-byte entry has room for -- and `xfs_repair`
+rejected **both with the same message**:
 
 ```text
-corrupt directory block 0 for inode 32
-would clear root inode 32
-root inode would be lost
+no . entry for directory 32
 ```
 
-Whatever rule this is, it is not the entry positions and it is not the index --
-both of which are verified -- so it is in the part that is not established.  The
-work was thrown away rather than committed half-done, because a `create` that
-produces a directory `xfs_repair` calls corrupt is worse than no `create`.
+So the tag's width is not what decides it.  What remains is that the insertion is
+losing the directory's first entry either way, and where it lands is not
+established: the hash index says the last entry ends at 304 and the name ought to
+go there, and the free-space search returns an offset that is not that.
+
+**That ordering is the mistake, not the not-knowing.**  The instrument that would
+have named the offset was written and left switched off behind an environment
+variable, and the hour went into guessing a mechanism instead.  An experiment whose
+first step is "print where the thing went" should start by printing where the thing
+went, and the whole of this project's findings are about the difference between a
+guess and a reading.
+
+The work was thrown away rather than committed half-done, because a `create` that
+produces a directory `xfs_repair` calls corrupt is worse than no `create`.  What is
+kept is the measurement that got this far -- the entries' positions, read from the
+hash index rather than from the code under test -- and the withdrawal of the claim
+that came with it.
+
+One ordinary bug came out of it and is worth recording because it looks like a
+format question and is not: the tag width was taken from the enum's **discriminant**,
+so `Dir2TagWidth::Four as usize` was 0 and the entry was sized from a field's
+position in the enum instead of its width -- an entry too short to hold its own
+name.  An enum whose variants mean numbers wants a method that says so, not a cast.
 
 What would settle it: the entry layout of a directory **XFS itself wrote**.  These
 images are hand-built, and the one fact that does not fit the format -- fourteen
