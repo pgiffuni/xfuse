@@ -39,12 +39,13 @@ use bincode_next::{
 use fuser::FileType;
 use libc::{c_int, ENOENT};
 
+const NO_IMAGE: &str = "no image has been opened in this process";
+
 use super::{
     definitions::*,
     dir3::{Dir3, XFS_DIR3_FT_DIR},
     sb::Sb,
     utils::{get_file_type, FileKind},
-    volume::SUPERBLOCK,
 };
 
 // pub type XfsDir2SfOff = [u8; 2];
@@ -83,7 +84,8 @@ struct Dir2SfEntry32 {
 
 impl<Ctx> Decode<Ctx> for Dir2SfEntry32 {
     fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, DecodeError> {
-        let sb = SUPERBLOCK.get().unwrap();
+        let sb = super::volume::try_superblock()
+            .ok_or_else(|| DecodeError::OtherString(NO_IMAGE.into()))?;
         let namelen: u8 = Decode::decode(decoder)?;
         let offset: u16 = Decode::decode(decoder)?;
         let mut namebytes = vec![0u8; namelen.into()];
@@ -126,7 +128,8 @@ impl Dir2SfEntry64 {
 
 impl<Ctx> Decode<Ctx> for Dir2SfEntry64 {
     fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, DecodeError> {
-        let sb = SUPERBLOCK.get().unwrap();
+        let sb = super::volume::try_superblock()
+            .ok_or_else(|| DecodeError::OtherString(NO_IMAGE.into()))?;
         let namelen: u8 = Decode::decode(decoder)?;
         let offset: u16 = Decode::decode(decoder)?;
         let mut namebytes = vec![0u8; namelen.into()];

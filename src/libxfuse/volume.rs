@@ -82,6 +82,30 @@ use crate::libxfuse::alloc::free_space::FreeRun;
 /// superblock within a Decode::decode implementation.
 pub(super) static SUPERBLOCK: OnceLock<Sb> = OnceLock::new();
 
+/// The superblock of the image being read, if one has been opened.
+///
+/// Several structures here cannot be decoded without it, because their *shape*
+/// depends on the file system's layout: whether a directory entry carries a type
+/// follows `ftype`, whether an inode number is 64 bits follows `nrext64`, and how
+/// far into an inode a fork starts follows the inode size.  A decoder that cannot
+/// have it has to say so.
+///
+/// The alternative was `SUPERBLOCK.get().unwrap()` at nine places, which is what
+/// this replaces.  It converts "nobody opened an image in this process" -- a
+/// mistake by whoever is reading, not a fault in the image -- into a panic, inside
+/// a program whose whole job is reading images other people wrote, and it did so
+/// on the very first attempt to read a directory in a unit test.
+///
+/// `ENODEV` is the error: there is no device, because there is no image.  It is
+/// not `EUCLEAN`, which would blame the file system for the caller having no
+/// context for it.
+pub(super) fn try_superblock() -> Option<&'static Sb> {
+    SUPERBLOCK.get()
+}
+
+/// The decode-time answer to "there is no image in this process".
+pub(super) const NO_IMAGE: &str = "no image has been opened in this process";
+
 #[derive(Debug)]
 struct OpenInode {
     dinode: Dinode,

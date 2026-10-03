@@ -227,7 +227,9 @@ impl AttrLeafblock {
 
 impl<Ctx> Decode<Ctx> for AttrLeafblock {
     fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, DecodeError> {
-        let blocksize = SUPERBLOCK.get().unwrap().sb_blocksize as usize;
+        let blocksize = super::volume::try_superblock()
+            .ok_or_else(|| DecodeError::OtherString(super::volume::NO_IMAGE.to_string()))?
+            .sb_blocksize as usize;
         let mut raw = vec![0u8; blocksize];
         decoder.reader().read(&mut raw[..])?;
 

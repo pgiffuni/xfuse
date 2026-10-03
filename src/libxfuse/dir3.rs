@@ -39,11 +39,13 @@ use bincode_next::{
 use fuser::FileType;
 use libc::c_int;
 
+/// The decode-time answer to "there is no image in this process".
+const NO_IMAGE: &str = "no image has been opened in this process";
+
 use super::{
     definitions::*,
     sb::Sb,
     utils::{decode, Uuid},
-    volume::SUPERBLOCK,
 };
 
 type XfsDir2DataOff = u16;
@@ -134,7 +136,8 @@ impl Dir2DataEntry {
 impl<Ctx> Decode<Ctx> for Dir2DataEntry {
     fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, DecodeError> {
         let inumber = Decode::decode(decoder)?;
-        let sb = SUPERBLOCK.get().unwrap();
+        let sb = super::volume::try_superblock()
+            .ok_or_else(|| DecodeError::OtherString(NO_IMAGE.into()))?;
         let namelen: u8 = Decode::decode(decoder)?;
         let mut namebytes = vec![0u8; namelen.into()];
         decoder.reader().read(&mut namebytes[..])?;

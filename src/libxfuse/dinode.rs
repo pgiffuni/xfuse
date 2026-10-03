@@ -53,7 +53,6 @@ use super::{
     extent::ExtentMap,
     sb::Sb,
     symlink_extent::SymlinkExtents,
-    volume::SUPERBLOCK,
 };
 
 #[derive(Debug)]
@@ -384,7 +383,7 @@ impl Dinode {
     where
         R: BufRead + Reader + Seek,
     {
-        let sb = SUPERBLOCK.get().unwrap();
+        let sb = super::volume::try_superblock().ok_or(libc::ENODEV)?;
         debug_assert_eq!(
             offset & ((1i64 << sb.sb_blocklog) - 1),
             0,
@@ -463,7 +462,7 @@ impl Dinode {
     where
         R: BufRead + Reader + Seek,
     {
-        let sb = SUPERBLOCK.get().unwrap();
+        let sb = super::volume::try_superblock().ok_or(libc::ENODEV)?;
         let size = u32::try_from(i64::from(size).min(self.di_core.di_size - offset)).unwrap();
 
         let block_offset = usize::try_from(offset & ((1i64 << sb.sb_blocklog) - 1)).unwrap();
