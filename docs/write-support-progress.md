@@ -1579,8 +1579,15 @@ images are hand-built, and the two facts that do not fit the format -- a tag tha
 is two bytes wide and a length formula that disagrees with the field layout -- are
 both of a piece with that.  `mkfs.xfs` makes no directory with a name in it that
 this suite can reach without mounting a file system, so that measurement needs a
-substrate this environment cannot make, the same answer as the b-map block's and
-the free list's.
+substrate this environment cannot make -- which is now the answer to three separate
+questions: the b-map block's data block, the free list's own transition, and this.
+
+And the correction is the general one.  **A measurement taken with the code under
+test is not a measurement of it.**  The entry-length table agreed with
+`get_length` because it was computed by `get_length`; only the hash index, read
+from bytes nobody derived, was evidence.  When a table can be produced two ways
+and one of them goes through the thing being checked, the other is the measurement
+and the first is a restatement.
 
 Reading it at all needed `SUPERBLOCK` installed, which is not a detail:
 
