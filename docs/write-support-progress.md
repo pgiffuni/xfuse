@@ -145,6 +145,8 @@ kernel usually does not send `open`/`opendir` at all.
 | Superblock free-block total follows the group | done | `alloc/allocator.rs` |
 | Existing-chunk inode allocation | done | `alloc/allocator.rs` |
 | INOBT consistency validation (`freecount == popcount(free_mask)`) | done | `alloc/inobt.rs`, `alloc/allocator.rs` |
+| Reading a file whose extents live in a B+tree, on either header form | done | `btree.rs`, `tests/integration.rs` |
+| An empty attribute list answered as a list rather than a size | done | `volume.rs` |
 | The measured invariants below | done | this document, `alloc/` tests |
 
 ### In progress
@@ -168,7 +170,7 @@ What is left in order:
    test can build one, the environment cannot mount a file system, and every image
    here that a file system made has never consumed an entry.  It is the thing that
    would settle the free list's own transition question — see
-   [that section](#the-agfl--ordinary-free-space-question-is-unmeasured) — and
+   [that section](#the-agfl--ordinary-free-space-question-answered) — and
    until it exists, a couple of questions below are blocked on evidence rather than
    on anything to write.
 
@@ -240,7 +242,25 @@ another, set against each other.  Counting tests is not a health check when a
 duplicate attribute is possible, and a count that has been believed for hours is
 exactly the thing a duplicate makes wrong.
 
-### The FreeBSD integration failures are the attribute fork, and it is not mine
+### The integration failures were the **extent** fork, not the attribute fork
+
+> **The attribution below is wrong and is corrected here rather than edited away.**
+> It concluded that the 86 failing integration tests came from the attribute fork
+> `di_aformat` finding that follows — which is a real bug, still unfixed, and was
+> never their cause.  They came from the b-map **extent** leaf, for the two reasons
+> in [A b-map leaf's records begin at 72 bytes, or 24](#a-b-map-leafs-records-begin-at-72-bytes-or-24-and-each-is-two-64-bit-words):
+> the records were read from 24 instead of 72, and each was read as four `__be32`
+> rather than as the two `__be64` it is.  Eighty-three of the eighty-six were b-tree
+> files of one kind or another, which is what the signature said at the time and what
+> the attribution ignored in favour of a hypothesis the code supported.
+>
+> The section is left as it was written because the way it went wrong is the
+> interesting part: **the inference was labelled as an inference and was still
+> believed**, and it was believed for as long as the failures lasted because it
+> explained the `map_block` symptom precisely.  A hypothesis that explains the
+> symptom is not thereby the cause of it, and the label mattered less than it was
+> meant to.
+
 
 `tests/integration.rs` panics in `AttrBtree::new` -- `btree.map_block(0).unwrap().0.unwrap()`,
 so `map_block` was handed logical block 0 and reported a **hole**.  That is worth
@@ -351,18 +371,11 @@ Each numerical claim in this document, what it rests on, and where it now stands
 | the free slots of a new chunk: magic, version, `next_unlinked` | tool | repair's complaints, item by item | **repair-validated only** |
 | — the *version* XFS picks for a new chunk's slots | inference | none: no image here has a chunk XFS created | **unmeasured** |
 | AGFL → ordinary free space, when the list is full | tool | a full list handed to `xfs_repair` comes back with **every** one of its 42 blocks as ordinary free space | **confirmed**, with a caveat about who did it |
-| a b-map leaf's magic, level, record count and sibling fields | tool | `BMAP` (`0x424d4150`) at 0, level at 4, count at 6, siblings at 8 and 12, the same in three leaves `xfs_db` can name the extents of | **confirmed** |
-| a b-map extent's start is at offset 24, in bytes | tool | writing 777777 there produced `offset 1519`, and 777777 / 512 is 1519 | **confirmed** |
-| offsets 12 and 44 are not record fields | tool | perturbing either produced no extent complaint | **confirmed** |
-| the "starting block number" repair reports is composite | tool | the low half of offset 32 changes it to `1592888456` and the high half to `49152`; neither is any byte range | **confirmed** |
-| a b-map extent's *length* is at offset 32 | tool | patching it moves repair's reported start and end, which is what a length does | **confirmed** |
-| offsets 16 and 44 hold no validated field | tool | an unmistakable value at either produces no extent complaint | **confirmed** |
-| a b-map record's fields | tool | `xfs_repair` prints them: `bmap rec out of order ... [o s c]` — offset, start block, count | **confirmed** |
-| a b-map record's size and field offsets | tool | 16 bytes; `o` at 24+16n, `s` at 28+16n, `c` at 32+16n | **confirmed** |
-| a b-map record's shape: 16 bytes, four 4-byte words, from offset 24 | tool | perturbing the word at 24 changes entry 0, at 40 changes entry 1, through entry 4 | **confirmed** |
-| a b-map extent's file offset is the record's **second** word, in **bytes** | tool | it reads 0, 512, 1024, 1536 — the offsets 0, 1, 2, 3 that repair *prints* | **confirmed** |
-| a b-map record's fourth word is `(entry << 16) \| length in blocks`, not a block | tool | its low half is 1 in all 64 entries and its high half counts 0..63 across three leaves without a break | **confirmed** |
-| a b-map extent's data block: where it is | — | **not in the record and not in the image**: the tree carries offsets and lengths only, and repair reconstructs the blocks from the entry index | **not measurable here** |
+| a b-map leaf's header length, and that the magic decides it | doc + tool | `XFS_BTREE_LBLOCK_CRC_LEN` is 72 and `XFS_BTREE_LBLOCK_LEN` is 24; 33 blocks in the two version 5 images carry the CRC magic and decode from 72, 102 in `xfsv4.img` carry the plain magic and decode from 24 | **confirmed** |
+| a b-map extent record is two `__be64` with fields interleaved across both | doc + tool | `xfs_format.h` gives `l0:9-62` startoff, `l0:0-8`+`l1:21-63` startblock, `l1:0-20` blockcount; the leaf of `files/btree2.txt` decodes to `xfs_db bmap`'s own `(0, 17833, 1)`, `(1, 17835, 1)`, … | **confirmed** |
+| a b-map extent's start block is stored scaled by 512 | tool | the field reads 17833 × 512 = 9130496 for the first record of `files/btree2.txt`, and 9130496 >> 9 is 17833 | **confirmed** |
+| a b-map record's *size* is 16 bytes | doc | `sizeof(xfs_bmbt_rec_t)`; also the only stride at which perturbation puts one record in each entry | **confirmed** |
+| ~~a b-map extent's start is at offset 24, in bytes; its length is at offset 32; a record is four 4-byte words from offset 24; its fourth word is `(entry << 16) \| length`; its data block is nowhere in the record and nowhere in the image~~ | — | **withdrawn**: all of it follows from reading a 72-byte-header block from 24, and of a field that spans a `__be64` boundary as two `__be32`.  The block *is* in the record, at `l0:0-8`+`l1:21-63`.  See the invariant above and [The b-map block's extent, and how it was nearly missed](#the-b-map-blocks-extent-and-how-it-was-nearly-missed) | **withdrawn** |
 | root collapse | — | unreachable, so nothing to confirm | **not written** |
 
 **Two rows are still open**, and both are the difference between "this is how it
@@ -521,6 +534,73 @@ Everything in this section was established by reading images produced by
 The numbers are quoted from a native tool wherever one can be asked -- see
 [How strong each measurement is](#how-strong-each-measurement-is-and-how-to-read-one)
 for what stands behind each one and what does not.
+
+### A b-map leaf's records begin at 72 bytes, or 24, and each is two 64-bit words
+
+The last piece of the on-disk format this project needed and did not have, and the
+one that was wrong in the code for as long as there was code to be wrong in.  Both
+halves of it were asserted here first and both were wrong; see
+[The b-map block's extent, and how it was nearly missed](#the-b-map-blocks-extent-and-how-it-was-nearly-missed).
+
+**The header length is decided by the block's magic.**  `xfs_format.h` has two:
+
+```c
+#define XFS_BTREE_SBLOCK_LEN  (offsetof(struct xfs_btree_block, bb_u) + \
+                               offsetof(struct xfs_btree_block_shdr, bb_blkno))   /* 12 */
+#define XFS_BTREE_LBLOCK_LEN  (offsetof(struct xfs_btree_block, bb_u) + \
+                               offsetof(struct xfs_btree_block_lhdr, bb_blkno))   /* 24 */
+#define XFS_BTREE_SBLOCK_CRC_LEN (... + sizeof(struct xfs_btree_block_shdr))     /* 56 */
+#define XFS_BTREE_LBLOCK_CRC_LEN (... + sizeof(struct xfs_btree_block_lhdr))     /* 72 */
+```
+
+A block with no checksum has a header that stops before its block number, which is
+what makes 24 the familiar number.  A checksummed block carries the block number,
+an LSN, the file system's UUID, the owning inode and the checksum as well, and is
+**72**.  Measured across the images here:
+
+| Image | Version | `bmapbta` magic | Blocks | Header |
+|:------|:--------|:----------------|:-------|:-------|
+| `xfs4096.img`, `xfs1024.img` | 5 | `XFS_BMAP_CRC_MAGIC` (0x424d4133) | 33 | **72** |
+| `xfsv4.img` | 4 | `XFS_BMAP_MAGIC` (0x424d4150) | 102 | **24** |
+
+**And a record is `sizeof(xfs_bmbt_rec_t)` = 16 bytes holding two `__be64`, with its
+fields interleaved across both of them.**  `xfs_format.h` states the layout:
+
+```c
+/*
+ * Bmap btree record and extent descriptor.
+ *  l0:63 is an extent flag (value 1 indicates non-normal).
+ *  l0:9-62 are startoff.
+ *  l0:0-8 and l1:21-63 are startblock.
+ *  l1:0-20 are blockcount.
+ */
+typedef struct xfs_bmbt_rec {
+	__be64			l0, l1;
+} xfs_bmbt_rec_t;
+```
+
+Fifty-four bits of offset, fifty-two of block number, twenty-one of length and one of
+flag is 128 bits, which is exactly the record, so nothing is spare and the fields
+cannot sit beside each other.  **Read as four `__be32` — which is what this code
+did — three of the fields become one nonsense number, and the start block is stored
+scaled by 512 besides**, so the number read unshifted is 512 times too large and
+names a block outside the image.
+
+That is the whole of it, and it is checked against `xfs_db`'s own output in
+`a_bmap_leaf_decodes_the_extents_xfs_db_reports`.  For `files/btree2.txt` in
+`xfs4096.img`, `xfs_db bmap` prints
+
+```text
+data offset 0 startblock 17833 count 1 flag 0
+data offset 1 startblock 17835 count 1 flag 0
+data offset 2 startblock 17837 count 1 flag 0
+```
+
+and the leaf those keys point at decodes to exactly those tuples.  `xfs_db`'s
+`bmapbta` type is the same tool this document said could not help: **it can**, and
+the one thing it needed was the block's own address — `xfs_db bmap` prints the
+record's meaning, and `xfs_db type bmapbta` prints the meaning of a block once its
+address is given, which `fsblock <n>` does.
 
 ### `agf_freeblks` is exactly the sum of the bno tree's records
 
@@ -1047,7 +1127,57 @@ requires them to agree about the level, the record count, every key and every
 pointer -- which is **shipped code being checked against a real file for the first
 time**, since every inode any other test reads has its extents *in* the inode.
 
+### The b-map block's extent, and how it was nearly missed
+
+> **The conclusions of the three sections that follow are withdrawn.**  What they
+> establish is that a b-map record, read the way this code read it, holds no block
+> number — and the block number was in the record the whole time.  The mistake was
+> not in the method and not in the measurements: it was in the *decoder* used to
+> read the bytes, so every experiment was faithful and the thing being measured was
+> wrong.  That is the failure mode the method in
+> [How a format fact is established here](#how-a-format-fact-is-established-here)
+> does not have a rule for, and it is written down here because it is the one that
+> actually happened.  The established layout is
+> [A b-map leaf's records begin at 72 bytes, or 24](#a-b-map-leafs-records-begin-at-72-bytes-or-24-and-each-is-two-64-bit-words).
+
+Two faults, and each one hides the other.
+
+**The header was read at 24.**  That is `XFS_BTREE_LBLOCK_LEN` — the length for a
+block with *no* checksum, whose header stops before its block number.  Every leaf
+in the version 5 images has a checksum and a 72-byte header, so reading from 24 put
+the reader in the middle of the LSN, the UUID, the owning inode and the checksum.
+Nothing there resembles a record, which is exactly why a long investigation was
+needed to conclude that no block number existed: the reader was looking at the
+wrong 48 bytes and reporting the honest result for them.
+
+**And the record was read as four `__be32`.**  `xfs_bmbt_rec_t` is two `__be64`
+with the block number split across the boundary between them — nine bits in `l0`,
+forty-three in `l1`.  Read as four words, the first three fields of the record
+collapse into one nonsensical value, and the fourth word contains neither the block
+nor the length.  This is the specific way the "fourth word ascends by `0x400000`
+per record" observation arose: `0x400000` is the step in the block number's *high*
+bits, and it is the block number, ascending by two blocks because the file's
+extents are interleaved with other allocations.
+
+**The method's blind spot, which is the part worth keeping.**  Perturbation is a
+sound instrument and it was used correctly throughout: a field that, when
+perturbed, changes a reported value is a field, and one that does not is not.  What
+perturbation cannot do is catch a reader that is looking at the wrong bytes — every
+perturbation lands in the header and every one of them produces a consistent,
+explainable, wrong answer.  The rule this adds is narrow and checkable: **before
+perturbing a field, confirm that the value already in that field is the value the
+file system put there.**  A decoder whose output for a pristine, known-good image is
+not already correct has no business being perturbed, because every answer it goes on
+to give is about the perturbation and not about the format.
+
+That check is what `a_bmap_leaf_decodes_the_extents_xfs_db_reports` now makes: it
+compares against `xfs_db`'s own reading of the same leaf rather than against
+constants copied out of this code's decoder.
+
 ### The b-map block: what three leaves agree on, and the one thing they do not
+
+> **Withdrawn**, as above.  Retained because the failure is worth reading: it is
+> careful, it is well evidenced, and every step of it is wrong.
 
 The record layout *inside* a b-map block is the last piece of this, and it is worth
 writing down as far as it actually goes, because most of it now rests on three
@@ -1306,6 +1436,11 @@ and where an extent's block comes from is the open question.
 
 ### The leading candidate for where it comes from, and the test that decides it
 
+> **Withdrawn**, as above.  What follows is the reasoning that the block
+> number is *reconstructed* rather than read; it is in the record, and it was
+> read by a decoder that had lost it.  Retained for the same reason as the
+> section above.
+
 `xfs_repair` can name a block for every entry in a leaf that does not contain
 one.  So either it reads it from somewhere this has not looked, **or it is
 reconstructing it and printing what it built rather than what it read** — and the
@@ -1378,6 +1513,11 @@ file is therefore untested until the record is attributed — which is a smaller
 hole than the one it replaces, and an honest one.
 
 ### The block is not in the image either, and that is why this cannot be measured here
+
+> **Withdrawn**, as above.  What follows is the reasoning that the block
+> number is *reconstructed* rather than read; it is in the record, and it was
+> read by a decoder that had lost it.  Retained for the same reason as the
+> section above.
 
 Two more experiments, and they settle it.
 
@@ -1539,6 +1679,27 @@ That is the third time in this work that a reader in this project and this proje
 own test agreed with each other and both were wrong, and it is the strongest
 argument for the rule this document now keeps: **the oracle is `xfs_repair`, not a
 round trip.**
+
+### The oracle disagrees with `xfs_repair` on two images, and `xfs_repair` is right
+
+Worth writing down because the method above leans on `xfs_db` for a step — "verify
+the rewrite landed before reading a verdict" — and that step is not sound on every
+image here.
+
+`xfs_db` reports **"Metadata corruption detected ... Metadata CRC error detected
+for ino 128"** on the root inode of `xfs1024.img` and `xfs_nrext64.img`.  On the
+same bytes, `xfs_repair -n` runs all seven phases and exits 0, and the daemon
+mounts both and serves their files.  `xfs_db -c "timelimit --bigtime"` does not
+change it.  So the complaint is `xfs_db`'s, not the image's: the project's own rule
+already makes `xfs_repair` the authority and `xfs_db` only a way of reading back
+what was written, and this is a case where reading it back produces a false alarm.
+
+Two consequences.  A failed `xfs_db` read is **not** evidence of corruption without
+a corroborating `xfs_repair`, and the reverse is the trap: a measurement taken from
+`xfs_db` on these two images is suspect in a way that one taken from `xfs4096.img`
+or `xfsv4.img` is not.  That matters here because `xfs_db bmap` is what establishes
+the b-map invariant above, and the image that invariant was established on is one
+where `xfs_db` works.
 
 ### The root has room, which is what `create` needs to know first
 
