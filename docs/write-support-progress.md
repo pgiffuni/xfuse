@@ -1465,11 +1465,37 @@ these images, which is the fact that matters for the order of work.
 
 That is a fact about this image and not a general one: whether a directory has
 room depends on how full it is, and the code still has to grow one that has none.
-And the entry offsets are 16 bytes apart for the short names, which is *smaller*
-than a full directory entry -- `inumber`, the name length, the type, the name and
-the tag do not fit in sixteen bytes for `sf` -- so these offsets are not yet
-understood well enough to write into, and that is the next thing to establish
-before `create` can be built rather than guessed at.
+**The entry layout is understood, and one doubt about it was wrong.**  Sixteen
+bytes is what the first three entries step by, and a directory entry has to hold an
+eight-byte inode number, a name and a tag, so sixteen looked impossible.  It is
+not: the block's own bytes say otherwise.
+
+```text
+  0: 58 44 32 42 01 48 0e 40 00 00 00 00 00 00 00 00   XD2B, header
+ 16: 00 00 00 00 00 00 00 20  01 2e  02 00 00 00 10   32, len 1, '.', tag 16
+ 32: 00 00 00 00 00 00 00 20  02 2e 2e  02 00 00 00 20   32, len 2, '..', tag 32
+ 48: 00 00 00 00 00 00 00 23  02 73 66  02 00 00 00 30   35, len 2, 'sf', tag 48
+ 64: 00 00 00 00 00 01 00 20  05 62 6c 6f 63 6b  02 00   65568, len 5, 'block'
+```
+
+`inumber` is eight bytes, the name length and the type one each, the name follows,
+and the tag is **four** bytes -- `xfs_dir2_data_off_t` is a 32-bit type, not a
+64-bit one -- so a one-character name needs 8 + 1 + 1 + 1 + pad + 4 = 16.  Every
+one of the thirteen measurable entries matches the reader's own
+`((namelen + 19) / 8) * 8`, and the test checks it by building real entry bytes
+and asking `Dir2DataEntry::get_length` rather than repeating the formula, so a
+writer and a reader agreeing is now a test rather than a coincidence.
+
+The doubt came from reading a list of offsets without noticing that the list was
+not all one steps -- `block` steps by 24 and `btree_with_single_leaf` by 40, and the
+first entry's offset is *after* the header and the leaf index, so the entry the walk
+reads first is not the one the walk was told to look at.  That off-by-one is now
+in the test as well, because pairing a name with the offset it was asked for
+rather than the one it was given makes every length wrong for the wrong name --
+which is a test that would have failed for a reason nobody could read.
+
+So `create` now has all three of its prerequisites measured: an inode to point at, a
+directory with room, and a byte-exact entry layout.
 
 Reading it at all needed `SUPERBLOCK` installed, which is not a detail:
 
