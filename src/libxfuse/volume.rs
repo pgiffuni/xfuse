@@ -999,18 +999,19 @@ impl Filesystem for Volume {
         flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        let _ = fh;
         // The kernel sends only the fields the caller actually asked to change, so
-        // a request that mentions one of them is a request for it.  Anything this
-        // file system does not do yet is refused rather than acknowledged and
-        // ignored, which would leave the caller believing something it did not get.
+        // a request that mentions one of them is a request for it.  What this file
+        // system cannot do is refused rather than acknowledged and ignored, which
+        // would leave the caller believing something it did not get.
+        //
+        // The three timestamps it does not keep -- creation, attribute change and
+        // backup -- are fields a version 4 inode does not have in the first place,
+        // so a caller that sets them on this image is asking for something the
+        // on-disk format cannot hold.
         let mut refused = Vec::new();
         for (asked, what) in [
-            (mode.is_some(), "the mode"),
-            (uid.is_some(), "the owner"),
-            (gid.is_some(), "the group"),
             (flags.is_some(), "the flags"),
-            (atime.is_some(), "the access time"),
-            (mtime.is_some(), "the modification time"),
             (_ctime.is_some(), "the status change time"),
             (_crtime.is_some(), "the creation time"),
             (_chgtime.is_some(), "the attribute change time"),
@@ -1022,23 +1023,103 @@ impl Filesystem for Volume {
         }
         if !refused.is_empty() {
             warn!(
-                "inode {ino}: cannot set {} yet; refusing the request",
+                "inode {ino}: cannot set {} on a file system whose inodes do not carry them; \
+                 refusing the request",
                 refused.join(", ")
             );
             return reply.error(libc::ENOTSUP);
         }
-        let Some(wanted) = size else {
-            let _ = fh;
-            return self.reply_attr_of(ino, reply);
+
+        // A size change is the one field with real work behind it, and it refuses
+        // what it cannot do itself -- a file whose mapping is a B+tree, for one --
+        // so its error is the caller's error rather than this wrapper's.
+        if let Some(wanted) = size {
+            let current = match self.open_files.get_mut(&ino) {
+                Some(oi) => oi.dinode.fsize() as u64,
+                None => return reply.error(libc::ENOENT),
+            };
+            if wanted != current {
+                if let Err(e) = self.truncate(ino, wanted) {
+                    warn!("truncating inode {ino} to {wanted} failed: {e}");
+                    return reply.error(e.errno());
+                }
+            }
+        }
+
+        // The rest is an inode update: the fields the caller named, and the status
+        // change time that goes with every one of them.  `SystemTime::now()` for a
+        // `TimeOrNow::Now`, and the named instant otherwise.
+        let now = std::time::SystemTime::now();
+        let stamp = |t: fuser::TimeOrNow| match t {
+            fuser::TimeOrNow::SpecificTime(s) => s,
+            fuser::TimeOrNow::Now => now,
         };
-        let current = match self.open_files.get_mut(&ino) {
-            Some(oi) => oi.dinode.fsize() as u64,
-            None => return reply.error(libc::ENOENT),
-        };
-        if wanted != current {
-            if let Err(e) = self.truncate(ino, wanted) {
-                warn!("truncating inode {ino} to {wanted} failed: {e}");
+        let wants_inode =
+            mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some();
+        if wants_inode {
+            if !self.open_files.contains_key(&ino) && ino != FUSE_ROOT_ID {
+                return reply.error(libc::ENOENT);
+            }
+            let xfs_ino = self.xfs_ino(ino);
+            let at = self.sb.inode_offset(xfs_ino);
+            let inode_size = self.sb.inode_size();
+            let mut tx = self.begin();
+            let bytes = match tx.read_bytes(at, inode_size) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("inode {ino}: reading it at {at} failed: {e}");
+                    return reply.error(e.errno());
+                }
+            };
+            let mut raw = match RawDinode::from_bytes(bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("inode {ino}: its {inode_size} bytes are not an inode: {e}");
+                    return reply.error(e.errno());
+                }
+            };
+            if let Some(m) = mode {
+                // The inode's mode field carries the **file type as well as** the
+                // permissions, and `xfs_repair` checks it: writing the permission
+                // bits on their own leaves `0o1234` where `0o101234` was, and repair
+                // then reports `bad inode type 0` and would clear the inode.  So the
+                // type is kept from what the inode already had and only the
+                // permissions are taken from the request -- which is also what
+                // stops a `chmod` from turning a file into a directory.
+                let type_bits = raw.mode() & !0o7777;
+                raw.set_mode(type_bits | ((m as u16) & 0o7777));
+                raw.set_ctime(now);
+            }
+            if let Some(u) = uid {
+                raw.set_uid(u);
+                raw.set_ctime(now);
+            }
+            if let Some(g) = gid {
+                raw.set_gid(g);
+                raw.set_ctime(now);
+            }
+            if let Some(t) = atime {
+                raw.set_atime(stamp(t));
+                raw.set_ctime(now);
+            }
+            if let Some(t) = mtime {
+                raw.set_mtime(stamp(t));
+                raw.set_ctime(now);
+            }
+            raw.finalise();
+            if let Err(e) = tx.write_bytes(at, raw.as_bytes()) {
+                warn!("inode {ino}: writing it back failed: {e}");
                 return reply.error(e.errno());
+            }
+            if let Err(e) = tx.commit() {
+                warn!("inode {ino}: committing the change failed: {e}");
+                return reply.error(e.errno());
+            }
+            self.device.invalidate();
+            self.device.set_bufsize(inode_size);
+            let fresh = Dinode::from(self.device.by_ref(), &self.sb, xfs_ino);
+            if let Some(oi) = self.open_files.get_mut(&ino) {
+                oi.dinode = fresh;
             }
         }
         self.reply_attr_of(ino, reply)

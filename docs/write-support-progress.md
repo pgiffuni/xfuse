@@ -1360,6 +1360,54 @@ fork header rather than a node's records, and `ExtentMap`'s b-tree arm cannot fe
 a leaf.  So a spill is reader-then-writer, in that order, and the reader is a
 milestone of its own rather than a detail of the writer.
 
+### A directory cannot be read from a unit test, and that shapes what `create` needs
+
+`SUPERBLOCK` is a `OnceLock<Sb>` set once, from `Volume::open`, and the directory
+readers reach for it: `Dir2DataEntry::decode` does `SUPERBLOCK.get().unwrap()` to
+learn whether the file system keeps a type in a directory entry.  A unit test that
+opens an image with `Sb::from` has not set it, so **every directory read panics**
+with `called Option::unwrap() on a None value` — in code that panics, on a
+structure a caller supplied, inside a program whose whole job is reading images it
+did not write.
+
+That is worth two things.  The first is that the panic is a real robustness defect
+whatever the test says: `SUPERBLOCK.get()` on a path reachable only after a
+successful `Volume::open` is defensible, but a reader that cannot say "I do not know
+this file system's layout" and must therefore crash is not.  The second is
+practical: **the directory readers here can only be exercised through an opened
+volume**, which in practice means through a mount, so `create` has to be developed
+at that level rather than against a hand-opened image.
+
+### An inode's mode field carries the file type, and `xfs_repair` checks it
+
+Found by trying to add `chmod`, and it is the sort of thing that is invisible
+until something else looks.
+
+`setattr` refused the mode, the owner and the timestamps outright, so `chmod`,
+`chown` and `utimes` failed on every file.  Adding them meant writing an inode
+back, and the first attempt stored **only the permission bits** on the reasoning
+that the kernel sends the whole mode and only the permissions belong in an inode.
+That reasoning is wrong in the one way that matters: `di_mode` holds the file type
+*and* the permissions, and XFS depends on it.
+
+```text
+before:   mode 0o101234
+after writing 0o1234:  xfs_repair -n says
+    bad inode type 0 inode 100551
+    would have cleared inode 100551
+```
+
+So a file whose type bits are dropped is an inode `xfs_repair` calls bad and would
+clear, and the round trip through this code's own reader showed the mode intact —
+**both readers agreed and the file system did not.**  The fix is to take the type
+from the inode and only the permissions from the request, which is also what stops
+a `chmod` from turning a file into a directory.
+
+That is the third time in this work that a reader in this project and this project's
+own test agreed with each other and both were wrong, and it is the strongest
+argument for the rule this document now keeps: **the oracle is `xfs_repair`, not a
+round trip.**
+
 ### Every directory in these images is in *local* format
 
 `xfs_db` on `xfsv4.img` reports `/files` with `core.format = 1 (local)`, and the

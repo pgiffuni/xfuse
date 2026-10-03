@@ -44,6 +44,7 @@ mod util;
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -130,7 +131,7 @@ impl Drop for Mounted {
                 .arg("-u")
                 .arg(&self.mnt)
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::inherit())
                 .spawn()
             else {
                 // Not installed under that name; try the next one.
@@ -193,8 +194,14 @@ fn mount(image: &Path, tag: &str, writable: bool) -> Mounted {
     let mut process = command
         .arg(image)
         .arg(&mnt)
+        // When `XFUSE_TEST_LOG` is set the child speaks, which is the only way to
+        // see why the file system refused something the test asked it to do.
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(if std::env::var_os("XFUSE_TEST_LOG").is_some() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
         .spawn()
         .unwrap_or_else(|e| panic!("running xfs-fuse on {image:?}: {e}"));
 
@@ -737,6 +744,92 @@ fn a_file_with_more_extents_than_its_inode_holds_is_refused() {
     );
 }
 
+/// A file's mode, owner and timestamps can be changed, and the change survives a
+/// remount.
+///
+/// `setattr` previously honoured a file's size and refused everything else with
+/// `ENOTSUP`, which made `chmod`, `chown` and `utimes` fail on every file.  These
+/// are the attributes a caller changes most often after the size, and the inode
+/// has a field for each.
+///
+/// What is checked, in order of how badly a mistake would hurt:
+///
+/// * the **mode** survives, through a fresh read-only mount — read from the image,
+///   not from the page cache of the process that wrote it;
+/// * the **timestamps** survive, including a *named* one rather than "now", which
+///   is the case where a mistake would be invisible: writing the current time
+///   twice always looks right;
+/// * the file **type is not taken from the mode**.  The kernel sends the whole
+///   mode with the file type in it, and copying that into the inode would let
+///   `chmod` turn a file into a directory, so only the permission bits are stored;
+/// * and `xfs_repair -n` accepts the image, which is what says the inode's
+///   checksum and fields still agree.
+#[test]
+fn a_files_permissions_and_times_can_be_changed() {
+    require_fusefs!();
+    let image = writable_copy(&GOLDENV4, "setattr");
+    let blocksize = 4096u64;
+    let named = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+
+    with_rw_mount_at(&image, "setattr", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let before = std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777;
+        assert_ne!(
+            before, 0,
+            "the file starts with no permissions, so a change proves nothing"
+        );
+        let f = open_rw(&file);
+        f.set_permissions(std::fs::Permissions::from_mode(0o640))
+            .unwrap();
+        drop(f);
+    });
+
+    // A named timestamp, set on its own so that "now" cannot mask a mistake.
+    with_rw_mount_at(&image, "setattr-times", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let f = open_rw(&file);
+        f.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(named)
+                .set_accessed(named),
+        )
+        .unwrap();
+        drop(f);
+    });
+
+    with_ro_mount(&image, "setattr-ro", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let meta = std::fs::metadata(&file).unwrap();
+        assert_eq!(
+            meta.permissions().mode() & 0o7777,
+            0o640,
+            "the permissions did not survive the remount"
+        );
+        let modified = meta.modified().unwrap();
+        assert_eq!(
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            named
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            "the modification time is not the one that was set"
+        );
+        // And the file is still a file: the mode must not have carried a type
+        // through into the inode.
+        assert!(meta.is_file(), "the file stopped being a file");
+        assert_eq!(
+            std::fs::read(&file).unwrap().len(),
+            14,
+            "its contents did not change"
+        );
+        let _ = blocksize;
+    });
+
+    repair_accepts(&image, "after a file's permissions and times were changed");
+}
 /// The image is a file system `xfs_repair -n` accepts, or the reason it does not.
 ///
 /// A skip where there is no repair tool to ask, because a test that cannot run its

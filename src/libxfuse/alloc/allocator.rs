@@ -3655,6 +3655,83 @@ mod t {
         leaf_blocks: Vec<u32>,
     }
 
+    /// Does an inode survive being read, changed and written back?
+    ///
+    /// Asked while adding `chmod` support, because `setattr` wrote the inode back
+    /// and then re-read it and found a **zero mode** -- which is a panic in the
+    /// reader, since an inode with no type is one this code cannot interpret.  The
+    /// FUSE layer is not needed to see that, and adding it makes it harder to see,
+    /// so this is the same round trip with nothing in the way: read the inode, note
+    /// its mode, change the mode, write, commit, invalidate, read again.
+    #[test]
+    fn an_inode_survives_being_read_changed_and_written_back() {
+        let Some(image) = copy_of_golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let sb = sb_of(image.path());
+        let ino = 100_551u64;
+        let at = sb.inode_offset(ino);
+        let inode_size = sb.inode_size();
+        let device = Arc::new(BlockDevice::open(image.path(), Access::ReadWrite).unwrap());
+        let mut cache = BlockCache::new(sb.sb_blocksize as usize, 256);
+
+        let before = {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let raw =
+                RawDinode::from_bytes(tx.read_bytes(at, inode_size).expect("reading the inode"))
+                    .expect("decoding the inode");
+            eprintln!(
+                "inode {ino} at {at}: version {}, mode {:#o}, {} bytes",
+                raw.version(),
+                raw.mode(),
+                raw.as_bytes().len()
+            );
+            raw.mode()
+        };
+        assert_ne!(before, 0, "the inode has no mode to begin with");
+
+        {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut raw = RawDinode::from_bytes(
+                tx.read_bytes(at, inode_size)
+                    .expect("reading the inode again"),
+            )
+            .expect("decoding it again");
+            // Keep the type bits: the inode's mode field carries them, and dropping
+            // them leaves an inode xfs_repair calls bad.
+            raw.set_mode((before & !0o7777) | (before & 0o7777));
+            eprintln!("  after set_mode: {:#o}", raw.mode());
+            raw.finalise();
+            tx.write_bytes(at, raw.as_bytes()).expect("writing it back");
+            tx.commit().expect("commit");
+        }
+        device.flush().unwrap();
+        cache.invalidate();
+
+        let after = {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let bytes = tx
+                .read_bytes(at, inode_size)
+                .expect("reading it back from the image");
+            let raw = RawDinode::from_bytes(bytes).unwrap_or_else(|e| {
+                eprintln!("  the bytes written back are not an inode: {e}");
+                panic!()
+            });
+            eprintln!("  read back: mode {:#o}", raw.mode());
+            raw.mode()
+        };
+        assert_eq!(
+            after, before,
+            "an inode that was read, changed and written back did not come back the same"
+        );
+        assert_eq!(
+            after & !0o7777,
+            before & !0o7777,
+            "the file type in the mode did not survive"
+        );
+        assert_repair_accepts(image.path(), "after a chmod through the transaction");
+    }
     /// What a *free* inode's slot looks like on disk, read out of a real image.
     ///
     /// The write-support plan's rule is that inode availability comes from the
