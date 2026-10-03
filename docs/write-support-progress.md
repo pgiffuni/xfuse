@@ -1408,6 +1408,25 @@ own test agreed with each other and both were wrong, and it is the strongest
 argument for the rule this document now keeps: **the oracle is `xfs_repair`, not a
 round trip.**
 
+### The root has room, which is what `create` needs to know first
+
+The first step of `create` is a measurement rather than an implementation: a
+directory can only be written if there is somewhere in it to write.  Read through
+this code's own decoder, the root of `xfsv4.img` is one 4096-byte block holding
+fourteen names:
+
+```text
+.  ..  sf  block  leaf  node  btree2.2  btree3  btree_with_single_leaf
+sparse_leaf  sparse_btree  files  xattrs  links
+```
+
+so there is room in it for more than one of the names `create` would add, and
+`create` does not have to grow the directory to be useful on these images.  That is
+a fact about this image and not a general one: whether a directory has room depends
+on how full it is, and the code has to handle the case where it does not.
+
+Reading it at all needed `SUPERBLOCK` installed, which is not a detail:
+
 ### Every directory in these images is in *local* format
 
 `xfs_db` on `xfsv4.img` reports `/files` with `core.format = 1 (local)`, and the
