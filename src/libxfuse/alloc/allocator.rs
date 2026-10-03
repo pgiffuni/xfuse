@@ -3857,6 +3857,78 @@ mod t {
             "only {lengths_ok} entries were checked, which is too few to be a check"
         );
         eprintln!("every one of {lengths_ok} measurable entries is the length its name needs");
+
+        // The block's own two trailers, read straight from the image rather than
+        // through the parser, so this cross-checks the parser instead of agreeing
+        // with it.
+        //
+        // A block directory ends with an eight-byte tail holding the *count* of
+        // hash-to-address entries, and the hash index itself sits immediately
+        // before that tail, growing downwards towards the data as names are added.
+        // A writer needs both: the count to raise and the index to insert into
+        // without breaking its order.
+        let mut raw = vec![0u8; dblksize];
+        std::fs::File::open(image.path())
+            .unwrap()
+            .read_exact_at(&mut raw, sb.fsb_to_offset(start))
+            .unwrap();
+        let tail_at = dblksize - 8;
+        let word = |raw: &[u8], at: usize| u32::from_be_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
+        let count = word(&raw, tail_at) as usize;
+        let stale = word(&raw, tail_at + 4);
+        let magic = word(&raw, 0);
+        let index_at = tail_at - 8 * count;
+        eprintln!(
+            "the block's magic is {magic:#010x}, its tail says {count} hash entries and {stale} \
+             stale bytes; they start at {index_at}"
+        );
+        assert_ne!(magic, 0, "the block does not start with a magic");
+        assert!(index_at >= dblksize / 2, "the hash index is implausibly far down the block");
+        let index: Vec<(u32, u32)> = (0..count)
+            .map(|i| (word(&raw, index_at + 8 * i), word(&raw, index_at + 8 * i + 4)))
+            .collect();
+        eprintln!("the hash index: {index:?}");
+        assert!(
+            index.windows(2).all(|w| w[0].0 < w[1].0),
+            "the hash index is not sorted: {index:?}"
+        );
+        // An address is the entry's offset in units of eight, which is how
+        // `get_addresses` turns one back into an offset, and which is what makes
+        // this a cross-check of the two halves rather than a second reading of one.
+        for ((name, _ino), entry_at) in names.iter().zip(offsets.iter()) {
+            let at = *entry_at;
+            assert!(
+                index.iter().any(|(_, addr)| *addr == (at / 8) as u32),
+                "no hash entry points at `{name}` at offset {at}"
+            );
+        }
+        assert_eq!(
+            index.len(),
+            names.len(),
+            "the hash index holds {} entries for {} names",
+            index.len(),
+            names.len()
+        );
+        // And where a new name would go: after the last entry, which leaves the
+        // room the first commit of this measured.
+        let last = names.last().expect("the root has names");
+        let mut last_entry = vec![0u8; 32];
+        last_entry[8] = last.0.as_bytes()[0];
+        let last_end = offsets.last().copied().unwrap_or(0) as usize
+            + Dir2DataEntry::get_length(&sb, &last_entry) as usize;
+        eprintln!(
+            "the last entry ends at {last_end}; the hash index starts at {index_at}, so {} \
+             bytes are free between them",
+            index_at.saturating_sub(last_end)
+        );
+        assert!(
+            last_end <= index_at,
+            "the entries run into the hash index: {last_end} > {index_at}"
+        );
+        assert!(
+            index_at - last_end > 64,
+            "a name and its hash entry would not fit in what is free"
+        );
     }
 
     /// What a *free* inode's slot looks like on disk, read out of a real image.
