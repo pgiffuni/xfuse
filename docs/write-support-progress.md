@@ -864,7 +864,62 @@ requires them to agree about the level, the record count, every key and every
 pointer -- which is **shipped code being checked against a real file for the first
 time**, since every inode any other test reads has its extents *in* the inode.
 
-What is still not established is the record layout *inside* a b-map block, and the
+### The b-map block: what three leaves agree on, and the one thing they do not
+
+The record layout *inside* a b-map block is the last piece of this, and it is worth
+writing down as far as it actually goes, because most of it now rests on three
+independent confirmations rather than on one reading.
+
+`xfs_db` cannot help: its type list has `attr`, `bnobt`, `inobt` and the two
+`bmapb*` names, and asked to decode a b-map block with any of them it falls back to
+a raw hex dump or answers `no current type`.  So the block was read directly, and
+the three children of inode 100553's fork were compared -- which is the useful part,
+because each has a *known* first extent, because the fork's keys say so.
+
+```text
+daddr 50313  level 0 numrecs 30   fork key says its first extent is at block 0
+daddr 50315  level 0 numrecs 15   ...                                        30
+daddr 50317  level 0 numrecs 19   ...                                        45
+```
+
+and at offset 24 of each, stepping 16 bytes:
+
+```text
+50313:     0,   512,  1024, ...
+50315: 15360, 15872, 16384, ...
+50317: 23040, 23552, 24064, ...
+```
+
+Those first values are 0, 15360 and 23040 -- **exactly the byte offsets the fork's
+keys imply** (blocks 0, 30 and 45 at 512 bytes apiece).  Three leaves, three
+matches, so this is established rather than noticed:
+
+* the magic in a b-map block is `BMAP` (`0x424d4150`), the level and record count
+  are the usual 4-byte and 2-byte fields at 4 and 6, and the sibling fields are at
+  8 and 12;
+* **the records start at offset 24 and are 16 bytes apart**, with the file offset
+  in the *second* eight bytes of each.
+
+**What is not explained** is the partner field.  Interleaved with those startoffs
+are values like `0x0000001891000001`, and no reading of them is a block number in a
+131072-block image -- `0x0000001891000001` is 6.6 billion.  Three possibilities
+remain and this suite cannot currently choose between them:
+
+1. the partner field is not a block number but something this image's builder
+   wrote, which is a real possibility because `xfsv4.img` is **hand-built**;
+2. the record is not 16 bytes and the series at offset 24 is something else that
+   happens to line up with the fork's keys three times over;
+3. the field is a block number in a unit or width this suite has not identified.
+
+Option 2 is the one that would invalidate everything above, and it is cheap to
+settle: build a single leaf with one record whose startoff is unambiguous, and ask
+`xfs_repair` what block it thinks the extent lives at.  That is the next
+experiment, and it is described in the failed attempt below so it does not have to
+be rediscovered.
+
+### The attempt that failed, and why it is worth writing down
+
+
 attempt to settle it by hand is worth recording as a failure of method rather than
 of arithmetic.  Patching a slot and asking repair produces a complaint whose
 numbers can be read several ways, and four candidate layouts all produced
