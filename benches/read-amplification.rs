@@ -18,7 +18,7 @@ use xattr::FileExt;
 
 #[path = "../tests/util.rs"]
 mod util;
-use util::{waitfor, GOLDEN1K, GOLDEN4K};
+use util::{is_fusefs, waitfor, GOLDEN1K, GOLDEN4K};
 
 pub struct Gnop {
     path: PathBuf,
@@ -288,7 +288,7 @@ fn main() {
 
         waitfor(Duration::from_secs(5), || {
             let s = nix::sys::statfs::statfs(d.path()).unwrap();
-            s.filesystem_type_name() == "fusefs.xfs"
+            is_fusefs(&s)
         })
         .unwrap();
 

@@ -46,14 +46,18 @@ continuous integration then rejects.  That is not hypothetical: fourteen warning
 sat in `#[cfg(test)]` code, invisible to every local command that was used, and
 continuous integration's nightly `-D warnings` stopped on all fourteen at once.
 
-`cargo clippy --all-targets` on a Linux host also reports errors in
-`tests/integration.rs` and `benches/`, which are FreeBSD-only and do not compile
-here at all — `EXTATTR_NAMESPACE_USER`, `extattr_list_file` and
-`filesystem_type_name` do not exist in Linux's `libc`.  Those are not findings;
-the two commands that do work on both platforms are
+The whole tree — including `tests/integration.rs` and `benches/` — builds and
+lints on both Linux and FreeBSD.  It did not for a while, and the reason is
+worth recording: the integration tests reached for `EXTATTR_NAMESPACE_USER`,
+`extattr_list_file` and `filesystem_type_name`, none of which exist in Linux's
+`libc`, so `cargo clippy --all-targets` could not finish on a Linux host at all.
+Each of those now goes through a small helper that answers the same question on
+both systems — `is_fusefs`, `xattr_list_bytes`, `xattr_get_bytes` in
+`tests/util.rs` and `tests/integration.rs` — which is why the tests that were
+FreeBSD-only for want of a syscall are not any more, and why the commands are
 
 ```sh
-cargo clippy --bins --tests -- -D warnings   # everything but the FreeBSD-only files
+cargo clippy --all-targets -- -D warnings   # on either platform
 cargo test --bins                            # the unit tests
 ```
 

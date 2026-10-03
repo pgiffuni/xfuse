@@ -27,6 +27,7 @@ use tempfile::{tempdir, TempDir};
 
 mod util;
 use util::{
+    is_fusefs,
     waitfor,
     GOLDEN1K,
     GOLDEN4K,
@@ -92,6 +93,127 @@ fn remote_attrs_per_file(f: &str) -> usize {
     }
 }
 
+/// The width of a mode field.
+///
+/// Linux's `libc` gives the `S_IF*` constants and `st_mode` as `u32`; FreeBSD's
+/// gives both as `u16`.  Naming the width lets a test take the constants as
+/// they are and compare them against the mode as it is, on either system,
+/// rather than casting a type that is already the right one on one of them.
+#[cfg(target_os = "freebsd")]
+type Mode = u16;
+#[cfg(target_os = "linux")]
+type Mode = u32;
+
+/// The prefix a lookup must supply.
+///
+/// FreeBSD's extended attribute syscalls take the namespace as an argument, so
+/// they are given a name on its own.  Linux has no namespace argument, so the
+/// namespace is part of the name and has to be typed.  An attribute's own name
+/// -- the part after the prefix -- is the same either way, which is why the
+/// tests name attributes that way and let these helpers add what is needed.
+#[cfg(target_os = "freebsd")]
+const XATTR_LOOKUP_PREFIX: &str = "";
+#[cfg(target_os = "linux")]
+const XATTR_LOOKUP_PREFIX: &str = "user.";
+
+/// Bytes a listing charges an attribute beyond the length of its own name.
+///
+/// A listing is names separated by NULs, so it charges each name a NUL.  It
+/// also charges, on FreeBSD but not on Linux, the `user.` prefix: the FreeBSD
+/// listing was asked for a namespace and reports the names within it, whereas
+/// the Linux listing reports the full names, prefix included.  So the names
+/// `expected_xattrs_per_file` returns, which are always full, are longer than
+/// a FreeBSD listing's by exactly the prefix.
+#[cfg(target_os = "freebsd")]
+const XATTR_LIST_OVERHEAD: usize = "user.".len();
+#[cfg(target_os = "linux")]
+const XATTR_LIST_OVERHEAD: usize = 0;
+
+/// The errno a system reports for an extended attribute that is not there.
+///
+/// FreeBSD invented `ENOATTR` because its other file systems do not store
+/// extended attributes and have no errno to say so; Linux reuses `ENODATA`,
+/// which its other file systems do use.  Which of the two it is says nothing
+/// about the code under test: a lookup of a name that is not present has to
+/// come back as an error, and this is the one it must be.
+#[cfg(target_os = "freebsd")]
+const XATTR_ABSENT: i32 = libc::ENOATTR;
+#[cfg(target_os = "linux")]
+const XATTR_ABSENT: i32 = libc::ENODATA;
+
+/// How many bytes the extended attribute list of `p` occupies.
+///
+/// The two syscalls are one query under two names, and they answer it the same
+/// way: the size of the list, whether or not they were given somewhere to put
+/// it.  `buf` is that somewhere; `None` asks for the size alone, which is what
+/// a test that must not fetch the list wants.
+#[cfg(target_os = "freebsd")]
+fn xattr_list_bytes(p: &Path, mut buf: Option<&mut [u8]>) -> isize {
+    use std::{ffi::CString, ptr};
+    let cpath = CString::new(p.as_os_str().as_bytes()).unwrap();
+    unsafe {
+        libc::extattr_list_file(
+            cpath.as_ptr(),
+            libc::EXTATTR_NAMESPACE_USER,
+            buf.as_deref_mut()
+                .map_or(ptr::null_mut(), |b| b.as_mut_ptr().cast()),
+            buf.as_ref().map_or(0, |b| b.len()),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn xattr_list_bytes(p: &Path, mut buf: Option<&mut [u8]>) -> isize {
+    use std::{ffi::CString, ptr};
+    let cpath = CString::new(p.as_os_str().as_bytes()).unwrap();
+    unsafe {
+        libc::listxattr(
+            cpath.as_ptr(),
+            buf.as_deref_mut()
+                .map_or(ptr::null_mut(), |b| b.as_mut_ptr().cast()),
+            buf.as_ref().map_or(0, |b| b.len()),
+        )
+    }
+}
+
+/// The value of one extended attribute, or how long it is.
+///
+/// `name` is the attribute's own name, without the namespace prefix, which
+/// `XATTR_LOOKUP_PREFIX` supplies.  `buf` is where the value goes, or `None` to
+/// ask only for its length.
+#[cfg(target_os = "freebsd")]
+fn xattr_get_bytes(p: &Path, name: &OsStr, mut buf: Option<&mut [u8]>) -> isize {
+    use std::{ffi::CString, ptr};
+    let cpath = CString::new(p.as_os_str().as_bytes()).unwrap();
+    let cname = CString::new(name.as_bytes()).unwrap();
+    unsafe {
+        libc::extattr_get_file(
+            cpath.as_ptr(),
+            libc::EXTATTR_NAMESPACE_USER,
+            cname.as_ptr(),
+            buf.as_deref_mut()
+                .map_or(ptr::null_mut(), |b| b.as_mut_ptr().cast()),
+            buf.as_ref().map_or(0, |b| b.len()),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn xattr_get_bytes(p: &Path, name: &OsStr, mut buf: Option<&mut [u8]>) -> isize {
+    use std::{ffi::CString, ptr};
+    let cpath = CString::new(p.as_os_str().as_bytes()).unwrap();
+    let cname = CString::new(format!("{XATTR_LOOKUP_PREFIX}{}", name.to_string_lossy())).unwrap();
+    unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            cname.as_ptr(),
+            buf.as_deref_mut()
+                .map_or(ptr::null_mut(), |b| b.as_mut_ptr().cast()),
+            buf.as_ref().map_or(0, |b| b.len()),
+        )
+    }
+}
+
 /// How many directory entries are in each directory?
 // This is a function of the golden image creation.
 fn ents_per_dir_longnames(path: &Path, d: &str) -> usize {
@@ -147,7 +269,7 @@ fn harness(img: &Path, rtimg: Option<&Path>) -> Harness {
 
     waitfor(Duration::from_secs(5), || {
         let s = nix::sys::statfs::statfs(d.path()).unwrap();
-        s.filesystem_type_name() == "fusefs.xfs"
+        is_fusefs(&s)
     })
     .unwrap();
 
@@ -367,7 +489,7 @@ mod dev {
 
         waitfor(Duration::from_secs(5), || {
             let s = nix::sys::statfs::statfs(d.path()).unwrap();
-            s.filesystem_type_name() == "fusefs.xfs"
+            is_fusefs(&s)
         })
         .unwrap();
 
@@ -521,62 +643,34 @@ mod getextattr {
     }
 
     /// Try to get the value of an extended attribute that doesn't exist.
-    // This test is freebsd-specific because the relevant syscall is.  It could
-    // be implemented for Linux too, but I haven't done so.
-    #[cfg(target_os = "freebsd")]
     #[named]
     #[apply(all_xattr_fork_types_with_none)]
     fn enoattr(#[case] h: fn() -> Harness, #[case] d: &str) {
-        use std::ffi::CString;
-
         require_fusefs!();
 
         let harness = h();
-        let ns = libc::EXTATTR_NAMESPACE_USER;
         let p = harness.d.path().join(d);
-        let cpath = CString::new(p.as_os_str().as_bytes()).unwrap();
-        let attrname = OsStr::new("user.nonexistent");
-        let cattrname = CString::new(attrname.as_bytes()).unwrap();
-        let mut v = Vec::<u8>::with_capacity(80);
-        let r = unsafe {
-            libc::extattr_get_file(
-                cpath.as_ptr(),
-                ns,
-                cattrname.as_ptr(),
-                v.as_mut_ptr().cast(),
-                v.capacity(),
-            )
-        };
+        let mut v = vec![0u8; 80];
+        let r = xattr_get_bytes(&p, OsStr::new("nonexistent"), Some(v.as_mut_slice()));
         assert!(r < 0);
         assert_eq!(
-            libc::ENOATTR,
+            XATTR_ABSENT,
             io::Error::last_os_error().raw_os_error().unwrap()
         );
     }
 
     /// Try to get the size of an extended attribute that doesn't exist.
-    // This test is freebsd-specific because the relevant syscall is.  It could
-    // be implemented for Linux too, but I haven't done so.
-    #[cfg(target_os = "freebsd")]
     #[named]
     #[apply(all_xattr_fork_types_with_none)]
     fn enoattr_size(#[case] h: fn() -> Harness, #[case] d: &str) {
-        use std::{ffi::CString, ptr};
-
         require_fusefs!();
 
         let harness = h();
-        let ns = libc::EXTATTR_NAMESPACE_USER;
         let p = harness.d.path().join(d);
-        let cpath = CString::new(p.as_os_str().as_bytes()).unwrap();
-        let attrname = OsStr::new("user.nonexistent");
-        let cattrname = CString::new(attrname.as_bytes()).unwrap();
-        let r = unsafe {
-            libc::extattr_get_file(cpath.as_ptr(), ns, cattrname.as_ptr(), ptr::null_mut(), 0)
-        };
+        let r = xattr_get_bytes(&p, OsStr::new("nonexistent"), None);
         assert!(r < 0);
         assert_eq!(
-            libc::ENOATTR,
+            XATTR_ABSENT,
             io::Error::last_os_error().raw_os_error().unwrap()
         );
     }
@@ -659,7 +753,7 @@ fn daemonize() {
 
     waitfor(Duration::from_secs(5), || {
         let s = nix::sys::statfs::statfs(d.path()).unwrap();
-        s.filesystem_type_name() == "fusefs.xfs"
+        is_fusefs(&s)
     })
     .unwrap();
 
@@ -668,7 +762,7 @@ fn daemonize() {
 
     // And the file system should still be mounted
     let s = nix::sys::statfs::statfs(d.path()).unwrap();
-    assert_eq!(s.filesystem_type_name(), "fusefs.xfs");
+    assert!(is_fusefs(&s));
 
     // Now clean up
     let cmd = Command::new("umount").arg(d.path()).output();
@@ -1001,17 +1095,12 @@ mod lsextattr {
     #[named]
     #[rstest]
     fn empty(harness4k: Harness) {
-        use std::ffi::CString;
         require_fusefs!();
 
-        let ns = libc::EXTATTR_NAMESPACE_USER;
         let p = harness4k.d.path().join("files/hello.txt");
-        let cpath = CString::new(p.as_os_str().as_bytes()).unwrap();
-        let mut v = Vec::<u8>::with_capacity(1024);
+        let mut v = vec![0u8; 1024];
 
-        let r = unsafe {
-            libc::extattr_list_file(cpath.as_ptr(), ns, v.as_mut_ptr().cast(), v.capacity())
-        };
+        let r = xattr_list_bytes(&p, Some(v.as_mut_slice()));
         if let Ok(r) = usize::try_from(r) {
             assert_eq!(0, r);
         } else {
@@ -1022,14 +1111,11 @@ mod lsextattr {
     #[named]
     #[rstest]
     fn empty_size(harness4k: Harness) {
-        use std::{ffi::CString, ptr};
         require_fusefs!();
 
-        let ns = libc::EXTATTR_NAMESPACE_USER;
         let p = harness4k.d.path().join("files/hello.txt");
-        let cpath = CString::new(p.as_os_str().as_bytes()).unwrap();
 
-        let r = unsafe { libc::extattr_list_file(cpath.as_ptr(), ns, ptr::null_mut(), 0) };
+        let r = xattr_list_bytes(&p, None);
         if let Ok(r) = usize::try_from(r) {
             assert_eq!(0, r);
         } else {
@@ -1039,26 +1125,20 @@ mod lsextattr {
 
     /// Lookup the size of the extended attribute list of a file, without
     /// fetching it.
-    // This test is freebsd-specific because the relevant syscall is.  It could
-    // be implemented for Linux too, but I haven't done so.
-    #[cfg(target_os = "freebsd")]
     #[named]
     #[apply(all_xattr_fork_types)]
     fn size(#[case] h: fn() -> Harness, #[case] d: &str) {
-        use std::{ffi::CString, ptr};
         require_fusefs!();
 
         let harness = h();
-        let ns = libc::EXTATTR_NAMESPACE_USER;
         let p = harness.d.path().join(d);
         let expected_len: usize = expected_xattrs_per_file(d)
-            .map(|attr| {
-                attr.name.len() /* -5 because "user." is not included*/ - 5 /* +1 for NUL */ + 1
-            })
+            .map(
+                |attr| attr.name.len() - XATTR_LIST_OVERHEAD + 1, /* NUL */
+            )
             .sum();
-        let cpath = CString::new(p.as_os_str().as_bytes()).unwrap();
 
-        let r = unsafe { libc::extattr_list_file(cpath.as_ptr(), ns, ptr::null_mut(), 0) };
+        let r = xattr_list_bytes(&p, None);
         if let Ok(r) = usize::try_from(r) {
             assert_eq!(expected_len, r);
         } else {
@@ -1081,9 +1161,18 @@ mod open {
         let _f1 = fs::File::open(&path).unwrap();
         // Open it again with a different mode.  This forces fusefs(4) to send a
         // separate FUSE_OPEN request.
+        //
+        // FreeBSD's O_EXEC opens for execute permission alone, so the second
+        // open asks for something the first did not.  Linux has no such flag,
+        // and O_NOCTTY is the one flag that is guaranteed both to be a real
+        // difference in the open mode and to be ignored for a regular file.
+        #[cfg(target_os = "freebsd")]
+        let mode = libc::O_EXEC;
+        #[cfg(target_os = "linux")]
+        let mode = libc::O_NOCTTY;
         let _f2 = fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_EXEC)
+            .custom_flags(mode)
             .open(&path)
             .unwrap();
     }
@@ -1638,7 +1727,7 @@ mod stat {
     #[case::chardev("chardev", libc::S_IFCHR)]
     #[case::fifo("fifo", libc::S_IFIFO)]
     #[case::socket("sock", libc::S_IFSOCK)]
-    fn devs(harness4k: Harness, #[case] filename: &str, #[case] devtype: u16) {
+    fn devs(harness4k: Harness, #[case] filename: &str, #[case] devtype: Mode) {
         require_fusefs!();
 
         let path = harness4k.d.path().join("files").join(filename);
@@ -1676,15 +1765,15 @@ fn statfs(harness4k: Harness) {
 
     // Linux's calculation for blocks available and free is complicated and the
     // docs indicate that it's approximate.  So don't assert on the exact value.
-    assert_eq!(
-        sfs.blocks_available(),
-        i64::try_from(sfs.blocks_free()).unwrap()
-    );
+    // `nix` gives these out as `u64` on FreeBSD and `i64` on Linux, so the
+    // comparison is made in a width both have.  None of these values is
+    // negative on a file system with blocks in it.
+    assert_eq!(sfs.blocks_available() as i64, sfs.blocks_free() as i64);
 
     // Linux's calculation for f_files is very confusing and not supported by
     // the XFS documentation.  I think it may be wrong.  So don't assert on it
     // here.
-    assert_eq!(i64::try_from(sfs.files()).unwrap() - sfs.files_free(), 750);
+    assert_eq!(sfs.files() as i64 - sfs.files_free() as i64, 750);
 
     // There are legitimate questions about what the correct value for
     // optimal_transfer_size

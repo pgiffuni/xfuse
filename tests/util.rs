@@ -99,6 +99,29 @@ macro_rules! require_root {
     };
 }
 
+/// Is this statfs a FUSE mount?
+///
+/// Every harness polls for this before it touches the file system, because a
+/// mount that is not up yet yields a statfs of whatever is underneath the
+/// mount point, and every test that ran against that would fail in a way that
+/// says nothing about the code under test.
+///
+/// FreeBSD reports a name, and the name a FUSE mount reports is what these
+/// tests have always compared against.  Linux has no name to compare -- `nix`
+/// offers the magic number instead -- so the check is the same question asked
+/// of the only thing Linux exposes.
+#[allow(unused)] // Not used by the write tests
+#[cfg(target_os = "freebsd")]
+pub fn is_fusefs(sfs: &nix::sys::statfs::Statfs) -> bool {
+    sfs.filesystem_type_name() == "fusefs.xfs"
+}
+
+#[allow(unused)] // Not used by the write tests
+#[cfg(target_os = "linux")]
+pub fn is_fusefs(sfs: &nix::sys::statfs::Statfs) -> bool {
+    sfs.filesystem_type() == nix::sys::statfs::FUSE_SUPER_MAGIC
+}
+
 /// Does this look like a golden image that was extracted properly?
 ///
 /// Not all of the golden images are file systems: `xfs_rt2.img` is a real-time
