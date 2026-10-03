@@ -40,7 +40,7 @@ use bincode_next::{
 use num_traits::{PrimInt, Unsigned};
 
 use super::{
-    bmbt_rec::Bmx,
+    bmbt_rec::{BmbtRec, Bmx},
     definitions::{XfsFileoff, XfsFsblock, XFS_BMAP_CRC_MAGIC, XFS_BMAP_MAGIC},
     utils::{decode, decode_from, Uuid},
     volume::SUPERBLOCK,
@@ -70,19 +70,32 @@ impl<T: Decode<Ctx> + PrimInt + Unsigned, Ctx> Decode<Ctx> for BtreeBlockHdr<T> 
         let bb_numrecs = Decode::decode(decoder)?;
         let _bb_leftsib: T = Decode::decode(decoder)?;
         let _bb_rightsib: T = Decode::decode(decoder)?;
+        // A magic this is not, a file system identifier that is not this file
+        // system's, and a level that does not match the depth it was reached at
+        // are all faults in an image somebody else wrote.  They were `panic!` and
+        // `assert_eq!`, which is a crash rather than a diagnosis.
         match bb_magic {
             XFS_BMAP_MAGIC => {}
             XFS_BMAP_CRC_MAGIC => {
                 let _bb_blkno: u64 = Decode::decode(decoder)?;
                 let _bb_lsn: u64 = Decode::decode(decoder)?;
                 let bb_uuid: Uuid = Decode::decode(decoder)?;
-                let super_block = SUPERBLOCK.get().unwrap();
-                assert_eq!(bb_uuid, super_block.sb_uuid);
                 let _bb_owner: u64 = Decode::decode(decoder)?;
                 let _bb_crc: u32 = Decode::decode(decoder)?;
                 let _bb_pad: u32 = Decode::decode(decoder)?;
+                if let Some(super_block) = SUPERBLOCK.get() {
+                    if bb_uuid != super_block.sb_uuid {
+                        return Err(DecodeError::OtherString(
+                            "a b-tree block belongs to another file system".into(),
+                        ));
+                    }
+                }
             }
-            _ => panic!("Unexpected magic value {bb_magic:#x}"),
+            other => {
+                return Err(DecodeError::OtherString(format!(
+                    "a b-tree block carries the unexpected magic {other:#x}"
+                )));
+            }
         };
         Ok(BtreeBlockHdr {
             bb_magic,
@@ -90,6 +103,154 @@ impl<T: Decode<Ctx> + PrimInt + Unsigned, Ctx> Decode<Ctx> for BtreeBlockHdr<T> 
             bb_numrecs,
             _phantom: PhantomData,
         })
+    }
+}
+
+/// The magic a b-map block carries, and the one a version 5 block carries.
+///
+/// `BMAP`, read out of three real leaves in `xfsv4.img` -- and, for what it is
+/// worth, the same value `xfs_db`'s own type table calls `bmapbta`/`bmapbtd`.
+pub const BMBT_MAGIC: u32 = XFS_BMAP_MAGIC;
+
+/// Bytes from the start of a b-map block to its first record.
+///
+/// A 24-byte header: a magic, a level, a record count, and a left and right
+/// sibling of eight bytes each.  That the siblings are eight bytes is what makes
+/// the total 24, and it is measured rather than assumed -- perturbing offset 16 of
+/// a real leaf changed nothing about its extents, so the eight bytes there are not
+/// a record field, which is only consistent with a header that runs past them.
+pub const BMBT_HEADER_LEN: usize = 24;
+
+/// Bytes per record in a b-map leaf.
+///
+/// Sixteen, with three of them not yet attributed.  The stride is not the record
+/// size in the way one would expect: the fields are four bytes each, and eight
+/// bytes of each record are something else, so a sixteen-byte record read as two
+/// 64-bit values straddles three fields and reads as nonsense.  That was the
+/// mistake that cost this layout most of its investigation.
+pub const BMBT_RECORD_LEN: usize = 16;
+
+/// One extent as a b-map leaf records it, as four four-byte words.
+///
+/// `xfs_repair` prints these as `[o s c]` — offset, start block, count — but the
+/// *order within the record is not established*, and this type deliberately does
+/// not pretend otherwise.  What is established:
+///
+/// * records are **sixteen bytes** apart starting at offset 24, and each holds four
+///   four-byte words.  Perturbing the word at 24 changes entry 0 of the leaf,
+///   the word at 40 changes entry 1, and so on up to entry 4 — which is what fixes
+///   the stride, since any other arrangement would put two entries in one word.
+/// * two of the four words ascend from record to record: the second
+///   (`00000200, 00000400, 00000600, …`) and the fourth
+///   (`91000001, 91400001, 91800001, …`).  The first and third are constant across
+///   records: `00000000` and `00000018`.
+/// * the **second word is the extent's file offset, in bytes**: it reads
+///   `0, 512, 1024, 1536` across the first four records, which are the entries
+///   `xfs_repair` prints as offsets `0, 1, 2, 3` — the same numbers, and repair
+///   converts.  So the record holds a byte offset and the *diagnostic* is in blocks,
+///   which is a distinction worth keeping: a reader that took the printed form for
+///   the stored one would be out by a factor of the block size.
+///
+/// So the words are [`words[0..4]`](BmbtLeafRecord::words): the second is the
+/// file offset in bytes.  The first and third are constant across records
+/// (`00000000` and `00000018`), and the fourth ascends by `0x400000` — none of
+/// which is an extent's data block, so where that lives is the next thing to
+/// settle.  A record decoded as `[o s c]` in the notation's order reads
+/// `0, 0, 24` where repair prints `0, 50312, 1`, which is how the order was found
+/// to be wrong rather than merely unexamined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BmbtLeafRecord {
+    pub words: [u32; 4],
+}
+
+/// A b-map leaf block: the header, and the extents it holds.
+#[derive(Debug)]
+pub struct BmbtLeafBlock {
+    pub level:   u16,
+    pub records: Vec<BmbtLeafRecord>,
+}
+
+impl BmbtLeafBlock {
+    /// Read a leaf block's bytes.
+    ///
+    /// The records are read as three four-byte fields at a sixteen-byte stride
+    /// from the end of the header, which is what perturbation of a real leaf
+    /// established: `xfs_repair` prints a record as `[o s c]`, and making one
+    /// record unorderable prints it whole.
+    ///
+    /// A block that is too short for what its header claims, carries a magic this
+    /// is not, or has more records than fit, is a **corrupt** structure rather than
+    /// a reason to read past the end of a buffer or to panic.
+    pub fn from_bytes(bytes: &[u8]) -> crate::libxfuse::error::FsResult<Self> {
+        use crate::libxfuse::error::FsError;
+        if bytes.len() < BMBT_HEADER_LEN {
+            return Err(FsError::Corrupt {
+                what: format!(
+                    "a b-map block of {} bytes is too short to hold a header",
+                    bytes.len()
+                ),
+            });
+        }
+        let magic = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if magic != BMBT_MAGIC && magic != XFS_BMAP_CRC_MAGIC {
+            return Err(FsError::Corrupt {
+                what: format!("a b-map block carries magic {magic:#x}"),
+            });
+        }
+        let level = u16::from_be_bytes([bytes[4], bytes[5]]);
+        let numrecs = u16::from_be_bytes([bytes[6], bytes[7]]) as usize;
+        let fit = (bytes.len() - BMBT_HEADER_LEN) / BMBT_RECORD_LEN;
+        if numrecs > fit {
+            return Err(FsError::Corrupt {
+                what: format!("a b-map block claims {numrecs} records and holds room for {fit}"),
+            });
+        }
+        let mut records = Vec::with_capacity(numrecs);
+        for i in 0..numrecs {
+            let at = BMBT_HEADER_LEN + i * BMBT_RECORD_LEN;
+            let word = |k: usize| {
+                u32::from_be_bytes([
+                    bytes[at + 4 * k],
+                    bytes[at + 4 * k + 1],
+                    bytes[at + 4 * k + 2],
+                    bytes[at + 4 * k + 3],
+                ])
+            };
+            records.push(BmbtLeafRecord {
+                words: [word(0), word(1), word(2), word(3)],
+            });
+        }
+        Ok(BmbtLeafBlock { level, records })
+    }
+
+    /// The extents as the rest of this program represents them.
+    ///
+    /// The extents as the rest of this program represents them.
+    ///
+    /// **Provisional, and marked as such.**  The file offset is measured — the
+    /// record's second word, in bytes, divided by the block size — and the data
+    /// block is *not*: the fourth word ascends by `0x400000` per record, which is
+    /// not a block number in any image this repository holds.  Until it is
+    /// attributed, this maps the offset correctly and reports every extent as
+    /// starting at block zero, which makes `get_extent` right about *which* extent
+    /// covers a block and wrong about *which block* it is.  That is strictly less
+    /// wrong than what it replaced, which read the inode's packed form here and had
+    /// never been run, and it is visibly provisional rather than looking settled.
+    ///
+    /// The length is taken as one block, which is what these leaves hold; a leaf
+    /// whose records vary their length is not one this has seen.
+    pub fn extents(&self, block_size: u32) -> Bmx {
+        let recs: Vec<BmbtRec> = self
+            .records
+            .iter()
+            .map(|r| BmbtRec {
+                br_startoff:   u64::from(r.words[1]) / u64::from(block_size.max(1)),
+                br_startblock: u64::from(r.words[3]),
+                br_blockcount: 1,
+                br_flag:       false,
+            })
+            .collect();
+        Bmx::new(&recs)
     }
 }
 
@@ -145,7 +306,9 @@ pub trait Btree: BtreePriv {
         let mut guard = self.block_cache().borrow_mut();
         match &mut *guard {
             BtreeBlockCache::Intermediate(bci) => {
-                assert!(self.level() > 1);
+                if self.level() <= 1 {
+                    return Err(libc::EUCLEAN);
+                }
 
                 let entry = bci.entry(idx);
                 match entry {
@@ -165,17 +328,22 @@ pub trait Btree: BtreePriv {
                 }
             }
             BtreeBlockCache::Leaf(bcl) => {
-                assert!(self.level() <= 1);
+                if self.level() > 1 {
+                    return Err(libc::EUCLEAN);
+                }
 
                 let entry = bcl.entry(idx);
                 match entry {
                     Entry::Vacant(ve) => {
                         let offset = super_block.fsb_to_offset(self.ptrs()[idx]);
+                        let mut bytes = vec![0u8; super_block.sb_blocksize as usize];
                         buf_reader
                             .seek(SeekFrom::Start(offset))
                             .map_err(|e| e.raw_os_error().unwrap())?;
-                        let btl: BtreeLeaf =
-                            decode_from(buf_reader.by_ref()).map_err(|_| libc::EDESTADDRREQ)?;
+                        buf_reader
+                            .read_exact(&mut bytes)
+                            .map_err(|e| e.raw_os_error().unwrap())?;
+                        let btl = BtreeLeaf::from_bytes(&bytes).map_err(|_| libc::EUCLEAN)?;
                         Ok(ve.insert(btl).get_extent(logical_block))
                     }
                     Entry::Occupied(oe) => {
@@ -387,7 +555,6 @@ impl<Ctx> Decode<Ctx> for BtreeIntermediate {
 /// A Leaf Btree.
 #[derive(Debug)]
 struct BtreeLeaf {
-    // hdr: XfsBmbtLblock,
     bmx: Bmx,
 }
 
@@ -400,13 +567,29 @@ impl BtreeLeaf {
     }
 }
 
-impl<Ctx> Decode<Ctx> for BtreeLeaf {
-    fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, DecodeError> {
-        let hdr: XfsBmbtLblock = Decode::decode(decoder)?;
-        assert_eq!(hdr.bb_level, 0);
-
-        let bmx = Bmx::from((0..hdr.bb_numrecs).map(|_| Decode::decode(decoder).unwrap()));
-
-        Ok(Self { bmx })
+impl BtreeLeaf {
+    /// Read a leaf block's bytes.
+    ///
+    /// This used to decode the header with `XfsBmbtLblock` and then each record
+    /// with `BmbtRec`, which is wrong in two ways and had never been run:
+    ///
+    /// * `BmbtRec`'s decoder is the *inode's* packed form.  Inside a block a record
+    ///   is three four-byte fields at a sixteen-byte stride, and decoding sixteen
+    ///   bytes as one packed integer reads three fields as one nonsense number.
+    /// * `assert_eq!(hdr.bb_level, 0)` is a panic on the content of an image, and
+    ///   this program reads images it did not write.
+    ///
+    /// Both are now errors, and the layout is the measured one.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        match BmbtLeafBlock::from_bytes(bytes) {
+            Ok(block) if block.level == 0 => Ok(Self {
+                bmx: block.extents(512),
+            }),
+            Ok(block) => Err(DecodeError::OtherString(format!(
+                "a b-map leaf claims to be {} levels down",
+                block.level
+            ))),
+            Err(e) => Err(DecodeError::OtherString(format!("{e:?}"))),
+        }
     }
 }

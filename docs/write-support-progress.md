@@ -260,7 +260,9 @@ Each numerical claim in this document, what it rests on, and where it now stands
 | offsets 16 and 44 hold no validated field | tool | an unmistakable value at either produces no extent complaint | **confirmed** |
 | a b-map record's fields | tool | `xfs_repair` prints them: `bmap rec out of order ... [o s c]` — offset, start block, count | **confirmed** |
 | a b-map record's size and field offsets | tool | 16 bytes; `o` at 24+16n, `s` at 28+16n, `c` at 32+16n | **confirmed** |
-| a b-map extent's file offset is in **blocks**, not bytes | tool | entries 0, 1, 2, 3 each one block, at blocks 50312, 50314, 50316, 50318 | **confirmed** |
+| a b-map record's shape: 16 bytes, four 4-byte words, from offset 24 | tool | perturbing the word at 24 changes entry 0, at 40 changes entry 1, through entry 4 | **confirmed** |
+| a b-map extent's file offset is the record's **second** word, in **bytes** | tool | it reads 0, 512, 1024, 1536 — the offsets 0, 1, 2, 3 that repair *prints* | **confirmed** |
+| a b-map extent's data block: where it is | — | the fourth word ascends by `0x400000`, which is no block number here | **unmeasured** |
 | root collapse | — | unreachable, so nothing to confirm | **not written** |
 
 **Two rows are still open**, and both are the difference between "this is how it
@@ -1162,15 +1164,43 @@ So the layout is:
 | 4 | level (u16), record count (u16) | |
 | 8, 12 | left and right sibling | |
 | 16 | nothing repair validates | pristine contents here are the next node's daddr, by coincidence |
-| 24 + 16n | `o` — file offset, **in blocks** | measured |
-| 28 + 16n | `s` — first data block | measured |
-| 32 + 16n | `c` — length, in blocks | measured |
-| 36 + 16n | not yet attributed | |
+| 24 + 16n | not attributed | constant across records (`00000000`) |
+| 28 + 16n | the extent's file offset, in **bytes** | measured |
+| 32 + 16n | not attributed | constant across records (`00000018`) |
+| 36 + 16n | not attributed | ascends by `0x400000` per record |
 
-The last row is the only loose end, and it is small: one 4-byte word per record
-that has not been perturbed, and it does not change any of the three that matter.
-Whatever the record's fourth word is, the record is 16 bytes with three named
-4-byte fields, and that is enough to write a reader.
+**Two of those rows correct the row above them.**  The record was written up as
+`{offset, start block, count}` in that order, on the strength of `xfs_repair`'s
+notation — and reading the record's words in the notation's order gives
+`0, 0, 24` where repair prints `0, 50312, 1`, which is how the wrongness was found
+rather than merely suspected.  Only the *second* word is attributed, and it is the
+file offset in **bytes**: it reads 0, 512, 1024, 1536 across the first four
+records, which are the offsets 0, 1, 2, 3 that repair prints.  So the record holds
+a byte offset and the **diagnostic** is in blocks.  That distinction matters — a
+reader that took the printed form for the stored one would be out by a factor of
+the block size — and it is the same trap as the composite: `xfs_repair`'s numbers
+are decoded values, not the bytes on the disk.
+
+**Where the data block lives is the open question.**  The fourth word ascends by
+`0x400000` per record, which is not a block number in any image here, and neither
+constant word is it.  The reader that exists maps the file offset correctly and
+reports every extent as starting at block zero, so it is right about *which*
+extent covers a block and wrong about *which block* it is.  That is strictly less
+wrong than the decoder it replaced — which read the *inode's* packed record form
+here and had never been run against anything — and it is marked provisional in the
+code rather than left to look settled.
+
+**And that is what stopped a write.**  `tests/write.rs` writes into
+`files/btree2.2.txt`, `files/btree3.txt` and `files/btree3.3.txt`, all of which
+have a B+tree mapping, and it had been passing.  It had been passing *by
+accident*: the old decoder produced numbers that happened to fall inside the image,
+the writes landed somewhere, and `xfs_repair -n` had nothing to say about it.  A
+write into a file whose mapping is a B+tree is now **refused**, with the reason,
+because the write has to locate the extent first and the extent's block cannot be
+located safely yet; and the test skips those files with the reason printed, as it
+already skipped files it could not stat.  In-place overwrite of a B+tree-backed
+file is therefore untested until the record is attributed — which is a smaller
+hole than the one it replaces, and an honest one.
 
 ### The attempt that failed, and why it is worth writing down
 
