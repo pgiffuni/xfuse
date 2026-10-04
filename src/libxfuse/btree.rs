@@ -435,6 +435,77 @@ pub trait Btree: BtreePriv {
     }
 }
 
+impl BtreeRoot {
+    /// Every extent in the tree, in file-offset order.
+    ///
+    /// `map_block` answers "which extent holds *this* block", which is the question
+    /// a read asks and the only one this code has asked of a b-tree.  An operation
+    /// that changes the tree asks a different one -- "what is in it" -- and there
+    /// was no way to get that answer, so every such operation refused a file whose
+    /// extents are not in its inode.  Truncating one is refused for exactly that
+    /// reason.
+    ///
+    /// This is what it needs, and what a writer needs before it can rewrite one.
+    ///
+    /// The walk descends by level rather than by searching, so a child's level
+    /// comes from its parent and its own header never has to be parsed to decide
+    /// what it is.  Records come out in key order, which for a b-map b-tree is
+    /// file-offset order, and that is the order the rest of the program expects an
+    /// extent list in.
+    ///
+    /// **A root that is itself a leaf is refused.**  Such a root keeps its records
+    /// in the inode rather than in a block, and this holds only the `xfs_bmdr_block`
+    /// and the keys and pointers decoded beside it, so its records are not in hand
+    /// here.  No data fork in any image in this repository has one -- every one
+    /// measured has an interior root with leaves in blocks -- and returning half a
+    /// tree for the rest would describe a file that is not the file, so this is an
+    /// error and says so.
+    ///
+    /// A block that cannot be read, or that is not the level its parent promised,
+    /// is likewise an error.  Silently returning the extents of the leaves that
+    /// happened to be readable would be a short list, and a short list is a file
+    /// that is quietly shorter than it is.
+    #[allow(dead_code)] // Used as soon as a b-tree data fork can be truncated.
+    pub fn all_extents<R>(&self, buf_reader: &mut R) -> Result<Bmx, i32>
+    where
+        R: bincode_next::de::read::Reader + BufRead + Seek,
+    {
+        let sb = super::volume::try_superblock().ok_or(libc::ENODEV)?;
+        let mut out: Vec<BmbtRec> = Vec::new();
+        let mut stack: Vec<(Vec<XfsBmbtPtr>, u16)> = vec![(self.ptrs.clone(), self.level())];
+
+        while let Some((ptrs, level)) = stack.pop() {
+            for ptr in ptrs {
+                let offset = sb.fsb_to_offset(ptr);
+                let child = level - 1;
+                buf_reader
+                    .seek(SeekFrom::Start(offset))
+                    .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+                if child == 0 {
+                    let mut bytes = vec![0u8; sb.sb_blocksize as usize];
+                    buf_reader
+                        .read_exact(&mut bytes)
+                        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+                    let leaf =
+                        BmbtLeafBlock::from_bytes(&bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+                    if leaf.level != child {
+                        return Err(crate::libxfuse::EUCLEAN);
+                    }
+                    out.extend(leaf.extents().extents().iter().copied());
+                } else {
+                    let node: BtreeIntermediate =
+                        decode_from(buf_reader.by_ref()).map_err(|_| libc::EDESTADDRREQ)?;
+                    if node.level() != child {
+                        return Err(crate::libxfuse::EUCLEAN);
+                    }
+                    stack.push((node.ptrs().to_vec(), node.level()));
+                }
+            }
+        }
+        Ok(Bmx::new(&out))
+    }
+}
+
 #[derive(Debug)]
 enum BtreeBlockCache {
     Intermediate(BTreeMap<usize, BtreeIntermediate>),
