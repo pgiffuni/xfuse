@@ -59,9 +59,32 @@ struct App {
 }
 
 fn main() {
+    // `EnvFilter::from_default_env()` with `RUST_LOG` unset builds a filter that
+    // matches **nothing**, so every `warn!` in the library is discarded before it
+    // reaches stderr and only `eprintln!` output is visible.  That is worse than
+    // it sounds: this is a file system whose refusals carry their reasons --
+    // "this inode's data fork is full and here are the two numbers" is the
+    // difference between a debuggable limit and `ENOSPC` from the void -- and a
+    // diagnostic nobody can see is not one.
+    //
+    // So the default is `warn`: everything the code thinks is worth saying, and
+    // nothing louder.  `info` and `debug` stay opt-in, because a FUSE daemon is
+    // not a debugging session by default.  `RUST_LOG` still overrides all of it.
+    //
+    // The variable is read **directly** rather than through
+    // `try_from_default_env`, because that returns `Ok` with a filter matching
+    // *nothing* when `RUST_LOG` is unset -- so a `unwrap_or_else` around it never
+    // runs, and the default silently stays silent.  That is the same failure this
+    // is fixing, one layer down.
+    let filter = std::env::var("RUST_LOG")
+        .ok()
+        .filter(|d| !d.trim().is_empty());
+    let filter = filter
+        .as_deref()
+        .map_or_else(|| EnvFilter::new("warn"), EnvFilter::new);
     tracing_subscriber::fmt()
         .pretty()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(filter)
         .init();
 
     let app = App::parse();

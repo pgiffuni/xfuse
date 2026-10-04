@@ -658,9 +658,42 @@ diagnostic that requires an environment variable nobody sets is not a diagnostic
 and the measurement above was blocked twice by it.
 
 So the next step is not an interior block.  It is: **make the daemon's warnings
-visible by default**, or at least say how to see them, and then decide what the
-default should be -- `warn` for a filesystem that is explicitly experimental, and
-the current silence only if that is deliberate and written down.
+visible by default**, and that is now done.  `main.rs` reads `RUST_LOG` itself and
+falls back to `warn`, so a refusal prints with no environment set at all:
+
+```text
+WARN xfs_fuse::libxfuse::volume: inode 100551: a write past its end at
+30412800..30412814 was refused: the inode's data fork is full: a file's b-tree
+needs 61 extents, which is more than two leaves of 512 blocks hold, and a third
+leaf needs an interior block
+```
+
+`info` and `debug` stay opt-in -- a FUSE daemon is not a debugging session by
+default -- and `RUST_LOG` still overrides the lot.
+
+Two details of that fix are worth writing down, because the first version of it did
+not work and **looked** like it did:
+
+* **`EnvFilter::try_from_default_env()` returns `Ok` with a filter that matches
+  nothing** when `RUST_LOG` is unset, so a `unwrap_or_else` around it **never
+  runs**.  The original `from_default_env()` had the same property, and so did the
+  obvious "fix", producing exactly the same silence it was meant to remove.  The
+  variable now has to be read directly, because the thing being fixed is a filter
+  that silently matches nothing, and reaching for a helper that hides that is the
+  same mistake one layer down.
+* **A build that does nothing looks exactly like a build that succeeded** when the
+  command fails and the pipeline is only grepping for build errors.  More than one
+  conclusion in this document was drawn against a binary that predated the change
+  being discussed, because the helper script that made `cargo` work in this
+  container had been deleted and every invocation since was a silent no-op.  The
+  fix is the boring one -- check the exit status, and check the binary's mtime --
+  and the general lesson is that **a measurement is only of the thing it was
+  actually taken against**, which is the same rule as the one about oracles: code
+  that does not contain the change is not evidence about the change.
+
+With the diagnostics visible, the question this section was opened for is settled,
+and the answer is the honest one: **the boundary is deliberate, at two leaves, and
+the code says so.**
 
 ### A write test proves xfuse can read its own output; `xfs_repair` proves more
 
