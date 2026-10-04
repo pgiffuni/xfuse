@@ -1568,6 +1568,7 @@ mod t {
             runs.iter().map(|(_, l)| *l).max().unwrap_or(0),
         );
         dev.write_at(&agf, BS as u64).unwrap();
+
         dev.flush().unwrap();
         (f, sb)
     }
@@ -6294,8 +6295,19 @@ mod t {
     // the test.  It is the same fault `xfs_repair` reports on a real image as
     // "free space ... only seen by one free space btree", and the plan records it
     // in "The free-space trees disagree with each other".
+    // **Not yet running.**  The split is the only allocation path with no
+    // coverage, so this test should exist; but `image_with_group` writes a
+    // deliberately minimal superblock with no magic and never sets
+    // `sb_fdblocks`, so anything that reads the superblock properly fails on the
+    // image rather than on the behaviour.
+    //
+    // The failure this test was originally written to chase -- "the superblock
+    // records fewer free blocks than were taken from it" -- turned out to be that
+    // same gap and not a fault in the split path, so the claim it was committed
+    // with is withdrawn.  Fixing the builder is the next step, and the test runs
+    // when it is done.
     #[test]
-    #[ignore = "a split run leaves the superblock short; see docs/write-support-progress.md"]
+    #[ignore = "image_with_group writes no real superblock; fix the builder first"]
     fn taking_a_block_from_the_middle_of_a_run_leaves_both_trees_agreeing() {
         // One long run, so the first allocation has to split it rather than
         // shorten it.

@@ -748,7 +748,50 @@ Two things make it worth naming precisely rather than "the allocator is broken":
   itself odd** for a group holding runs of at least two different lengths.  It is
   the kind of thing to ask about *after* the split, not instead of it.
 
-**The measurement has been made, and it reproduces on the first split.**
+**The measurement has been attempted, and its first result was wrong.**  That is
+recorded here rather than tidied away, because the mistake is the same one this
+document has caught twice already and is now worth naming as a class.
+
+The test builds a group holding one long run, takes single blocks out of the middle
+of it, and reads both trees back.  It failed immediately -- but on the *superblock*,
+with "the superblock records fewer free blocks than were taken from it", and on a
+second attempt with "the superblock's magic number is wrong".  Both are the same
+fault and it is in the **test harness**: `image_with_group` writes a deliberately
+minimal superblock with no magic and never sets `sb_fdblocks`, so any path that
+reads the superblock properly fails on the image rather than on the behaviour under
+test.
+
+So:
+
+* **The claim that the split leaves the accounting short is withdrawn.**  It was
+  drawn from a measurement against an image whose superblock count was zero, which
+  is a fault in the fixture and not in the allocator.  Nothing here has shown the
+  split to be wrong; and nothing has shown it to be right either, because the test
+  has never reached the trees.
+* **The test is committed, ignored, with the reason in the `ignore` string** --
+  `image_with_group writes no real superblock; fix the builder first`.  It is not
+  deleted, because a deleted test is indistinguishable from one never written, and
+  it is not left red, because a red suite is no place to keep a finding.
+
+What survives the withdrawal is the structural claim, which does not depend on any
+of this: **the split is the only allocation path with no test.**  An allocation
+from the end of a run shortens it, and freeing an already-allocated block adds a
+run; both are covered by `a_committed_allocation_is_a_coherent_change`, which
+asserts exactly what this one does and passes.  Taking a block from the middle is
+the only one that produces **two pieces where there was one**.
+
+The lesson is the third instance of one thing: **a measurement is only of the thing
+it was taken against.**  The first was a decoder reading the wrong bytes, the second
+a binary that predated the change, and this is a fixture that is not the filesystem
+it is meant to stand for.  All three produced a confident claim about code that was
+not in the path being measured.
+
+So the next step is smaller than it looked and is not in the allocator at all: **make
+`image_with_group` write a superblock**, with a magic and with `sb_fdblocks` set
+from the runs it was given.  Then the test runs, and the trees are finally compared.
+Until then the `xfs_repair` evidence stands on its own -- a real image, two runs six
+blocks apart seen by only one tree, and a group with 30144 free blocks of 32768 that
+could not spare one -- and that is still unexplained.
 
 `taking_a_block_from_the_middle_of_a_run_leaves_both_trees_agreeing` builds a group
 holding one long run, takes twelve single blocks out of the middle of it, and then
