@@ -159,7 +159,8 @@ kernel usually does not send `open`/`opendir` at all.
 | Reading a whole b-tree data fork | done | `BtreeRoot::all_extents`, the walk `map_block` cannot do.  Not yet called: the row below needs it. |
 | **Truncating** a b-tree data fork | done | The dependency nobody wrote down, and it **inverts** the order this section had.  A file's fork becoming a B+tree is refused while `drop_extents_above` answers `ENOTSUP` for a fork that is not in the inode — so converting one would **take away** the ability to shrink the very files that had outgrown the inode.  Building the writer first would trade a capability for a bigger one.  All four pieces exist: `BtreeRoot::all_extents` reads the tree and reports the blocks it occupies, `RawDinode::data_btree_root` decodes the root, `split_extents_above` is the cut (shared with the `extents` path so the two cannot drift), and `set_data_extents_from_tree` writes the survivors back and zeroes what the root occupied.  The survivors go back into the inode rather than the tree being rewritten, which is the direction XFS itself takes when the list fits and the only one available without a writer.  `agf_btreeblks` does not move: `xfs_format.h` calls it "of blocks held in **AGF** btrees", which is a group's free-space trees, not a file's b-map tree.  The test for it skips, because `xfs_db` cannot resolve inode 128 in `xfsv4.img` — see [the oracle's own defect](#the-oracle-disagrees-with-xfs_repair-on-two-images-and-xfs_repair-is-right). |
 | A data fork that becomes a B+tree | done | One leaf and a level-1 root in the inode, with `di_format`, `di_nblocks` and `di_nextents` moving in the same transaction.  A file whose records no longer fit its fork converts on the write that needs the room, and `xfs_repair -n` on the result **exits 0 with no complaints**.  Both leaf headers exist -- the 72-byte checksummed one and the 24-byte version 4 one -- because a leaf written with the wrong magic is `bad magic`, which reads like a mapping fault and is not.  See [the fork's room](#an-inodes-data-fork-size-is-di_forkoff--3-and-its-core-is-100-bytes-at-v2). |
-| **A second leaf**, and the interior node above it | not started | A file outgrows its leaf at 31 records in a 512-byte version 4 block, and the write is refused with `ENOSPC` naming both numbers.  `all_extents` already walks a chain, so the reader side is ready; what is missing is splitting a leaf and widening the root to two keys. |
+| **A second leaf**, and the interior root over it | done | A list that will not fit one leaf becomes two, with the root's second key and pointer, the siblings chained, and every leaf block allocated before any is written.  `xfs_repair -n` on a file grown into that shape exits 0.  Recorded as a **verified boundary** -- see [The boundary at thirty records](#the-boundary-at-thirty-records-and-the-question-it-leaves). |
+| A **third** leaf | not started | Needs an interior *block* rather than an interior root: the same shape as the block leaves have, with its own keys and pointers, allocated and linked like one.  Nothing here is written for it by extrapolation; see the question below, whose answer decides whether it is even the limit that is being hit. |
 
 ### Blocked
 
@@ -570,6 +571,83 @@ The numbers are quoted from a native tool wherever one can be asked -- see
 [How strong each measurement is](#how-strong-each-measurement-is-and-how-to-read-one)
 for what stands behind each one and what does not.
 
+### The boundary at thirty records, and the question it leaves
+
+**This is where the work stopped, and the stopping is deliberate.**  A file whose
+data fork outgrew its inode became a B+tree, that tree grew to two leaves under an
+interior root, and `xfs_repair -n` on the image **exits 0 with no complaints**.
+That is a verified boundary: not a claim that the rest is easy, and not an
+incomplete implementation pretending to be further along than it is.
+
+What is *not* known is why growth stops there, and that is the next thing to find
+out -- **before** writing an interior block, because the answer decides whether an
+interior block is what is missing at all.
+
+The measurement, stated so it can be falsified.  One leaf of this image holds
+**thirty** records: a 512-byte block with a 24-byte version 4 header and 16-byte
+records is `(512 - 24) / 16 = 30`.  Growth currently refuses with `ENOSPC` at or
+past thirty-one, and the question is which of these five that is:
+
+1. **Block geometry**, and thirty is simply the most a leaf can hold.  Then the
+   answer is `(blocksize - header) / 16`, it is already implemented as
+   `BmbtLeafBlock::max_records`, and a third leaf needs a second block and a wider
+   root -- nothing else.
+2. **The header or the tail**, and thirty is not the whole story: something before
+   or after the records is reserved, and the real limit is lower.  Then
+   `max_records` is wrong in a way that will also be wrong for every other block
+   size, and it should be fixed before anything is built on it.
+3. **The data region**, and some of the block is not available to records.  This is
+   a variant of (2) with a different owner, and only `xfs_repair` distinguishes
+   them: a leaf with free records in it that XFS calls short is a different
+   complaint from a leaf that is full.
+4. **The allocator**, and the block for a third leaf could not be obtained.  Then
+   the refusal is `NoSpace` wearing a fork's clothes, the group really is full, and
+   the fix is nowhere near the b-tree.
+5. **A deliberate limit in xfuse**, and the code is refusing something the format
+   can do.  Then the refusal is a placeholder and the work is to remove it.
+
+These are distinguishable and none of them should be guessed.  The cheap
+discriminator is the **message**: the refusal names the number of extents needed and
+the number a block holds, so a run that trips it says which pair of numbers it was.
+A `NoSpace` from `allocate` is candidate (4) and reads differently.  Beyond that,
+`xfs_repair` is what tells (2) from (3), and a leaf built with fewer records than
+`max_records` says and accepted is the direct test of (3).
+
+**The experiment is small and it is the whole of the next step.**  It needs no new
+code: grow a file to thirty, to thirty-one, and to the point where it refuses,
+capturing the message at each, and ask `xfs_repair -n` about the image at thirty.
+
+### A write test proves xfuse can read its own output; `xfs_repair` proves more
+
+This is the lesson the last three milestones rest on, and it is worth stating
+plainly because it is easy to overclaim.
+
+A green write test says: **this program can write a file system and read it back.**
+That is not nothing -- the read side is independent code, the bytes come off the
+device, and a write that cannot be read back is broken in an obvious way.  But every
+conclusion in it is a conclusion *this implementation* drew about its own output.
+A decoder that shares an assumption with the encoder will agree with it
+unconditionally.
+
+`xfs_repair -n` says something stronger and categorically different: that the output
+conforms to the **structural invariants of XFS, which this implementation did not
+define**.  It reads the image with the reference implementation, applies rules
+nobody here wrote, and reports disagreement.  A green `xfs_repair` is the only
+result in this project that is not self-referential.
+
+That distinction earned its place twice in three milestones.  The b-map leaf was
+readable by this code, passed the whole read test suite, and was wrong -- records
+read from offset 24 of a 72-byte header, three of four fields folded into one
+nonsense number.  `xfs_repair` had been asked about it in a different context and
+had complained; nobody connected the two.  And the conversion milestone went through
+`bad magic`, then `bad data fork`, then `bad nblocks 1`, then `bad nextents 10`
+before it was right, and **every one of those was found by `xfs_repair` and not by
+any test in this repository.**
+
+So: record a write test as evidence that a path works, and record `xfs_repair -n`
+as evidence that the result is a filesystem.  They are not the same claim and
+collapsing them is how "all tests pass" comes to mean less than it says.
+
 ### A b-map leaf's records begin at 72 bytes, or 24, and each is two 64-bit words
 
 The last piece of the on-disk format this project needed and did not have, and the
@@ -842,6 +920,65 @@ anything that stocks the list more tightly than `free_in_group` does would make
 it unreachable.
 
 ---
+
+## The three that are left, and why they are not one thing
+
+The work that remains is not "finish write support".  It is three independent
+structural problems, and each one has to be able to fail without taking the others
+down.  They are listed here separately because the temptation is to treat the
+dependency chain above as a queue.
+
+### A. Tree depth: an interior node that is a block
+
+```text
+root            root
+├── leaf   -->  ├── interior
+└── leaf        │    ├── leaf
+                │    └── leaf
+                └── leaf
+```
+
+Mostly about proving a format this code has never written -- an interior node in a
+block is the same shape as a leaf with keys and pointers where records go -- and
+then its allocation and linkage, which is the same sequence the free-space trees
+already use and the same trap.  **It is the smallest of the three**, and it is also
+the one whose justification is not yet established: see
+[the boundary at thirty records](#the-boundary-at-thirty-records-and-the-question-it-leaves)
+before building it, because the answer may be that nothing about depth is the
+constraint.
+
+### B. Namespace mutation
+
+```text
+create   unlink   rename   mkdir   rmdir
+```
+
+Much the largest, and categorically different in kind.  One of these crosses inode
+allocation, the directory's representation, link counts, the directory's own size,
+timestamps, free-space allocation and transaction boundaries -- seven things that
+each have their own invariants and their own ways of being wrong, and that have to
+move together or the file system describes two different things.  `rename` crosses
+two directories and a free-space boundary at once.
+
+It deserves its own plan rather than its own milestone.  The directory side has the
+least established ground in this repository of anything left: every directory in
+these images is in *local* format, the entries' *positions* are measured while what
+is inside one is not, and the `get_length` claim was withdrawn once already.  A
+directory cannot be read from a unit test here at all, which is what shapes what
+`create` has to do.
+
+### C. Free-space tree root transitions
+
+Root growth and root collapse, and both are **unreachable on the images in this
+repository**.  So there is nothing to test them against, and implementing them by
+extrapolation is the thing this document has been refusing to do since it started --
+the AGFL experiments are the precedent: manufacture the smallest native filesystem
+that naturally reaches the transition, measure it, and only then write it.
+
+The constraint is not skill, it is evidence.  It is the same category as
+[the skipped oracle checks](#a-skipped-check-is-not-a-passing-check): a change with
+no way to be wrong is not a test, and this suite is built so that every claim has a
+way to be wrong.
 
 ## Next work
 
