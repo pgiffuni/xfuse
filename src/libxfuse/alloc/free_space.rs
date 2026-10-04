@@ -1862,8 +1862,18 @@ pub fn insert_in_tree<B: GroupBlocks>(
         if let Some((child, separator)) = pending.take() {
             // The split child is the one this level sent us down through, so
             // the new entry goes directly after it.
+            // Written on exactly one path, and which one matters: on a split the
+            // left half has **already** gone into this block, and writing the
+            // unsplit node over it again would throw the split away while the new
+            // right-hand node stayed recorded in the grandparent.  The result is a
+            // node the parent does not reference and a grandparent that does --
+            // and every record in the unreachable node is a record the tree now
+            // claims twice over, which is what `xfs_repair` reports as a block
+            // "multiply claimed by bno space tree".
             match parent.insert_child(index + 1, separator, child) {
-                Ok(()) => {}
+                Ok(()) => {
+                    blocks.put(*parent_block, parent.into_bytes())?;
+                }
                 Err(FsError::NoSpace) => {
                     let (left, right, up) = parent.split()?;
                     blocks.put(*parent_block, left)?;
@@ -1875,7 +1885,6 @@ pub fn insert_in_tree<B: GroupBlocks>(
                 Err(e) => return Err(e),
             }
         }
-        blocks.put(*parent_block, parent.into_bytes())?;
     }
 
     // A split that is still unaccounted for came out of the root, so the root
