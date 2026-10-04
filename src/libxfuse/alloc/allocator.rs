@@ -6324,6 +6324,83 @@ mod t {
     // records are read as free runs before its level has been checked*, and the
     // backtrace points into `allocate_in_group` rather than at any of the three
     // functions above.
+    /// Every group, not the first.
+    ///
+    /// A property of the format does not vary by allocation group, so a check made
+    /// against one group is not evidence about the others.  Group 0 is the group
+    /// every other free-space test here uses, and it is the group whose trees are a
+    /// single leaf -- so anything guarded by "the root is not a leaf" is never
+    /// entered, and anything guarded by "the root is a leaf" is entered only
+    /// where the trees happen to be shallow.
+    ///
+    /// This grows each group's free space trees past one leaf by taking single
+    /// blocks out of the middle of its longest run: each take splits one record
+    /// into two, which is the only way an allocation *grows* a leaf.  A leaf of a
+    /// 512-byte block holds 62 records, so this asks for several splits per group.
+    #[test]
+    fn growing_every_groups_free_space_trees_past_one_leaf_works() {
+        let Some(golden) = crate::libxfuse::alloc::golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let Ok(source) = std::fs::File::open(&golden) else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let mut copy = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut src = source;
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = std::io::Read::read(&mut src, &mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                copy.write_all(&buf[..n]).unwrap();
+            }
+        }
+        copy.flush().unwrap();
+        let mut reader = std::io::BufReader::new(std::fs::File::open(copy.path()).unwrap());
+        let sb = Sb::from(&mut reader);
+        let device = Arc::new(BlockDevice::open(copy.path(), Access::ReadWrite).unwrap());
+        let mut cache = BlockCache::new(BS, 256);
+        for agno in 0..sb.agcount() {
+            grow_one_groups_trees(&device, &mut cache, &sb, copy.path(), agno);
+        }
+    }
+
+    /// Take one block from the middle of `agno`'s longest run until the group
+    /// cannot, and require the image to be a file system afterwards.
+    fn grow_one_groups_trees(
+        device: &Arc<BlockDevice>,
+        cache: &mut BlockCache,
+        sb: &Sb,
+        path: &std::path::Path,
+        agno: u32,
+    ) {
+        let mut ok = 0usize;
+        for _ in 0..200 {
+            let mut tx = Transaction::begin(device, cache, sb, CommitMode::Direct);
+            match allocate(&mut tx, sb, agno, 1) {
+                Ok(run) => {
+                    assert_eq!(run.len, 1, "the allocation was not a single block");
+                    tx.commit().unwrap();
+                    ok += 1;
+                }
+                Err(e) => {
+                    // A refusal is allowed -- the group may be full.  Anything else
+                    // is a fault and fails the test with its own message, which is
+                    // the point of running it on every group.
+                    eprintln!("group {agno}: stopped after {ok} allocations: {e}");
+                    break;
+                }
+            }
+        }
+        device.flush().unwrap();
+        eprintln!("group {agno}: {ok} single-block allocations from the middle of a run");
+        assert_repair_accepts(path, "after growing a group's free space trees");
+    }
+
     #[test]
     #[ignore = "a node's records are read as runs before its level is checked"]
     fn taking_a_block_from_the_middle_of_a_run_leaves_both_trees_agreeing() {

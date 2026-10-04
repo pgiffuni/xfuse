@@ -241,10 +241,23 @@ a block missing from one is a block handed out twice.
 trees must receive both halves: 200 such splits in group 0 of `xfsv4.img` leave the
 two trees agreeing, the count following, and `xfs_repair -n` accepting the image.
 
-**HYPOTHESIS.** Two single-block runs six apart were reported as "only seen by one
-free space btree" in group 1 of a grown image, whose group header claimed 30144 free
-blocks of 32768 and could not then spare one. Group 0 does not show it. Unresolved;
-see `docs/write-support-progress.md`.
+**MEASURED.** Growing every group's trees past one leaf -- taking single blocks from
+the middle of the longest run, 200 times per group, on `xfsv4.img` -- succeeds in
+groups 0, 1 and 2, with `xfs_repair -n` accepting after each. **Group 3 fails on
+the very first allocation**, with `Invalid { errno: 22, msg: "this node holds
+subtrees, not free runs" }` -- a node's records read as free runs before its level
+has been checked.
+
+**MEASURED.** The group headers of groups 1, 2 and 3 are byte-identical from offset
+0x20 onwards and differ only before it, which is exactly where `agf_bno_root` and
+`agf_cnt_root` live. So the difference between the group that works and the group
+that fails is in the tree roots.
+
+**HYPOTHESIS.** A group whose roots are shaped differently from groups 1 and 2 --
+the final group, which XFS does not require to have the same geometry as the
+others -- takes a code path the others do not. Unresolved. The two single-block runs
+six apart that `xfs_repair` reported as "only seen by one free space btree" on a
+grown image may or may not be this; that is not established.
 
 ### Siblings
 
