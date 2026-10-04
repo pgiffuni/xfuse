@@ -253,11 +253,34 @@ has been checked.
 `agf_cnt_root` live. So the difference between the group that works and the group
 that fails is in the tree roots.
 
-**HYPOTHESIS.** A group whose roots are shaped differently from groups 1 and 2 --
-the final group, which XFS does not require to have the same geometry as the
-others -- takes a code path the others do not. Unresolved. The two single-block runs
-six apart that `xfs_repair` reported as "only seen by one free space btree" on a
-grown image may or may not be this; that is not established.
+**MEASURED.** `xfs_db freesp -a <agno>` reports the free space of each group of
+`xfsv4.img`, and the four groups differ sharply in shape:
+
+| Group | Largest runs |
+|:------|:-------------|
+| 0 | heavily fragmented; many small extents |
+| 1 | 1707 at block 1, 8954 at 8192-16383 |
+| 2 | 25464 at 16384-32768, otherwise fragmented |
+| 3 | **7953 at block 1**, 15921 at 8192-16383 -- two large runs dominate |
+
+**HYPOTHESIS.** The failing group is the one whose free space is **few and very
+large**, and the mechanism is the descent in the tree keyed by **length**. That
+tree cannot be descended by key, because its keys do not say which child holds which
+run, so the code *searches*: it reads children and compares their records to find
+the one holding the wanted run. If such a search reads a child that is itself an
+interior node and compares its records as runs, that is exactly
+`runs()` on a non-leaf -- which is the observed error. Group 3's few very large runs
+would send that search down a route the fragmented groups never take.
+
+This is a hypothesis and not a measurement. The test that decides it is one
+comparison: the **CNT root's level** for each of the four groups, which no
+measurement here has yet produced -- `xfs_db`'s `agf_bno_root` / `agf_cnt_root` field
+names do not resolve in this build, and `daddr` addressing on this 512-byte-block
+image has repeatedly produced the superblock where an AG header was intended.
+
+The two single-block runs six apart that `xfs_repair` reported as "only seen by one
+free space btree" on a grown image may or may not be this; that is not established
+either.
 
 ### Siblings
 
