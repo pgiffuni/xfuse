@@ -1102,6 +1102,58 @@ arrangement is to ask repair while the chunk exists and every one of its inodes 
 still free — which it accepts — and then to assert that the inode's allocation is
 the *only* thing repair objects to afterwards.
 
+### A b-map node has the **long** header, 72 bytes; the free space trees have the short one, 56
+
+Two b-trees in the same file system, in the same image, with **different header
+sizes** — which is the sort of thing that reads as a contradiction and is not.
+
+`xfs_format.h` has two shapes for a b-tree block, and they differ in one thing: how
+wide a sibling pointer is.
+
+```c
+struct xfs_btree_block_shdr {  /* short form */
+    __be32 bb_leftsib, bb_rightsib, bb_blkno, bb_pad, bb_lsn;
+    uuid_t  bb_uuid; __be32 bb_crc, bb_pad2;
+};                                  /* + 8 = XFS_BTREE_SBLOCK_CRC_LEN = 56 */
+
+struct xfs_btree_block_lhdr {  /* long form */
+    __be64 bb_leftsib, bb_rightsib, bb_blkno, bb_lsn;
+    uuid_t bb_owner; __be32 bb_crc, bb_pad;
+};                                  /* + 8 = XFS_BTREE_LBLOCK_CRC_LEN = 72 */
+```
+
+The **free space trees are short**: `alloc/free_space.rs` puts the magic at 0, the
+level at 4, the count at 6, two four-byte siblings at 8 and 12, the LSN at 16, the
+owner at 24, the UUID at 32, the CRC at 52, and records at **56**.  The **b-map
+b-tree is long**, and its header measured straight off a real leaf is the long form
+field for field:
+
+| Field | `lhdr` | Measured in `files/btree2.txt`'s leaf |
+|:------|:-------|:---------------------------------------|
+| magic | 0x00 | `0x424d4133` |
+| level, numrecs | 0x04, 0x06 | 0, 16 |
+| leftsib, rightsib (8 each) | 0x08, 0x10 | both `0xffffffffffffffff` |
+| blkno | 0x18 | 109848 — the block's own number |
+| lsn | 0x20 | `0x10000016f` |
+| uuid | 0x28 | the file system's |
+| owner | 0x38 | 142541 — the inode |
+| crc | 0x40 | `0x1567f691`, and `xfs_repair` accepts it |
+| records | 0x48 | the extents |
+
+**So the free space node writer cannot be reused for a b-map node as it stands.**
+The CRC *convention* can — CRC-32C over the whole block with the CRC field read as
+zeroes, stored least significant byte first, the same as the superblock, the inodes,
+the group header and the free list — but the header between the sibling pointers and
+the records is a different length and a different order, and the long form carries a
+block number the short one does not.
+
+That is a smaller surprise than it looks, and it is the third time the header has
+answered something the code had wrong: the first two were the 72-byte offset and the
+bit-packed record, and this one says the shape is not even uniform across b-trees in
+one image.  A writer built by copying `leaf_of` and changing the magic would produce
+a block that is sixteen bytes short and mis-parsed past the siblings, and nothing in
+the build would say so.
+
 ### The attribute fork's format numbering coincides with the data fork's, which is why the conflation is harmless
 
 `di_aformat` is `__s8 /* format of attr fork's data */` and is decoded here as an
