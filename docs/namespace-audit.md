@@ -68,11 +68,65 @@ writes a b-tree root; both start at `literal_area_offset()`, but nothing writes
 * **Directory reads through the FUSE `read` path**, and how `readdir` derives its
   offsets — not read.
 
-## Fixtures
+## Fixtures — they already exist, and my earlier claim was wrong
 
-Every directory in the available images is `local` format, which is what makes
-shortform the right first target. Native fixtures for zero, one, several, long and
-varying-length names are **not yet created**; that is Milestone 1.
+I previously said "every directory in the available images is `local` format".  That
+was **wrong**: it was true of the one directory I had looked at (`files/`), not of
+the images.  `xfsv4.img`'s root contains a directory in **each** of the four forms,
+and they are named:
+
+```text
+xfs_db -c "sb 0" -c "inode 32" -c "ls" target/tmp/xfsv4.img
+
+ 35                 directory  sf
+ 65568              directory  block
+ 140736             directory  leaf
+ 196640             directory  node
+```
+
+So Milestone 1's fixtures need no manufacturing.  The shortform one is **inode 35,
+`sf`**, and it measures as follows:
+
+| Field | Value |
+|:------|:------|
+| `core.magic` | `0x494e` |
+| `core.mode` | `040755` |
+| `core.version` | **2** |
+| `core.format` | **1 (local)** |
+| `core.size` | **44** |
+| `core.nblocks` | **0** |
+| `core.forkoff` | **0** |
+| `core.aformat` | 2 (extents) |
+
+and its entries:
+
+```text
+ 2  35  directory  .           (synthesised)
+ 4  32  directory  ..          (the parent field, 32)
+ 6  36  regular    frame000000
+ 9  37  regular    frame000001
+```
+
+**Two things follow from arithmetic on those numbers, and both are measurements
+rather than assumptions.**
+
+* **This filesystem has no `ftype`.**  The header is 8 bytes (`count`=2,
+  `i8count`=0, `parent` as `u32`), and an 11-character name costs
+  `namelen(1) + offset(2) + name(11) + inumber(4) = 18` with no type byte.  Two
+  entries: `8 + 2 x 18 = 44`, which is exactly `core.size`.  With `ftype` it would
+  be 46 and the size would say so.
+* **`i8count = 0`, so the parent is a 32-bit inode number.**  This is the case the
+  decode path throws away, and the case a writer would get wrong first.
+
+Note also that `xfs_db`'s offsets for the synthesised `.` and `..` are 2 and 4,
+where `Dir2Sf::decode` synthesises them at 1 and 2. **One of the two is wrong and
+which one has not been established** -- it is on the list for the fixture work,
+because it affects nothing until a writer produces offsets that `xfs_db` and
+`xfuse` must agree about.
+
+What is still missing: fixtures with **zero** entries, with **long** names, and with
+enough entries to approach the shortform capacity, and the controlled native
+addition and removal that shows exactly which bytes change.
 
 ## What the first coding task therefore is
 
