@@ -78,7 +78,7 @@ use super::{
 use crate::libxfuse::{
     alloc::free_space::FreeRun,
     bmbt_rec::BmbtRec,
-    btree::{BmbtLeafBlock, BmbtLeafRecord, BtreeLblockHdr, BMBT_NULL_PTR},
+    btree::{BmbtKey, BmbtLeafBlock, BmbtLeafRecord, BtreeLblockHdr, BMBT_NULL_PTR},
 };
 
 /// We must store the Superblock in a global variable.  This is unfortunate, and limits us to only
@@ -546,7 +546,7 @@ impl Volume {
             // leaf.  A second leaf would need an interior node, and refusing that
             // is honest where silently building a root that names a block nothing
             // wrote is not.
-            if let Some((existing, blocks, ptr)) = tree {
+            if let Some((existing, blocks, _)) = tree {
                 let mut all = existing;
                 all.push(BmbtRec {
                     br_startoff:   first_new,
@@ -555,43 +555,91 @@ impl Volume {
                     br_flag:       false,
                 });
                 all.sort_by_key(|r| r.br_startoff);
-                // A leaf that will not hold the list is refused here rather than discovered
-                // as a write past the end of the block: the step after this is a second
-                // leaf and an interior node, which is not built, and saying so is better
-                // than a slice range.
+                // How the list is spread over leaves.  One leaf holds `room`; a
+                // list that will not fit one is **split in two** and the root grows
+                // a second key and pointer, because that is the whole of what an
+                // interior node over leaves is.  A third leaf would need a real
+                // interior *block*, and a tree deep enough to need one is refused.
                 let room = BmbtLeafBlock::max_records(sb.sb_blocksize as usize, sb.has_crc());
-                if all.len() > room {
-                    return Err(FsError::fork_full(format!(
-                        "a file's b-tree needs {} extents in one leaf and a block of {} holds {}",
-                        all.len(),
-                        sb.sb_blocksize,
-                        room
-                    )));
-                }
-                let leaf = BmbtLeafBlock {
-                    level:   0,
-                    records: all.iter().map(BmbtLeafRecord::from_extent).collect(),
-                };
-                let (leaf_fsb, leftsib, rightsib) = (blocks[0], BMBT_NULL_PTR, BMBT_NULL_PTR);
-                let at = sb.fsb_to_offset(leaf_fsb);
-                let block = if sb.has_crc() {
-                    leaf.to_bytes(
-                        &BtreeLblockHdr {
-                            blkno: ptr,
-                            lsn: 0,
-                            leftsib,
-                            rightsib,
-                            owner: xfs_ino,
-                            uuid: sb.uuid(),
-                        },
-                        sb.sb_blocksize as usize,
-                    )
+                let mut leaves: Vec<Vec<BmbtRec>> = Vec::new();
+                if all.len() <= room {
+                    leaves.push(all.clone());
                 } else {
-                    leaf.to_bytes_v4(leftsib, rightsib, sb.sb_blocksize as usize)
-                };
-                tx.write_bytes(at, &block)?;
+                    let second = &all[room..];
+                    if second.len() > room {
+                        return Err(FsError::fork_full(format!(
+                            "a file's b-tree needs {} extents, which is more than two leaves of \
+                             {} blocks hold, and a third leaf needs an interior block",
+                            all.len(),
+                            sb.sb_blocksize
+                        )));
+                    }
+                    leaves.push(all[..room].to_vec());
+                    leaves.push(second.to_vec());
+                }
+
+                // The blocks the leaves live in: the one the root already named,
+                // then one more per additional leaf.  Allocated before they are
+                // written, because a block that is charged for and never written is
+                // the state `xfs_repair` calls a node that belongs to no tree.
+                let mut leaf_fsb: Vec<u64> = vec![blocks[0]];
+                while leaf_fsb.len() < leaves.len() {
+                    let run = allocate(&mut tx, &sb, agno, 1)?;
+                    leaf_fsb.push(sb.ag_block_to_fsb(agno, run.start));
+                }
+
+                // The chain, so a reader walking siblings finds the leaves in
+                // order.  Nulls on the outside, the neighbours inside.
+                for (i, recs) in leaves.iter().enumerate() {
+                    let leftsib = if i == 0 {
+                        BMBT_NULL_PTR
+                    } else {
+                        leaf_fsb[i - 1]
+                    };
+                    let rightsib = if i + 1 == leaves.len() {
+                        BMBT_NULL_PTR
+                    } else {
+                        leaf_fsb[i + 1]
+                    };
+                    let leaf = BmbtLeafBlock {
+                        level:   0,
+                        records: recs.iter().map(BmbtLeafRecord::from_extent).collect(),
+                    };
+                    let at = sb.fsb_to_offset(leaf_fsb[i]);
+                    let block = if sb.has_crc() {
+                        leaf.to_bytes(
+                            &BtreeLblockHdr {
+                                blkno: leaf_fsb[i],
+                                lsn: 0,
+                                leftsib,
+                                rightsib,
+                                owner: xfs_ino,
+                                uuid: sb.uuid(),
+                            },
+                            sb.sb_blocksize as usize,
+                        )
+                    } else {
+                        leaf.to_bytes_v4(leftsib, rightsib, sb.sb_blocksize as usize)
+                    };
+                    tx.write_bytes(at, &block)?;
+                }
+
+                // The root: one key per leaf, each the first offset in that leaf,
+                // and one pointer per leaf in the same order.
+                let mut root = raw.data_btree_root()?;
+                root.ptrs = leaf_fsb.clone();
+                root.keys = leaves
+                    .iter()
+                    .map(|l| BmbtKey {
+                        br_startoff: l[0].br_startoff,
+                    })
+                    .collect();
+                root.bmdr.bb_level = 1;
+                root.bmdr.bb_numrecs = leaves.len() as u16;
+                raw.set_data_btree_root(&root)?;
+
                 data_blocks = all.iter().map(|r| r.br_blockcount).sum();
-                nodes = blocks.len() as u64;
+                nodes = leaf_fsb.len() as u64;
                 // `di_nextents` is the file's **total** extent count, not the
                 // records in the fork, so it has to follow a conversion and keep
                 // following it.  Leaving it at the count the fork held when it

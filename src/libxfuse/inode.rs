@@ -1063,6 +1063,55 @@ impl RawDinode {
         Ok(())
     }
 
+    /// Write a b-tree root into this inode's data fork.
+    ///
+    /// The root is `bb_level`, `bb_numrecs`, one key per child, the gap the fork
+    /// layout puts between the keys and the pointers, and one pointer per child.
+    /// **No magic**: `xfs_bmdr_block_t` is the two count fields and nothing else,
+    /// because a root inside the inode is not a block.
+    ///
+    /// Everything past the pointers is zeroed, because what was there was extent
+    /// records and a reader that found one where it expects the end of the root
+    /// would be reading a stale record as structure.
+    ///
+    /// The fork's *size* does not change.  `di_forkoff` still says where the
+    /// attribute fork begins, and the root occupies the same bytes the records did
+    /// -- which is why a level-0 root is never written here, since holding records
+    /// is what has just stopped working.
+    pub fn set_data_btree_root(&mut self, root: &BtreeRoot) -> FsResult<()> {
+        let n = root.ptrs.len();
+        if n == 0 || root.keys.len() != n {
+            return Err(FsError::corrupt(
+                "a b-tree root with a different number of keys and pointers",
+            ));
+        }
+        let start = self.literal_area_offset();
+        let limit = self.attribute_fork_offset().unwrap_or(self.bytes.len());
+        for b in &mut self.bytes[start..limit] {
+            *b = 0;
+        }
+        let mut at = start;
+        self.bytes[at..at + 2].copy_from_slice(&root.bmdr.bb_level.to_be_bytes());
+        self.bytes[at + 2..at + 4].copy_from_slice(&root.bmdr.bb_numrecs.to_be_bytes());
+        at += BmdrBlock::SIZE;
+        for k in &root.keys {
+            self.bytes[at..at + 8].copy_from_slice(&k.br_startoff.to_be_bytes());
+            at += BmbtKey::SIZE;
+        }
+        at += self.dfork_ptr_gap(root.bmdr.bb_numrecs);
+        for p in &root.ptrs {
+            if at + 8 > limit {
+                return Err(FsError::fork_full(
+                    "an inode has no room for a b-tree root's pointers",
+                ));
+            }
+            self.bytes[at..at + 8].copy_from_slice(&p.to_be_bytes());
+            at += 8;
+        }
+        self.set_format(3);
+        Ok(())
+    }
+
     /// Where the attribute fork begins, in bytes, if there is one.
     pub fn attribute_fork_offset(&self) -> Option<usize> {
         match self.forkoff() {
