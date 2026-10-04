@@ -773,6 +773,29 @@ So:
   deleted, because a deleted test is indistinguishable from one never written, and
   it is not left red, because a red suite is no place to keep a finding.
 
+**A negative result, which is worth as much as a positive one.**  The hypothesis
+was that the post-take split path mishandles a leaf that is also a root -- it has to
+be promoted to an interior node when it splits, and anything reading that block as a
+leaf would produce exactly this error.  Group 0's trees *are* single leaves, so the
+test is cheap there: take one block from the middle of the group's longest run, over
+and over, so each take splits one record into two and the leaf grows by one.  A leaf
+of a 512-byte block holds 62 records, so 200 takes ask for several splits.
+
+```text
+group 0: 200 single-block allocations from the middle of a run
+```
+
+and `xfs_repair -n` **accepts the image**.  So the split, the occupancy rule, the
+promotion of a leaf that is also a root, and the superblock's own count all survive
+being exercised 200 times in the group whose tests all pass.
+
+That kills the hypothesis, and it leaves the discriminator exactly where it was:
+**something in the allocate path is reached only when the root is not a leaf**, and
+that code has now never been read in a group where it runs.  The next experiment is
+the same one over *every* group rather than the first, which is a change of a loop
+and not of logic -- and the test above is written to be that change, so it should be
+finished rather than started again.
+
 What survives the withdrawal is the structural claim, which does not depend on any
 of this: **the split is the only allocation path with no test.**  An allocation
 from the end of a run shortens it, and freeing an already-allocated block adds a
