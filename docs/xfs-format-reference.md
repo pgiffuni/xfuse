@@ -272,11 +272,40 @@ interior node and compares its records as runs, that is exactly
 `runs()` on a non-leaf -- which is the observed error. Group 3's few very large runs
 would send that search down a route the fragmented groups never take.
 
-This is a hypothesis and not a measurement. The test that decides it is one
-comparison: the **CNT root's level** for each of the four groups, which no
-measurement here has yet produced -- `xfs_db`'s `agf_bno_root` / `agf_cnt_root` field
-names do not resolve in this build, and `daddr` addressing on this 512-byte-block
-image has repeatedly produced the superblock where an AG header was intended.
+**MEASURED.** The tool invocation that works, and the four groups' roots:
+
+```text
+xfs_db -r -c "sb 0" -c "daddr <agno * agblocks + 1>" -c "type agf" -c "p bnoroot" ...
+```
+
+Two things about that command line that cost time to find. The field names are
+**`bnoroot`, `cntroot`, `bnolevel`, `cntlevel`** -- *not* `agf_bno_root` or
+`agf_cnt_root`, which do not resolve. And a group's AG header is at **sector
+`agno * agblocks + 1`**, because it is *block 1* of the group; `agno * agblocks`
+lands on the superblock. Both were wrong for most of an hour.
+
+| Group | bno root | cnt root | bno level | cnt level | freeblks | longest |
+|:------|:---------|:---------|:----------|:----------|:---------|:--------|
+| 0 | 4 | 5 | 1 | 1 | 30144 | 29528 |
+| 1 | 8 | 10 | 2 | 2 | 10729 | 8954 |
+| 2 | 4 | 5 | 1 | 1 | 25536 | 25464 |
+| **3** | **609** | **615** | **3** | **3** | 23868 | 15921 |
+
+**So group 3 is the deepest, at level 3, and group 1 is already level 2** -- which
+does not explain why group 1 works and group 3 does not, and so the hypothesis
+above about the *length*-ordered tree's search is not established. Groups 0 and 2
+have level-1 trees, group 1 level 2, group 3 level 3, and three of the four work.
+
+**The striking part is the root block numbers.** Group 3's bno root is block **609**
+and its first free run is blocks **1-7953** (`freesp -a 3`), so the tree's root
+would sit *inside* free space. No valid file system can have that. Either `bnoroot`
+is being decoded differently for this AGF version, or this AG header is not group
+3's. Group 1's roots -- 8 and 10 -- are inside its first free run of 1707 blocks
+too, so if that reasoning were sound group 1 would be equally impossible, and it is
+`xfs_repair`-clean. **Which means the reasoning is unsound**, most likely because
+`bnoroot` here is not a block number in the file system's own numbering, or because
+`freesp` and the AGF header disagree about what "block 1" means. That is unresolved
+and no conclusion is drawn from it.
 
 The two single-block runs six apart that `xfs_repair` reported as "only seen by one
 free space btree" on a grown image may or may not be this; that is not established
