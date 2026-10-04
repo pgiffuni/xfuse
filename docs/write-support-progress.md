@@ -613,54 +613,54 @@ A `NoSpace` from `allocate` is candidate (4) and reads differently.  Beyond that
 `xfs_repair` is what tells (2) from (3), and a leaf built with fewer records than
 `max_records` says and accepted is the direct test of (3).
 
-**The experiment has been run, and the answer is not on the list.**  Growing
-`files/hello.txt` in `xfsv4.img` one sparse write at a time:
+**The experiment has been run, and the answer was on the list after all.**  Growing
+`files/hello.txt` in `xfsv4.img` one sparse write at a time, with the refusal
+logged, gives:
 
 ```text
-start size 14
-refused after 30 successful writes, errno 28 (ENOSPC)
-size at the refusal 30412800
+the inode's data fork is full: a file's b-tree needs 61 extents, which is
+more than two leaves of 512 blocks hold, and a third leaf needs an interior block
 ```
 
-Thirty successful writes plus the extent the file already had is **thirty-one
-extents**, which is exactly where a thirty-record leaf fills -- so the boundary
-looks like candidate (1) and is not.  Two observations exclude most of the rest:
+**Sixty-one, and two leaves of thirty hold sixty.**  So this is candidate (5), a
+deliberate limit here, and it is *correct*: the code refuses a third leaf because a
+third leaf is what needs an interior block, and saying so is the honest answer.  The
+thirty-one first reported here was a miscount -- one `write(2)` of a 4082-byte
+buffer becomes **two** FUSE writes at a page boundary, and each of them adds an
+extent, so thirty writes are sixty extents, not thirty.
 
-* **The group is not full.**  Immediately after the refusal a 512-byte write
-  *inside* the file succeeds, and a `ftruncate` four megabytes past the file's end
-  succeeds.  A sparse extension allocates nothing, so this does not prove the group
-  could spare another block -- but it does prove the refusal is about *this write's*
-  blocks rather than about the device.
-* **`xfs_repair -n` is clean on the image at the boundary.**  So nothing was left
-  half-written: the refusal left a consistent filesystem behind.
+An intermediate note claimed something false and is withdrawn: that "volume.rs
+contains no ENOSPC at all, therefore xfuse does not produce this errno".  It does
+-- `FsError::ForkFull` maps to `ENOSPC` in `error.rs` -- and the claim came from
+grepping one file for a constant that lives in another.  A negative result about a
+whole program, drawn from one file, is not evidence about the program.
 
-And then the finding that dissolves the question:
+What the exercise did establish, and it is worth keeping:
 
-> **`volume.rs` contains no `ENOSPC` at all.**  Not `libc::ENOSPC`, not
-> `FsError::NoSpace`, nothing that maps to it.  The `errno` the caller sees is not
-> produced by this program.
+* **The refusal is honest and specific.**  It names the two numbers -- sixty-one
+  extents needed, two leaves' worth available -- so a caller is told which
+  constraint it hit rather than that "the disk is full".
+* **The group is not the limit**, and that was checked rather than assumed: after
+  the refusal a write inside the file succeeds and a sparse `ftruncate` four
+  megabytes past its end succeeds.
+* **`xfs_repair -n` is clean at the boundary**, so the refusal left a consistent
+  filesystem rather than a half-written one.
+* **It is still Linux-specific in effect and invisible to CI**, for a different
+  reason than the first guess: the *code* is portable, but until `RUST_LOG` is set
+  the daemon prints nothing at all.
 
-Which excludes (2), (3) and (4) as well, because none of them could produce an
-`ENOSPC` that xfuse does not generate.  What it is instead is the shape of (5):
-somewhere on this path xfuse answers **`Ok(0)`** -- a success carrying no bytes --
-and the **Linux kernel reports a zero-length reply to a non-empty write as
-`ENOSPC`**.
+That last one is a real gap and it is now the actionable one.  `main.rs` builds its
+subscriber with `EnvFilter::from_default_env()`, and with `RUST_LOG` unset that
+filter matches **nothing**: every `warn!` in the library -- the refusals, the
+"cannot set these fields" messages, the inode-format warnings -- is discarded
+before it reaches stderr.  Only `eprintln!` output is visible by default.  A
+diagnostic that requires an environment variable nobody sets is not a diagnostic,
+and the measurement above was blocked twice by it.
 
-The thirty-one is real, and it is where the defect *shows up*; it is not why.  That
-is a better place to start than an interior block: a zero-byte success is a defect
-whatever produces it, it is in the write path rather than the b-tree, and it is
-findable by finding the `Ok(0)` a write past the end can take.
-
-**It is also the first defect this project has found that its own CI cannot see.**
-The rule that turns a zero-length reply into `ENOSPC` is the Linux kernel's;
-FreeBSD's FUSE layer has no such rule, and CI runs FreeBSD.  That is the same shape
-as the skipped oracle checks -- something absent rather than something failing -- and
-it belongs beside them: a check that is silently skipped and a platform where a
-whole class of failure cannot occur look identical from inside a green run.
-
-One loose end, named rather than left: a `warn!` at the `write_extending` call site
-did **not** fire, which is consistent with `write_extending` returning `Ok` and is
-itself part of the evidence -- but it was not followed to the `Ok(0)`.
+So the next step is not an interior block.  It is: **make the daemon's warnings
+visible by default**, or at least say how to see them, and then decide what the
+default should be -- `warn` for a filesystem that is explicitly experimental, and
+the current silence only if that is deliberate and written down.
 
 ### A write test proves xfuse can read its own output; `xfs_repair` proves more
 
