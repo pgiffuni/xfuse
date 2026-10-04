@@ -613,9 +613,54 @@ A `NoSpace` from `allocate` is candidate (4) and reads differently.  Beyond that
 `xfs_repair` is what tells (2) from (3), and a leaf built with fewer records than
 `max_records` says and accepted is the direct test of (3).
 
-**The experiment is small and it is the whole of the next step.**  It needs no new
-code: grow a file to thirty, to thirty-one, and to the point where it refuses,
-capturing the message at each, and ask `xfs_repair -n` about the image at thirty.
+**The experiment has been run, and the answer is not on the list.**  Growing
+`files/hello.txt` in `xfsv4.img` one sparse write at a time:
+
+```text
+start size 14
+refused after 30 successful writes, errno 28 (ENOSPC)
+size at the refusal 30412800
+```
+
+Thirty successful writes plus the extent the file already had is **thirty-one
+extents**, which is exactly where a thirty-record leaf fills -- so the boundary
+looks like candidate (1) and is not.  Two observations exclude most of the rest:
+
+* **The group is not full.**  Immediately after the refusal a 512-byte write
+  *inside* the file succeeds, and a `ftruncate` four megabytes past the file's end
+  succeeds.  A sparse extension allocates nothing, so this does not prove the group
+  could spare another block -- but it does prove the refusal is about *this write's*
+  blocks rather than about the device.
+* **`xfs_repair -n` is clean on the image at the boundary.**  So nothing was left
+  half-written: the refusal left a consistent filesystem behind.
+
+And then the finding that dissolves the question:
+
+> **`volume.rs` contains no `ENOSPC` at all.**  Not `libc::ENOSPC`, not
+> `FsError::NoSpace`, nothing that maps to it.  The `errno` the caller sees is not
+> produced by this program.
+
+Which excludes (2), (3) and (4) as well, because none of them could produce an
+`ENOSPC` that xfuse does not generate.  What it is instead is the shape of (5):
+somewhere on this path xfuse answers **`Ok(0)`** -- a success carrying no bytes --
+and the **Linux kernel reports a zero-length reply to a non-empty write as
+`ENOSPC`**.
+
+The thirty-one is real, and it is where the defect *shows up*; it is not why.  That
+is a better place to start than an interior block: a zero-byte success is a defect
+whatever produces it, it is in the write path rather than the b-tree, and it is
+findable by finding the `Ok(0)` a write past the end can take.
+
+**It is also the first defect this project has found that its own CI cannot see.**
+The rule that turns a zero-length reply into `ENOSPC` is the Linux kernel's;
+FreeBSD's FUSE layer has no such rule, and CI runs FreeBSD.  That is the same shape
+as the skipped oracle checks -- something absent rather than something failing -- and
+it belongs beside them: a check that is silently skipped and a platform where a
+whole class of failure cannot occur look identical from inside a green run.
+
+One loose end, named rather than left: a `warn!` at the `write_extending` call site
+did **not** fire, which is consistent with `write_extending` returning `Ok` and is
+itself part of the evidence -- but it was not followed to the `Ok(0)`.
 
 ### A write test proves xfuse can read its own output; `xfs_repair` proves more
 
