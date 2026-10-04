@@ -242,11 +242,14 @@ trees must receive both halves: 200 such splits in group 0 of `xfsv4.img` leave 
 two trees agreeing, the count following, and `xfs_repair -n` accepting the image.
 
 **MEASURED.** Growing every group's trees past one leaf -- taking single blocks from
-the middle of the longest run, 200 times per group, on `xfsv4.img` -- succeeds in
-groups 0, 1 and 2, with `xfs_repair -n` accepting after each. **Group 3 fails on
-the very first allocation**, with `Invalid { errno: 22, msg: "this node holds
-subtrees, not free runs" }` -- a node's records read as free runs before its level
-has been checked.
+the middle of the longest run, 200 times per group, on `xfsv4.img` -- now succeeds in
+**all four groups**, with `xfs_repair -n` accepting after each.
+
+This did not work for group 3 until the two one-level assumptions above were fixed;
+it previously failed there on the *first* allocation. The test that asserts it,
+`taking_a_block_from_the_middle_of_a_run_leaves_both_trees_agreeing`, additionally
+requires **both** trees to describe the same free space and the count to follow them,
+and is no longer ignored.
 
 **MEASURED.** The group headers of groups 1, 2 and 3 are byte-identical from offset
 0x20 onwards and differ only before it, which is exactly where `agf_bno_root` and

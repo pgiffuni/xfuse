@@ -6402,7 +6402,6 @@ mod t {
     }
 
     #[test]
-    #[ignore = "a node's records are read as runs before its level is checked"]
     fn taking_a_block_from_the_middle_of_a_run_leaves_both_trees_agreeing() {
         // A **real** image, not the synthetic one.  This started on
         // `image_with_group`, which writes a superblock with no magic and no
