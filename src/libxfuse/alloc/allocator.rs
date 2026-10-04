@@ -6260,6 +6260,102 @@ mod t {
         assert_repair_accepts(copy.path(), "after frees that split a leaf");
     }
 
+    /// Taking a block from the **middle** of a free run leaves both trees saying
+    /// the same thing.
+    ///
+    /// This is the path nothing tested.  An allocation from the *end* of a run
+    /// shortens it; an allocation that frees a block which was already allocated
+    /// adds a new run; and both of those are covered.  Taking a block from the
+    /// middle is the only one that **splits** a run into two, and a split is the
+    /// one operation where the two trees have to be updated with different values.
+    ///
+    /// It is also where a real image goes wrong.  `xfs_repair` on a file grown
+    /// until it had a couple of hundred extents said:
+    ///
+    /// ```text
+    /// free space (1,17694-17694) only seen by one free space btree
+    /// free space (1,17700-17700) only seen by one free space btree
+    /// ```
+    ///
+    /// Six blocks apart, which is what the two halves of a split run look like,
+    /// and a group that had 30144 free blocks of 32768 could not then satisfy a
+    /// request for one.  So the split is measured here, on both trees, rather
+    /// than inferred from a summary.
+    // **Failing, and the failure is the finding.**  Taking a block from the
+    // middle of a free run splits it, and the split leaves the superblock's own
+    // free-block count short by what was taken:
+    //
+    //     Corrupt { what: "the superblock records fewer free blocks than were
+    //                taken from it" }
+    //
+    // on the *first* split, before anything else in this test can be checked.  So
+    // it is ignored rather than deleted: the check is right, the code is not, and
+    // the reason is here so that whoever fixes it removes the `ignore` rather than
+    // the test.  It is the same fault `xfs_repair` reports on a real image as
+    // "free space ... only seen by one free space btree", and the plan records it
+    // in "The free-space trees disagree with each other".
+    #[test]
+    #[ignore = "a split run leaves the superblock short; see docs/write-support-progress.md"]
+    fn taking_a_block_from_the_middle_of_a_run_leaves_both_trees_agreeing() {
+        // One long run, so the first allocation has to split it rather than
+        // shorten it.
+        let runs: Vec<(u32, u32)> = vec![(64, 900)];
+        let (f, sb) = image_with_group(&runs);
+        let total: u32 = runs.iter().map(|(_, l)| l).sum();
+        let device = Arc::new(BlockDevice::open(f.path(), Access::ReadWrite).unwrap());
+        let mut cache = BlockCache::new(BS, 256);
+
+        // Take a block from the middle, repeatedly, so a split happens and then
+        // the halves are split again.
+        let mut taken: Vec<u32> = Vec::new();
+        for _ in 0..12 {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let run = allocate(&mut tx, &sb, 0, 1).expect("an allocation from a split run");
+            tx.commit().unwrap();
+            assert_eq!(run.len, 1, "the allocation was not a single block");
+            taken.push(run.start);
+            // And it is inside the run we built, not somewhere else entirely.
+            assert!(
+                (64..64 + 900).contains(&run.start),
+                "an allocation came from block {} which is not in the run",
+                run.start
+            );
+        }
+        device.flush().unwrap();
+
+        // The observation: **both** trees, read back independently.
+        let by_block = free_runs_in_group(f.path(), &sb, 0, false);
+        let by_size = free_runs_in_group(f.path(), &sb, 0, true);
+        assert_eq!(
+            by_block,
+            by_size,
+            "the two trees on the image no longer agree after {} splits",
+            taken.len()
+        );
+
+        // The summary follows the trees, not the other way round.
+        let free: u32 = by_block.iter().map(|r| r.len).sum();
+        assert_eq!(
+            free,
+            total - taken.len() as u32,
+            "the count of free blocks is wrong"
+        );
+        for block in &taken {
+            assert!(
+                !by_block
+                    .iter()
+                    .any(|r| r.start <= *block && *block < r.start + r.len),
+                "block {block} was allocated and is still free"
+            );
+        }
+
+        // And the image is one the reference implementation accepts.
+        assert_repair_accepts(f.path(), "after allocating from the middle of a run");
+    }
+
+    /// An allocation that is committed leaves the image coherent: both trees have
+    /// given up the blocks, they still agree with each other, and the group's
+    /// own count follows.
     /// An allocation that is committed leaves the image coherent: both trees have
     /// given up the blocks, they still agree with each other, and the group's
     /// own count follows.

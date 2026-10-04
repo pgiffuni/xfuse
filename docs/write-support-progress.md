@@ -748,11 +748,36 @@ Two things make it worth naming precisely rather than "the allocator is broken":
   itself odd** for a group holding runs of at least two different lengths.  It is
   the kind of thing to ask about *after* the split, not instead of it.
 
-The honest next step is a measurement in the same shape as the others here: take a
-run, take a block from the middle of it, and read **both** trees back -- the entries
-before, the entries after, and what `xfs_db` says each tree holds.  The
-perturbation is the allocation; the two reads are the observation; and the question
-is which of the two trees is missing a piece of a split run.
+**The measurement has been made, and it reproduces on the first split.**
+
+`taking_a_block_from_the_middle_of_a_run_leaves_both_trees_agreeing` builds a group
+holding one long run, takes twelve single blocks out of the middle of it, and then
+reads both trees back independently.  It does not get as far as reading them:
+
+```text
+Corrupt { what: "the superblock records fewer free blocks than were taken from it" }
+```
+
+On the **first** split.  So the accounting is wrong before any tree comparison is
+possible, which is a sharper statement than `xfs_repair`'s and points somewhere
+specific: `set_sb_fdblocks` is not being told what the split cost.
+
+That test is committed **ignored, with its reason**, rather than deleted or left
+failing.  A deleted test is indistinguishable from a test that was never written, and
+a red suite is not a place to keep a finding; an ignored test whose `ignore` string
+names the defect is both visible and honest, and whoever fixes the split removes the
+`ignore` and not the test.
+
+What makes this the fault it is: **the split is the only allocation path that had no
+test.**  An allocation from the end of a run shortens it, and freeing a block that
+was already allocated adds a run; both are covered by
+`a_committed_allocation_is_a_coherent_change`, which asserts exactly what this one
+does and passes.  Taking a block from the middle is the only one that produces two
+pieces where there was one, and it is the only one where the trees and the summary
+have to be told about different values.
+
+So the question for next is narrow and answerable: **what does a split tell
+`set_sb_fdblocks`?**  Everything else about the path is already measured.
 
 ### A write test proves xfuse can read its own output; `xfs_repair` proves more
 
