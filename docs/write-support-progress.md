@@ -398,6 +398,7 @@ Each numerical claim in this document, what it rests on, and where it now stands
 | a non-root leaf needs 31 records, a root leaf none | tool | repair's `bad btree nrecs (30, min=31, max=62)`, and silence for a root | **confirmed** |
 | `next_unlinked` is at offset 96 and holds `0xffffffff` | tool | repair names the field; its offset found by writing a value at each offset and asking which it read | **confirmed** |
 | `startino` is counted from the group | tool | repair accepts below `153600 × 2` and refuses at or above it | **confirmed** |
+| an inode's data fork is `di_forkoff << 3`, and `XFS_DINODE_SIZE` is 100 (v2) / 184 (v3) | doc, cross-checked | `XFS_DFORK_DSIZE` and `XFS_DINODE_SIZE` in `xfs_format.h`; for the 256-byte inode `(256 − 100) / 16` is 9.75, which is the nine that were measured independently by nine sparse writes succeeding and the tenth being refused | **confirmed** |
 | a 256-byte inode holds nine extents | derived + tool | `(256 − 100) / 16`, and nine sparse writes succeed before the tenth is refused | **confirmed** |
 | the free slots of a new chunk: magic, version, `next_unlinked` | tool | repair's complaints, item by item | **repair-validated only** |
 | — the *version* XFS picks for a new chunk's slots | inference | none: no image here has a chunk XFS created | **unmeasured** |
@@ -1098,6 +1099,77 @@ program has allocated an inode cannot be one repair accepts, and the only honest
 arrangement is to ask repair while the chunk exists and every one of its inodes is
 still free — which it accepts — and then to assert that the inode's allocation is
 the *only* thing repair objects to afterwards.
+
+### The attribute fork's format numbering coincides with the data fork's, which is why the conflation is harmless
+
+`di_aformat` is `__s8 /* format of attr fork's data */` and is decoded here as an
+`XfsDinodeFmt`, so two different enumerations' *numbers* are being read as their
+*meanings*.  Measured: an inode with a B+tree **attribute** fork — `files/btree2.txt`
+in `xfs4096.img`, whose sixteen attributes are all remote — reports
+
+```text
+core.aformat = 2 (extents)
+core.forkoff = 24
+core.naextents = 0
+core.nextents = 16      (the *data* fork's count)
+core.format = 3 (btree) (ditto)
+```
+
+and its attributes are read correctly.  So 2 dispatches to the extents arm, which
+builds the fork's remote-value extent map — empty here, because `naextents` is 0 and
+the names come from the attribute B+tree instead.  The read works.
+
+The reason it works is the useful finding: **for the two forms XFS actually writes
+— local and extents — the attribute fork's format numbers are the same as the data
+fork's.**  A file with an in-inode attribute fork reports 1 and takes the shortform
+arm, which is right; one with remote values reports 2 and takes the extents arm,
+which is right.  The arms named `Btree` for an attribute fork name a form XFS no
+longer writes.
+
+So this is **fragile rather than wrong**, and the difference matters to how it is
+read: a reader that dispatches correctly *by accident* will keep working, and will
+start failing on a form whose number happens to differ.  The fix is a separate enum
+with its own numbers, and it should be written when a form is found that needs it
+rather than as a precaution — the plan's rule is that a workaround is not a fix, and
+a rename is not a fix either.
+
+### An inode's data fork size is `di_forkoff << 3`, and its core is 100 bytes at v2
+
+The arithmetic every fork-capacity question in this project rests on, and it is
+three macros in `xfs_format.h` rather than anything that had to be inferred:
+
+```c
+#define XFS_DFORK_BOFF(dip)   ((int)((dip)->di_forkoff << 3))
+#define XFS_DFORK_DSIZE(dip,mp) \
+        ((dip)->di_forkoff ? XFS_DFORK_BOFF(dip) : XFS_LITINO(mp))
+#define XFS_DFORK_MAXEXT(dip,mp,w) \
+        (XFS_DFORK_SIZE(dip, mp, w) / sizeof(struct xfs_bmbt_rec))
+```
+
+so the number of extent records a data fork holds is `(di_forkoff << 3) / 16` when
+there is an attribute fork and `(sb_inodesize − XFS_DINODE_SIZE) / 16` when there
+is not.  `XFS_DINODE_SIZE` is `offsetof(struct xfs_dinode, di_crc)` = **100** for a
+version 2 inode and `sizeof(struct xfs_dinode)` = **184** for a version 3 one.
+
+| Inode | Version | `di_forkoff` | Data fork | Records |
+|:------|:---------|:--------------|:----------|:--------|
+| 256 B | 2 | 0 | 256 − 100 = 156 | **9** |
+| 512 B | 3 | 0 | 512 − 184 = 328 | 20 |
+| 512 B | 3 | 24 | 24 << 3 = 192 | 12 |
+
+**The first row is the check on the whole table**, because nine is not derived from
+the header — it is what a 256-byte inode was measured to hold, by nine sparse writes
+succeeding and the tenth being refused.  `(256 − 100) / 16` is 9.75, which is
+exactly nine records and then the refusal, and the 100 is only in the header.  Two
+independent routes, one number.
+
+It is also the number that decides what BMBT growth has to do.  A file that cannot
+grow past this is not short of free space; its **fork** is full, and the format's
+answer is to change what is in it.  Converting to a B+tree does not immediately
+help: the root lives in the fork, so a *leaf* root at level 0 still holds
+`DSIZE / 16` records and a 512-byte inode with a 24-byte attribute fork still gets
+12.  Growing past that needs an interior root and real leaf blocks, which is why the
+remaining work is a writer and not a flag.
 
 ### A 256-byte inode holds nine extents, and the tenth is refused
 
