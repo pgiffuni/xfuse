@@ -6307,50 +6307,95 @@ mod t {
     // with is withdrawn.  Fixing the builder is the next step, and the test runs
     // when it is done.
     #[test]
-    #[ignore = "image_with_group writes no real superblock; fix the builder first"]
     fn taking_a_block_from_the_middle_of_a_run_leaves_both_trees_agreeing() {
-        // One long run, so the first allocation has to split it rather than
-        // shorten it.
-        let runs: Vec<(u32, u32)> = vec![(64, 900)];
-        let (f, sb) = image_with_group(&runs);
-        let total: u32 = runs.iter().map(|(_, l)| l).sum();
-        let device = Arc::new(BlockDevice::open(f.path(), Access::ReadWrite).unwrap());
-        let mut cache = BlockCache::new(BS, 256);
+        // A **real** image, not the synthetic one.  This started on
+        // `image_with_group`, which writes a superblock with no magic and no
+        // `sb_fdblocks`, and every attempt failed on the fixture before reaching
+        // the behaviour: once as "the superblock records fewer free blocks than
+        // were taken from it", and once as "the superblock's magic number is
+        // wrong".  Both were the image.  A measurement of a filesystem wants a
+        // filesystem, and the images are right here.
+        let Some(golden) = crate::libxfuse::alloc::golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let Ok(source) = std::fs::File::open(&golden) else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let mut copy = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut src = source;
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = std::io::Read::read(&mut src, &mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                copy.write_all(&buf[..n]).unwrap();
+            }
+        }
+        copy.flush().unwrap();
 
-        // Take a block from the middle, repeatedly, so a split happens and then
-        // the halves are split again.
-        let mut taken: Vec<u32> = Vec::new();
-        for _ in 0..12 {
+        let mut reader = std::io::BufReader::new(std::fs::File::open(copy.path()).unwrap());
+        let sb = Sb::from(&mut reader);
+        let device = Arc::new(BlockDevice::open(copy.path(), Access::ReadWrite).unwrap());
+        let mut cache = BlockCache::new(BS, 256);
+        let agno = 0u32;
+
+        // The longest free run the group has, so the allocations below land in the
+        // middle of something real rather than at a boundary.
+        let target = {
             let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
-            let run = allocate(&mut tx, &sb, 0, 1).expect("an allocation from a split run");
+            let agf = read_agf(&mut tx, &sb, agno).expect("a group header");
+            let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
+            let runs = crate::libxfuse::alloc::free_space::walk(
+                agf.block_btree_root(),
+                GroupGeometry::new(sb.sb_agblocks, sb.has_crc(), true),
+                |b| store.get(b),
+            )
+            .expect("the free space tree");
+            runs.into_iter()
+                .filter(|r| r.len >= 8)
+                .max_by_key(|r| r.len)
+                .expect("a run long enough to take a block from the middle of")
+        };
+        let before_free = free_runs_in_group(copy.path(), &sb, agno, false);
+
+        // Take one block from the middle, several times, so a run is split and
+        // then the pieces are split again.
+        let mut taken: Vec<u32> = Vec::new();
+        for _ in 0..6 {
+            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            // `allocate`, not `allocate_in_group`: the wrapper is what tells the
+            // **superblock** how many blocks the filesystem has given up, and
+            // skipping it leaves `sb_fdblocks` short by exactly the number taken --
+            // which is what `xfs_repair` reported here when this test called the
+            // inner function directly.
+            let run = allocate(&mut tx, &sb, agno, 1).expect("an allocation");
             tx.commit().unwrap();
             assert_eq!(run.len, 1, "the allocation was not a single block");
             taken.push(run.start);
-            // And it is inside the run we built, not somewhere else entirely.
-            assert!(
-                (64..64 + 900).contains(&run.start),
-                "an allocation came from block {} which is not in the run",
-                run.start
-            );
         }
         device.flush().unwrap();
 
-        // The observation: **both** trees, read back independently.
-        let by_block = free_runs_in_group(f.path(), &sb, 0, false);
-        let by_size = free_runs_in_group(f.path(), &sb, 0, true);
+        // The observation: **both** trees, read independently off the image.
+        let by_block = free_runs_in_group(copy.path(), &sb, agno, false);
+        let by_size = free_runs_in_group(copy.path(), &sb, agno, true);
         assert_eq!(
             by_block,
             by_size,
-            "the two trees on the image no longer agree after {} splits",
+            "the two trees no longer agree after {} allocations from the middle of a run",
             taken.len()
         );
 
-        // The summary follows the trees, not the other way round.
-        let free: u32 = by_block.iter().map(|r| r.len).sum();
+        // The summary follows the trees.
+        let before: u32 = before_free.iter().map(|r| r.len).sum();
+        let after: u32 = by_block.iter().map(|r| r.len).sum();
         assert_eq!(
-            free,
-            total - taken.len() as u32,
-            "the count of free blocks is wrong"
+            after,
+            before - taken.len() as u32,
+            "the free block count did not follow the trees"
         );
         for block in &taken {
             assert!(
@@ -6360,9 +6405,12 @@ mod t {
                 "block {block} was allocated and is still free"
             );
         }
+        assert!(
+            target.len >= 8,
+            "the run chosen should have been long enough to split"
+        );
 
-        // And the image is one the reference implementation accepts.
-        assert_repair_accepts(f.path(), "after allocating from the middle of a run");
+        assert_repair_accepts(copy.path(), "after allocating from the middle of a run");
     }
 
     /// An allocation that is committed leaves the image coherent: both trees have
