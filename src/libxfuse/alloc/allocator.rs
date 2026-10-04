@@ -1403,7 +1403,14 @@ mod t {
         },
         block_cache::BlockCache,
         block_device::{Access, BlockDevice},
-        btree::BmbtLeafBlock,
+        btree::{
+            BmbtLeafBlock,
+            BmbtLeafRecord,
+            BtreeLblockHdr,
+            BMBT_CRC_HEADER_LEN,
+            BMBT_HEADER_LEN,
+            BMBT_RECORD_LEN,
+        },
         dinode::{DiA, DiU, Dinode},
         dinode_core::XfsDinodeFmt,
         dir3::{Dir2DataEntry, Dir3},
@@ -4701,6 +4708,87 @@ mod t {
     /// What is also pinned is that the structure **refuses** what it should,
     /// rather than reading past the end of a buffer or crashing: a bad magic, more
     /// records than fit, and too short a block are all errors.
+    /// A checksummed b-map leaf re-encodes to the bytes the file system wrote.
+    ///
+    /// The long-form header is 72 bytes and the short form the free space trees use
+    /// is 56, and both are in these images, so writing a leaf is not a variation on
+    /// the free space node writer -- it is a different header with the same checksum
+    /// convention.  What settles which is which is the file system's own bytes: a
+    /// leaf is found by looking for the magic, decoded, and re-encoded from its own
+    /// decoded contents, and the result has to equal the block it came from.
+    ///
+    /// The block's own number and its owning inode are read **out of the block**
+    /// rather than passed in, because a writer that has to be told them is a writer
+    /// whose caller has to know them, and that is the part most likely to be wrong.
+    #[test]
+    fn a_checksummed_bmap_leaf_re_encodes_to_the_bytes_on_disk() {
+        use crate::libxfuse::definitions::XFS_BMAP_CRC_MAGIC;
+        let Some(path) = crate::libxfuse::alloc::golden("xfs4096.img") else {
+            eprintln!("skipping: no unpacked xfs4096.img");
+            return;
+        };
+        let sb = sb_of(&path);
+        let bs = sb.sb_blocksize as usize;
+        let uuid = sb.uuid();
+        let whole = std::fs::read(&path).expect("reading the image");
+
+        let mut found = 0usize;
+        for blk in 0..whole.len() / bs {
+            let at = blk * bs;
+            if u32::from_be_bytes([whole[at], whole[at + 1], whole[at + 2], whole[at + 3]])
+                != XFS_BMAP_CRC_MAGIC
+            {
+                continue;
+            }
+            let level = u16::from_be_bytes([whole[at + 4], whole[at + 5]]);
+            let numrecs = u16::from_be_bytes([whole[at + 6], whole[at + 7]]) as usize;
+            if level != 0 || numrecs == 0 || numrecs > (bs - BMBT_CRC_HEADER_LEN) / 16 {
+                continue;
+            }
+            let bytes = &whole[at..at + bs];
+            let leaf = BmbtLeafBlock::from_bytes(bytes).expect("a b-map leaf");
+
+            // The header, read **out of the block**: a writer that has to be told
+            // which block it is writing is a writer whose caller has to know it,
+            // and that is the part most likely to be wrong.
+            let be = |o: usize| u64::from_be_bytes(bytes[o..o + 8].try_into().unwrap());
+            let hdr = BtreeLblockHdr {
+                blkno: be(24),
+                lsn: be(32),
+                leftsib: be(8),
+                rightsib: be(16),
+                owner: be(56),
+                uuid,
+            };
+            let again = leaf.to_bytes(&hdr, bs);
+            // Compared by offset, because a whole 4096-byte block in an assertion
+            // message is unreadable and the first difference is the only one that
+            // matters.
+            let differs: Vec<usize> = again
+                .iter()
+                .zip(bytes.iter())
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .map(|(i, _)| i)
+                .take(8)
+                .collect();
+            assert!(
+                differs.is_empty(),
+                "block {blk}: re-encoding differs from the bytes on disk at {differs:?}"
+            );
+            let again_leaf = BmbtLeafBlock::from_bytes(&again).expect("re-reading our own leaf");
+            assert_eq!(
+                again_leaf.records, leaf.records,
+                "block {blk}: records changed"
+            );
+            found += 1;
+            if found == 3 {
+                break;
+            }
+        }
+        assert!(found > 0, "no checksummed b-map leaf was found in {path:?}");
+    }
+
     #[test]
     fn a_bmap_leaf_decodes_the_extents_xfs_db_reports() {
         let Some(path) = crate::libxfuse::alloc::golden("xfsv4.img") else {
@@ -4740,6 +4828,36 @@ mod t {
             assert_eq!(r.startblock(), startblock, "record {i}: start block");
             assert_eq!(r.blockcount(), blockcount, "record {i}: block count");
             assert!(!r.extent_flag(), "record {i}: extent flag");
+        }
+
+        // And the encoder is the decoder's inverse, byte for byte, on the file
+        // system's own bytes rather than on constants copied out of this code.
+        //
+        // This is the half the writer needs and the half that a decode-only test
+        // cannot reach: a record that reads correctly and re-encodes wrongly is a
+        // record that this code would rewrite into an image XFS then refuses.
+        for (i, r) in leaf.records.iter().enumerate() {
+            let at = BMBT_HEADER_LEN + i * BMBT_RECORD_LEN;
+            let on_disk = &bytes[at..at + BMBT_RECORD_LEN];
+
+            // Read the bytes, and get the same record back.
+            assert_eq!(
+                BmbtLeafRecord::from_bytes(on_disk),
+                *r,
+                "record {i}: reading the bytes back gave a different record"
+            );
+
+            // Decode, encode, and get **the file system's own bytes** back --
+            // through `from_extent`, which is the path a writer takes, rather than
+            // through the accessor the decoder happened to use.  A record that
+            // reads correctly and re-encodes wrongly is one this code would write
+            // into an image that `xfs_repair` then refuses, and only a comparison
+            // with the bytes already on disk can tell the two apart.
+            assert_eq!(
+                BmbtLeafRecord::from_extent(&r.as_extent()).to_bytes(),
+                *on_disk,
+                "record {i}: decoding and re-encoding did not reproduce the bytes"
+            );
         }
 
         // Every record in the leaf, which is the stronger claim: the offsets

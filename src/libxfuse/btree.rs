@@ -41,7 +41,7 @@ use num_traits::{PrimInt, Unsigned};
 
 use super::{
     bmbt_rec::{BmbtRec, Bmx},
-    definitions::{XfsFileoff, XfsFsblock, XFS_BMAP_CRC_MAGIC, XFS_BMAP_MAGIC},
+    definitions::{XfsFileoff, XfsFsblock, XfsIno, XFS_BMAP_CRC_MAGIC, XFS_BMAP_MAGIC},
     utils::{decode, decode_from, Uuid},
     volume::SUPERBLOCK,
 };
@@ -163,6 +163,60 @@ pub const BMBT_STARTOFF_BITLEN: u32 = 54;
 /// sign bit is still spent.
 pub const BMBT_BLOCKCOUNT_BITLEN: u32 = 21;
 
+/// The five values in a long-form checksummed b-tree header that are not counts.
+///
+/// They are gathered into one value because they are one question -- "which block
+/// is this, in what file system, owned by whom, and next to what" -- and a writer
+/// that took eight arguments to ask it would be a writer whose callers could not
+/// remember the order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BtreeLblockHdr {
+    /// The block's **own** number.
+    pub blkno:    XfsFsblock,
+    /// The log sequence number; see [`BmbtLeafBlock::to_bytes`].
+    pub lsn:      u64,
+    pub leftsib:  XfsFsblock,
+    pub rightsib: XfsFsblock,
+    /// The inode whose fork the tree belongs to.
+    pub owner:    XfsIno,
+    /// The file system's identifier.
+    pub uuid:     [u8; 16],
+}
+
+impl BtreeLblockHdr {
+    /// A header for a tree with one leaf and no log sequence number: the two
+    /// siblings are null and the rest is what the block is.
+    #[allow(dead_code)]
+    pub const fn for_single_leaf(blkno: XfsFsblock, owner: XfsIno, uuid: [u8; 16]) -> Self {
+        Self {
+            blkno,
+            lsn: 0,
+            leftsib: BMBT_NULL_PTR,
+            rightsib: BMBT_NULL_PTR,
+            owner,
+            uuid,
+        }
+    }
+}
+
+/// The sibling pointer a b-tree node has when it has no sibling.
+///
+/// `NULLAGINO` widened to the eight bytes the long form uses, which is every bit
+/// set -- not zero, which is a block number.
+#[allow(dead_code)] // The conversion writes a single-leaf tree, which is this.
+pub const BMBT_NULL_PTR: XfsFsblock = u64::MAX;
+
+/// A CRC-32C over a whole block, with the checksum's own four bytes read as zeroes.
+///
+/// Little significant byte first, at `at`, which is where every checksummed
+/// structure in this file system keeps it.
+fn crc32c_without_its_own_field(bytes: &[u8], at: usize) -> u32 {
+    let crc = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
+    let mut buf = bytes.to_vec();
+    buf[at..at + 4].fill(0);
+    crc.checksum(&buf)
+}
+
 /// Where in a b-map record the low half of the start block sits, and its width.
 ///
 /// `l0:0-8`, nine bits.
@@ -234,6 +288,49 @@ impl BmbtLeafRecord {
         let low = self.l0 & ((1 << BMBT_STARTBLOCK_LOW_BITLEN) - 1);
         let high = (self.l1 >> BMBT_BLOCKCOUNT_BITLEN) & ((1 << BMBT_STARTBLOCK_HIGH_BITLEN) - 1);
         ((high << BMBT_STARTBLOCK_LOW_BITLEN) | low) >> BMBT_STARTBLOCK_SCALE_SHIFT
+    }
+
+    /// The record that records this extent, which is its inverse.
+    ///
+    /// The scale and the bit layout are [`startoff`]'s, [`startblock`]'s and
+    /// [`blockcount`]'s read backwards, and the one that is easy to get wrong is
+    /// the start block: it is written into `l1`'s high bits **already scaled**, so
+    /// it is `l1 >> 21` and not a value assembled from both words.  `l0`'s low nine
+    /// bits -- nominally the block number's low bits -- are left zero, which is
+    /// what every leaf measured here holds, and the round trip in the allocator's
+    /// tests is what pins that rather than this comment.
+    #[allow(dead_code)] // Used as soon as a data fork can grow into a B+tree.
+    pub const fn from_extent(e: &BmbtRec) -> Self {
+        let mut l0 =
+            (e.br_startoff & ((1 << BMBT_STARTOFF_BITLEN) - 1)) << BMBT_STARTBLOCK_LOW_BITLEN;
+        if e.br_flag {
+            l0 |= 1 << (64 - BMBT_EXNTFLAG_BITLEN);
+        }
+        let startblock = e.br_startblock & ((1 << BMBT_STARTBLOCK_HIGH_BITLEN) - 1);
+        let l1 = (startblock << BMBT_BLOCKCOUNT_BITLEN)
+            | (e.br_blockcount & ((1 << BMBT_BLOCKCOUNT_BITLEN) - 1));
+        Self { l0, l1 }
+    }
+
+    /// These two records' bytes, big endian, which is how a leaf holds them.
+    pub fn to_bytes(self) -> [u8; BMBT_RECORD_LEN] {
+        let mut out = [0u8; BMBT_RECORD_LEN];
+        out[..8].copy_from_slice(&self.l0.to_be_bytes());
+        out[8..].copy_from_slice(&self.l1.to_be_bytes());
+        out
+    }
+
+    /// These two words read out of a leaf's bytes.
+    #[allow(dead_code)] // Used as soon as a data fork can grow into a B+tree.
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let mut l0 = [0u8; 8];
+        let mut l1 = [0u8; 8];
+        l0.copy_from_slice(&bytes[..8]);
+        l1.copy_from_slice(&bytes[8..16]);
+        Self {
+            l0: u64::from_be_bytes(l0),
+            l1: u64::from_be_bytes(l1),
+        }
     }
 
     /// This record as the extent the rest of this program works with.
@@ -320,6 +417,63 @@ impl BmbtLeafBlock {
             });
         }
         Ok(BmbtLeafBlock { level, records })
+    }
+
+    /// This leaf as the bytes a block of a checksummed file system holds.
+    ///
+    /// The header is the **long** form, 72 bytes, and it is worth being explicit
+    /// that this is not the header the free space trees use: those are the short
+    /// form, 56 bytes, with four-byte siblings and no block number.  Both are in
+    /// `xfs_format.h` and both are in the same images here, so a node writer copied
+    /// from the free space one and given a new magic would be sixteen bytes short
+    /// and mis-parsed past the siblings.
+    ///
+    /// `blkno` is the block's **own** number, `owner` the inode whose fork this
+    /// tree belongs to, and both are there so a block that has been copied or
+    /// swapped cannot pass as the block it claims to be.
+    ///
+    /// The siblings are passed in rather than set to null because they are not
+    /// always null: a tree with one leaf has none, and every leaf of a longer chain
+    /// has two, and a writer that could only say "null" could not build one.  The
+    /// null a single-leaf tree wants is [`BMBT_NULL_PTR`].
+    ///
+    /// The checksum is a CRC-32C over the whole block with its own field read as
+    /// zeroes, stored least significant byte first -- the same convention the
+    /// superblock, the inodes, the group header and the free list all use.
+    ///
+    /// `lsn` is the log sequence number, and it is a parameter rather than a zero
+    /// because the leaves in these images carry `0x10000016f`: a non-zero value on
+    /// a file system whose log nothing here has ever written.  So "unset is zero"
+    /// is not a safe assumption for reproducing a block byte for byte, even though
+    /// `xfs_repair` reads a zero as perfectly acceptable -- it is the one field of
+    /// the header that this code cannot derive, and passing it in is what keeps
+    /// that out of the writer.
+    #[allow(dead_code)] // Used as soon as a data fork can grow into a B+tree.
+    pub fn to_bytes(&self, hdr: &BtreeLblockHdr, sb_blocksize: usize) -> Vec<u8> {
+        let (blkno, lsn, leftsib, rightsib) = (hdr.blkno, hdr.lsn, hdr.leftsib, hdr.rightsib);
+        let (owner, uuid) = (hdr.owner, hdr.uuid);
+        let mut b = vec![0u8; sb_blocksize];
+        b[0..4].copy_from_slice(&XFS_BMAP_CRC_MAGIC.to_be_bytes());
+        b[4..6].copy_from_slice(&self.level.to_be_bytes());
+        b[6..8].copy_from_slice(&(self.records.len() as u16).to_be_bytes());
+        b[8..16].copy_from_slice(&leftsib.to_be_bytes());
+        b[16..24].copy_from_slice(&rightsib.to_be_bytes());
+        b[24..32].copy_from_slice(&blkno.to_be_bytes());
+        // The log sequence number.  It is **not** zero in the images here -- see
+        // the note on the parameter -- and it is passed in rather than invented,
+        // because this code does not go through the log and so has no sequence
+        // number of its own to write.
+        b[32..40].copy_from_slice(&lsn.to_be_bytes());
+        b[40..56].copy_from_slice(&uuid);
+        b[56..64].copy_from_slice(&owner.to_be_bytes());
+        // 64..68 is the checksum and is computed last; 68..72 is padding.
+        for (i, r) in self.records.iter().enumerate() {
+            let at = BMBT_CRC_HEADER_LEN + i * BMBT_RECORD_LEN;
+            b[at..at + BMBT_RECORD_LEN].copy_from_slice(&r.to_bytes());
+        }
+        let crc = crc32c_without_its_own_field(&b, 64);
+        b[64..68].copy_from_slice(&crc.to_le_bytes());
+        b
     }
 
     /// The extents as the rest of this program represents them.
