@@ -2543,19 +2543,11 @@ fn take_in_tree<B: GroupBlocks>(
         let index = if geometry.by_block {
             child_for(blocks, geometry, &node, &children, start)?
         } else {
-            children
-                .iter()
-                .position(|c| {
-                    read_node(blocks, geometry, *c)
-                        .and_then(|n| n.runs())
-                        .map(|runs| runs.contains(&chosen))
-                        .unwrap_or(false)
-                })
-                .ok_or_else(|| {
-                    FsError::corrupt(format!(
-                        "no leaf of the tree holds the run {chosen:?} that was chosen for taking"
-                    ))
-                })?
+            search_by_length(blocks, &geometry, &children, chosen)?.ok_or_else(|| {
+                FsError::corrupt(format!(
+                    "no leaf of the tree holds the run {chosen:?} that was chosen for taking"
+                ))
+            })?
         };
         path.push((block, index));
         block = children[index];
@@ -2567,6 +2559,41 @@ fn take_in_tree<B: GroupBlocks>(
 
     let root = walk_up(blocks, geometry, root, by_block_leaf, &path, None)?;
     Ok(root)
+}
+
+/// Which of `children` holds `wanted`, searching the whole tree beneath them.
+///
+/// The tree keyed by **length** cannot be descended by key -- its keys are records
+/// but do not say which child holds which run -- so it has to be searched, and
+/// searching means **recursing**.
+///
+/// Asking each child directly was the bug: a child's records answer "do you hold
+/// this run" only if the child is a **leaf**.  An interior node's records are the
+/// blocks holding its children, so the question is unanswerable there, and the
+/// error was being swallowed into "not this child" -- which made a tree of any
+/// greater depth report that it held nothing at all rather than that it was asked
+/// wrongly.
+///
+/// So a non-leaf child is descended into and its own children searched, and the
+/// index returned is the one in *this* level, because that is what the caller walks
+/// down.
+fn search_by_length<B: GroupBlocks>(
+    blocks: &mut B,
+    geometry: &GroupGeometry,
+    children: &[XfsAgblock],
+    wanted: FreeRun,
+) -> FsResult<Option<usize>> {
+    for (i, child) in children.iter().enumerate() {
+        let node = read_node(blocks, *geometry, *child)?;
+        if node.is_leaf() {
+            if node.runs()?.contains(&wanted) {
+                return Ok(Some(i));
+            }
+        } else if search_by_length(blocks, geometry, &node.children()?, wanted)?.is_some() {
+            return Ok(Some(i));
+        }
+    }
+    Ok(None)
 }
 
 /// The child of `node` that holds the run starting at `start`.
@@ -2637,12 +2664,31 @@ fn refresh_keys<B: GroupBlocks>(
         let first = read_node(blocks, geometry, parent.child(i)?)?.first_record()?;
         parent.set_key(i, (first.start, first.len))?;
     }
-    let last = read_node(blocks, geometry, parent.child(n - 1)?)?
-        .runs()?
-        .last()
-        .copied();
-    if let Some(run) = last {
-        parent.set_key(n, (run.start.saturating_add(run.len), 0))?;
+    // The sentinel: a start past the end of the last run in the last child.
+    //
+    // Only a **leaf**'s records can answer that.  An interior node's records are
+    // the blocks holding its children, so reading them as runs is an error rather
+    // than an answer -- and that error propagates out of the whole take, which is
+    // why no group whose last child is interior could be allocated from at all,
+    // however deep its tree was not the point.
+    //
+    // An interior child already carries a sentinel as **its own last key**, and
+    // that is the same quantity by construction: the same "one past the end".  So
+    // it is read rather than recomputed, and the two levels are asked the same
+    // question in the only way each can answer it.
+    let last_child = read_node(blocks, geometry, parent.child(n - 1)?)?;
+    let past_the_end = if last_child.is_leaf() {
+        last_child
+            .runs()?
+            .last()
+            .map(|r| r.start.saturating_add(r.len))
+    } else {
+        // An interior node's keys are its children's first keys plus a sentinel,
+        // so the sentinel is the one past its last record.
+        Some(last_child.key(last_child.numrecs() as usize)?.0)
+    };
+    if let Some(run) = past_the_end {
+        parent.set_key(n, (run, 0))?;
     }
     Ok(())
 }

@@ -360,22 +360,40 @@ fails. The search has to descend past a non-leaf rather than read it, and it doe
 not -- so in any group whose length-ordered root has interior children, this returns
 an error instead of an answer.
 
-**The fix is therefore known** and is narrow: in the `Order::ByLength` branch, when
-a child is **not** a leaf, recurse into it to find the leaf that holds the run, rather
-than asking it for runs. It is *not* implemented here, because an unverified edit to
-the allocator is worse than none -- and the check that it works is exactly the
-all-AG test, which currently stops at group 3 and would then continue.
+**The fix turned out to be two places, and both are the same mistake.**  A backtrace
+from the test does not localise this -- the library frames inline into the test --
+so the call was captured from *inside* `runs()`, which named the chain directly:
 
-**The striking part is the root block numbers.** Group 3's bno root is block **609**
-and its first free run is blocks **1-7953** (`freesp -a 3`), so the tree's root
-would sit *inside* free space. No valid file system can have that. Either `bnoroot`
-is being decoded differently for this AGF version, or this AG header is not group
-3's. Group 1's roots -- 8 and 10 -- are inside its first free run of 1707 blocks
-too, so if that reasoning were sound group 1 would be equally impossible, and it is
-`xfs_repair`-clean. **Which means the reasoning is unsound**, most likely because
-`bnoroot` here is not a block number in the file system's own numbering, or because
-`freesp` and the AGF header disagree about what "block 1" means. That is unresolved
-and no conclusion is drawn from it.
+```text
+refresh_keys  <-  walk_up  <-  take_in_tree  <-  FreeSpace::allocate
+```
+
+1. **`refresh_keys`** sets each key from its child's first record, then computes
+   the **sentinel** key from the last child's `runs()` -- which only answers if
+   that child is a leaf.  An interior child already carries a sentinel as **its own
+   last key**, and that is the same quantity by construction, so it is read rather
+   than recomputed.
+2. **The length-ordered search** asked each child directly whether it held the run
+   and **swallowed the error into "not this child"**, so a tree of any greater depth
+   reported that it held nothing at all rather than that it had been asked wrongly.
+   It now **recurses** past a non-leaf.
+
+Both are the shape of most of this project's defects: a function that knows one
+level of a structure being asked about another. "The child's records" is a leaf's
+answer and never an interior node's.
+
+**MEASURED after both fixes** -- all four groups, 200 mid-run splits each, with
+`xfs_repair -n` accepting the image after each:
+
+```text
+group 0: 200 single-block allocations from the middle of a run
+group 1: 200 single-block allocations from the middle of a run
+group 2: 200 single-block allocations from the middle of a run
+group 3: 200 single-block allocations from the middle of a run
+```
+
+which is the first time the deepest group in this image has been allocated from at
+all.
 
 The two single-block runs six apart that `xfs_repair` reported as "only seen by one
 free space btree" on a grown image may or may not be this; that is not established
