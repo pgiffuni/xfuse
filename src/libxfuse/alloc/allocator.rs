@@ -6309,21 +6309,23 @@ mod t {
     // **Not yet running for the groups that matter.**  Group 0 passes: the trees
     // agree, the count follows, the blocks are gone, `xfs_repair` accepts.
     //
-    // It fails on the first group whose free-space tree is **more than one level
-    // deep**, with:
+    // It fails inside `allocate` on the first group whose free-space tree is
+    // **more than one level deep**:
     //
     //     Invalid { errno: 22, msg: "this node holds subtrees, not free runs" }
     //
-    // which is `free_space::walk` refusing to descend into an interior node.  That
-    // is the finding: the walker handles single-level trees only.  And it is very
-    // likely the same thing `xfs_repair` was reporting on the grown image, because
-    // group 1 of `xfsv4.img` has a **level 4** `bno_root` -- it is not a group with
-    // one leaf in it.
+    // which is `FreeSpaceNode::runs()` called on a node that is not a leaf.
     //
-    // So the walk has to learn to descend before this test can say anything about
-    // the groups where the fault was actually seen.
+    // **It is not `walk`.**  This test's own walk, `FreeSpace::runs()` and
+    // `summaries()` all descend correctly -- `visit_node` checks `is_leaf()` and
+    // otherwise recurses through `children()`.  The claim that "the walker handles
+    // single-level trees only" was wrong, and the milestone it justified was based
+    // on that.  What is true is narrower: *somewhere in the allocate path a node's
+    // records are read as free runs before its level has been checked*, and the
+    // backtrace points into `allocate_in_group` rather than at any of the three
+    // functions above.
     #[test]
-    #[ignore = "free_space::walk does not descend past one level; see docs"]
+    #[ignore = "a node's records are read as runs before its level is checked"]
     fn taking_a_block_from_the_middle_of_a_run_leaves_both_trees_agreeing() {
         // A **real** image, not the synthetic one.  This started on
         // `image_with_group`, which writes a superblock with no magic and no
