@@ -1062,10 +1062,19 @@ fn a_file_that_outgrows_its_inode_becomes_a_btree() {
         (before, limit, first_byte)
     });
 
+    // Every write succeeding is now the *claim*, not a gap in the test.  Forty
+    // sparse writes are eighty extents, which is more than two leaves of a
+    // 512-byte block hold, so the file's fork has to have grown past the interior
+    // root in the inode and into an interior **block** -- and `xfs_repair` below is
+    // what says whether that tree is one XFS accepts.
+    //
+    // It used to assert the opposite, that a limit was reached, because a third
+    // leaf was not built and the refusal was the only honest answer available.  A
+    // test that requires the implementation to be *incomplete* is a test that
+    // fails when the work lands.
     assert!(
-        reached_leaf_limit,
-        "the test never reached a limit: {ATTEMPTS} writes all succeeded, so it proved nothing \
-         about either the conversion or the refusal"
+        !reached_leaf_limit,
+        "{ATTEMPTS} writes hit a limit, so this test no longer exercises what it was written for"
     );
     assert!(
         before < 1 << 20,

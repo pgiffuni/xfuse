@@ -351,6 +351,131 @@ pub struct BmbtLeafBlock {
     pub records: Vec<BmbtLeafRecord>,
 }
 
+/// A b-map interior node: keys and pointers instead of records.
+///
+/// The same block header a leaf has, and the same 16-byte stride, but what is in
+/// the body is different: **keys first, then pointers, with the padding between
+/// them that a node's own layout implies**.  A leaf holds records; this holds one
+/// eight-byte key per child and one eight-byte pointer per child, the key being
+/// the first file offset in that child.
+///
+/// It is written as a block in its own right rather than as a second kind of leaf,
+/// because that is what it is: a block allocated for the purpose, carrying the
+/// owning inode and the file system's UUID, with a checksum.
+#[derive(Debug, Clone)]
+pub struct BmbtInteriorBlock {
+    pub level: u16,
+    /// One per child, ascending; `keys[i]` is the first offset in child `i`.
+    pub keys:  Vec<BmbtKey>,
+    /// One per child, in the same order.
+    pub ptrs:  Vec<XfsBmbtPtr>,
+}
+
+impl BmbtInteriorBlock {
+    /// The most children one node can hold in a block of this shape.
+    pub const fn max_children(sb_blocksize: usize, has_crc: bool) -> usize {
+        // Half the body for keys and half for pointers, rounded to the node's own
+        // alignment -- the same reasoning as a leaf's occupancy, with two halves
+        // instead of one, which is why the answer is roughly half a leaf's records
+        // times two and is not simply `body / 16`.
+        let body = sb_blocksize.saturating_sub(if has_crc {
+            BMBT_CRC_HEADER_LEN
+        } else {
+            BMBT_HEADER_LEN
+        });
+        (body / 2) / BmbtKey::SIZE
+    }
+
+    /// This node as the bytes of a checksummed block.
+    #[allow(dead_code)] // Used as soon as a tree is deep enough to need one.
+    pub fn to_bytes(&self, hdr: &BtreeLblockHdr, sb_blocksize: usize) -> Vec<u8> {
+        let mut b = vec![0u8; sb_blocksize];
+        put_header(
+            &mut b,
+            XFS_BMAP_CRC_MAGIC,
+            self.level,
+            self.keys.len(),
+            hdr,
+            sb_blocksize,
+        );
+        let room = Self::max_children(sb_blocksize, true);
+        let mut at = BMBT_CRC_HEADER_LEN;
+        for k in &self.keys {
+            b[at..at + 8].copy_from_slice(&k.br_startoff.to_be_bytes());
+            at += BmbtKey::SIZE;
+        }
+        at = BMBT_CRC_HEADER_LEN + room * BmbtKey::SIZE;
+        for p in &self.ptrs {
+            b[at..at + 8].copy_from_slice(&p.to_be_bytes());
+            at += 8;
+        }
+        let crc = crc32c_without_its_own_field(&b, 64);
+        b[64..68].copy_from_slice(&crc.to_le_bytes());
+        b
+    }
+
+    /// This node as the bytes of a block on a file system without checksums.
+    #[allow(dead_code)] // Used as soon as a tree is deep enough to need one.
+    pub fn to_bytes_v4(
+        &self,
+        leftsib: XfsFsblock,
+        rightsib: XfsFsblock,
+        sb_blocksize: usize,
+    ) -> Vec<u8> {
+        let mut b = vec![0u8; sb_blocksize];
+        put_header(
+            &mut b,
+            XFS_BMAP_MAGIC,
+            self.level,
+            self.keys.len(),
+            &BtreeLblockHdr {
+                blkno: 0,
+                lsn: 0,
+                leftsib,
+                rightsib,
+                owner: 0,
+                uuid: [0; 16],
+            },
+            sb_blocksize,
+        );
+        let room = Self::max_children(sb_blocksize, false);
+        let mut at = BMBT_HEADER_LEN;
+        for k in &self.keys {
+            b[at..at + 8].copy_from_slice(&k.br_startoff.to_be_bytes());
+            at += BmbtKey::SIZE;
+        }
+        at = BMBT_HEADER_LEN + room * BmbtKey::SIZE;
+        for p in &self.ptrs {
+            b[at..at + 8].copy_from_slice(&p.to_be_bytes());
+            at += 8;
+        }
+        b
+    }
+}
+
+/// Write the header both node writers share.
+#[allow(clippy::too_many_arguments)]
+fn put_header(
+    b: &mut [u8],
+    magic: u32,
+    level: u16,
+    numrecs: usize,
+    hdr: &BtreeLblockHdr,
+    _sb_blocksize: usize,
+) {
+    b[0..4].copy_from_slice(&magic.to_be_bytes());
+    b[4..6].copy_from_slice(&level.to_be_bytes());
+    b[6..8].copy_from_slice(&(numrecs as u16).to_be_bytes());
+    b[8..16].copy_from_slice(&hdr.leftsib.to_be_bytes());
+    b[16..24].copy_from_slice(&hdr.rightsib.to_be_bytes());
+    if hdr.uuid != [0; 16] || hdr.owner != 0 {
+        b[24..32].copy_from_slice(&hdr.blkno.to_be_bytes());
+        b[32..40].copy_from_slice(&hdr.lsn.to_be_bytes());
+        b[40..56].copy_from_slice(&hdr.uuid);
+        b[56..64].copy_from_slice(&hdr.owner.to_be_bytes());
+    }
+}
+
 impl BmbtLeafBlock {
     /// Read a leaf block's bytes.
     ///
@@ -492,6 +617,45 @@ impl BmbtLeafBlock {
         sb_blocksize.saturating_sub(header) / BMBT_RECORD_LEN
     }
 
+    /// The fewest records a leaf may hold **when it has a parent**.
+    ///
+    /// Half the maximum.  A leaf under an interior node has to be at least half
+    /// full, so that splitting it in two leaves both leaves are still mostly full
+    /// -- a tree that could only hold nearly-empty leaves would deepen on every
+    /// insertion.
+    ///
+    /// This is a real rule and not a style: `xfs_repair` rejects a leaf outside it
+    /// by name -- "bad # of bmap records (7, min - 15, max - 30)" -- and then
+    /// calls the whole fork bad, which reads like a mapping fault and is not one.
+    pub const fn min_records(sb_blocksize: usize, has_crc: bool) -> usize {
+        Self::max_records(sb_blocksize, has_crc) / 2
+    }
+
+    /// How to divide `count` records among leaves of this shape.
+    ///
+    /// Not `chunks(max)`, which fills every leaf and leaves a remainder: the
+    /// remainder becomes the last leaf, and a last leaf holding less than
+    /// [`min_records`] is exactly what `xfs_repair` complains about.  So the
+    /// number of leaves is fixed first and the records spread evenly over them,
+    /// which keeps every leaf inside the range the format's occupancy rule
+    /// describes.
+    ///
+    /// Returns the number of leaves, or `None` when the records cannot be divided
+    /// legally.
+    pub fn leaves_for(count: usize, sb_blocksize: usize, has_crc: bool) -> Option<usize> {
+        if count == 0 {
+            return None;
+        }
+        let room = Self::max_records(sb_blocksize, has_crc);
+        let leaves = count.div_ceil(room);
+        let per = count.div_ceil(leaves);
+        if per > room || per < Self::min_records(sb_blocksize, has_crc) {
+            return None;
+        }
+        Some(leaves)
+    }
+
+    /// This leaf as the bytes of a block of a file system **without** checksums holds.
     /// This leaf as the bytes a block of a file system **without** checksums holds.
     ///
     /// A version 4 file system has no checksum, no UUID and no log, so its b-tree
