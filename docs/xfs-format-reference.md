@@ -266,8 +266,8 @@ that fails is in the tree roots.
 | 2 | 25464 at 16384-32768, otherwise fragmented |
 | 3 | **7953 at block 1**, 15921 at 8192-16383 -- two large runs dominate |
 
-**HYPOTHESIS.** The failing group is the one whose free space is **few and very
-large**, and the mechanism is the descent in the tree keyed by **length**. That
+**HYPOTHESIS — since refuted; kept for the reasoning.**  The failing group is the one
+whose free space is **few and very large**, and the mechanism is the descent in the tree keyed by **length**. That
 tree cannot be descended by key, because its keys do not say which child holds which
 run, so the code *searches*: it reads children and compares their records to find
 the one holding the wanted run. If such a search reads a child that is itself an

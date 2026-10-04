@@ -6175,7 +6175,31 @@ mod t {
     /// without the inode giving it up is what repair calls *found inodes not in
     /// the inode allocation tree*.  The only free a real image takes honestly is
     /// one of the blocks just taken, which is not enough to fill a leaf.
-    #[ignore = "reserving every freed block means the trees never overflow, so no split occurs"]
+    // **The ignore reason is wrong, and so is the fixture.**
+    //
+    // It said the trees never overflow, so no split occurs.  Splits do occur --
+    // `growing_every_groups_free_space_trees_past_one_leaf_works` forces 200 per
+    // group by allocating from the middle of a run -- so that reason described a
+    // problem that no longer exists, and it hid the real one.
+    //
+    // The real one: this test frees 80 blocks chosen as "not free", starting at
+    // block 16.  **Not free is not the same as freeable.**  An inode chunk's blocks
+    // are allocated, so they are chosen, and freeing one destroys the inode
+    // allocation tree.  `xfs_repair -n` says exactly that:
+    //
+    //     inode chunk claims used block, inobt block - agno 0, bno 16, inopb 2
+    //     inode chunk claims used block, inobt block - agno 0, bno 1212, inopb 2
+    //     root inode chunk not found
+    //     found inodes not in the inode allocation tree
+    //
+    // and it is not complaining about the free space at all.  So the test is not
+    // currently measuring the split; it is destroying the inode tree and calling
+    // the result a free-space failure.
+    //
+    // To be useful it must exclude the group's inode chunks -- which means asking
+    // the inode b-tree which blocks they cover, since "allocated" and "owned by
+    // metadata" are different questions and only the inobt answers the second.
+    #[ignore = "the fixture frees inode chunks; it must consult the inobt first"]
     #[test]
     fn a_split_leaves_the_block_count_right() {
         let Some(golden) = crate::libxfuse::alloc::golden("xfsv4.img") else {
