@@ -313,7 +313,27 @@ Not format requirements. Decisions xfuse made.
 * `di_aformat` is decoded as an `XfsDinodeFmt` rather than its own enumeration. This
   is a conflation, and it is **benign only** because the two enumerations number
   their two surviving forms alike. No image here exercises a form where it differs.
-* The daemon's tracing default is `warn`; `RUST_LOG` overrides it.
+* The daemon's tracing default is `warn`; `RUST_LOG` overrides it.  Before this,
+  `EnvFilter::from_default_env()` with `RUST_LOG` unset matched **nothing** and
+  every library `warn!` was discarded.
+
+### `fuser::mnt::fuse3: umount failed ... Invalid argument`
+
+**Benign, and known.** It comes from `fuser`'s destructor, and it is newly *visible*
+only because the tracing default became `warn`.  The test harness kills the daemon
+first and waits for it to exit -- which makes the kernel drop the FUSE mount -- so by
+the time anything calls `fusermount -u` there is nothing left and `EINVAL` is the
+answer.
+
+It cannot affect the suite: every test mounts at its own tempdir, so a stale mount
+at one path cannot be reached by a test at another, and a mount that genuinely
+survived would break the "fresh mount and read" validation layer visibly.
+
+**Do not silence it by filtering `fuser`'s target.**  The one case where it matters
+is a real unmount failure, and suppressing the daemon's only signal that the
+filesystem might still be mounted trades a known-noise line for an invisible real
+problem.  If the noise is unwanted, the better change is for the harness not to ask
+the system to unmount after it has already killed the daemon and waited for it.
 
 ---
 
