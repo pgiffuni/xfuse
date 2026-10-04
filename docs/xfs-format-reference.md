@@ -518,6 +518,11 @@ the system to unmount after it has already killed the daemon and waited for it.
 * The free-space disagreement above — **HYPOTHESIS**, unresolved.
 * Block-form attribute forks — **HYPOTHESIS**. No image here has one that has been
   shown to break.
-* Free-space tree root growth and collapse — **not implemented and not reachable**
-  on any image in this repository. Do not implement them by extrapolation; obtain a
-  native filesystem that reaches the transition first.
+* Free-space tree **root growth** — **implemented, reachable, and buggy.** The
+  earlier claim that it was unreachable is **withdrawn**: group 0 of `xfsv4.img` has
+  a single-leaf free-space tree, and `an_overflowing_leaf_takes_a_node_off_the_free_list`
+  grows it a level at round 14. The "manufacture a filesystem that reaches the
+  transition first" work is unnecessary — the transition was being reached all
+  along, by a test, and reported as an unrelated symptom.
+* Free-space tree **root collapse** — not implemented, and nothing reaches it:
+  collapse needs a tree to shrink, and no operation available here grows it smaller.

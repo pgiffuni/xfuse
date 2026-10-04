@@ -1197,15 +1197,23 @@ directory cannot be read from a unit test here at all, which is what shapes what
 
 ### C. Free-space tree root transitions
 
-Root growth and root collapse, and both are **unreachable on the images in this
-repository**.  So there is nothing to test them against, and implementing them by
-extrapolation is the thing this document has been refusing to do since it started --
-the AGFL experiments are the precedent: manufacture the smallest native filesystem
-that naturally reaches the transition, measure it, and only then write it.
+**Root growth is reachable after all, so half of this item is not "C" and is where
+item 1's remaining symptom lives.**  The claim below that it is unreachable is
+**withdrawn**: group 0 of `xfsv4.img` has a single-leaf free-space tree, and
+`an_overflowing_leaf_takes_a_node_off_the_free_list` grows it a level at round 14.
+The transition was being exercised all along and reported as "multiply claimed by
+bno space tree".  Four faults have been found and fixed in this area; the symptom is
+in the root-growth branch and is still open.
 
-The constraint is not skill, it is evidence.  It is the same category as
-[the skipped oracle checks](#a-skipped-check-is-not-a-passing-check): a change with
-no way to be wrong is not a test, and this suite is built so that every claim has a
+**Root collapse** -- a tree that loses a level when its root is left with one child
+-- remains unimplemented, and nothing here reaches it: collapse needs a tree to
+*shrink*, and no operation available grows it smaller.  That is the honest reason to
+leave it, and it is different from the reason that was given.
+
+So the original reasoning -- manufacture a filesystem that reaches the transition,
+measure it, then write it -- was right in method and **wrong in its premise**, which
+is worse than not having tried: it would have had us building a fixture for a
+transition we were already reaching.
 way to be wrong.
 
 ## Next work
