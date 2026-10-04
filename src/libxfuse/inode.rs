@@ -708,9 +708,11 @@ impl RawDinode {
             // `ENOSPC`: this is not the group running out, and a file that has
             // nine extents and wants a tenth has a problem no amount of free
             // space solves.  The format's answer is a b-tree rooted in the inode,
-            // which needs a reader as well as a writer -- there is no b-map block
-            // decoder in this code yet -- so the honest answer is to refuse and say
-            // so.
+            // whose reader exists and is verified -- `btree.rs`, both header forms,
+            // checked against `xfs_db`'s own reading of the same leaf -- so what is
+            // missing is the *writer*: a leaf, an interior root, and the inode
+            // fields that move with them.  Until those exist the honest answer is
+            // to refuse and say so.
             return Err(FsError::unsupported(format!(
                 "a {} byte inode holds {room} extent records and this file needs {}: its data \
                  fork has to become a b-tree, which is not implemented",

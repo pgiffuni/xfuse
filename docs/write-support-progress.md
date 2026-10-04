@@ -153,16 +153,19 @@ kernel usually does not send `open`/`opendir` at all.
 
 | Area | Status | What is missing |
 |:-----|:-------|:----------------|
-| Free-space tree structural growth | in progress | Leaf split and root split exist and are tested in memory.  They are not reachable from the image, because reaching them needs a leaf to overflow, and no test can overflow a leaf honestly without a file giving up its blocks — which is the truncate that is not built. |
-| Free-space tree shrinkage | in progress | Leaf merging works and is checked on a real image with `xfs_repair`.  Root collapse does not exist, and is not reachable: nothing empties an interior node, because a parent always has at least two children and the merge branch refuses to take the last one. |
+| Free-space tree **leaf** growth | done | Reachable and checked on a real image: `a_split_takes_a_node_from_the_free_list` fills the free list and keeps going until the trees overflow.  **This row said it was not reachable, and that was wrong** — it named the truncate as the thing missing, and the truncate is built and tested (`a_file_made_shorter_gives_its_blocks_back`).  A split needs a run to split, and giving blocks back is what produces one. |
+| Free-space tree **root** growth | in progress | A root split needs the root *leaf* to overflow, and no image here has a free-space tree whose root is close enough.  The code path is tested in memory; what is missing is an image to reach it on. |
+| Free-space tree shrinkage | in progress | Leaf merging works and is checked on a real image with `xfs_repair`.  Root collapse does not exist, and is genuinely unreachable: nothing empties an interior node, because a parent always has at least two children and the merge branch refuses to take the last one. |
+| A data fork that becomes a B+tree | not started | A reader exists and is verified — `BmbtLeafBlock`, both header forms, and an `XfsFsblock` extent lookup through it.  **What is missing is a writer**, and that is new: the reader was cited here as a reason this could not be built, and that reason has gone.  See [A 256-byte inode holds nine extents, and the tenth is refused](#a-256-byte-inode-holds-nine-extents-and-the-tenth-is-refused). |
 
 ### Blocked
 
-**Free space tree growth, because nothing can reach it yet.**  A split needs a
-metadata block; metadata blocks now come and go with the accounting XFS expects,
-on both paths and in both directions.  What is left is a way to make a leaf
-overflow on a real image, which needs a file to give up its blocks — the
-truncate that is not built.
+**Free space tree *root* growth, because nothing can reach it yet.**  A split
+needs a metadata block; metadata blocks come and go with the accounting XFS
+expects, on both paths and in both directions, and a **leaf** split is reached and
+checked on a real image.  What is left is the root case, which needs the root leaf
+itself to overflow, and that is a question about the images rather than about the
+code.
 
 What is left in order:
 
@@ -291,10 +294,38 @@ file whose attributes live in a block, and the fork decodes as empty.  `get_attr
 then sees `anextents == 0` and returns none, so **`links`'s attributes are
 silently never read at all**.
 
-That is very likely the same defect the FreeBSD panic sees from the other side: an
-attribute fork that is not there, decoded as something, and then read.  What is
-*confirmed* here is the silent loss; what is *inferred* is that the FreeBSD panic
-shares its cause, and the inference is labelled as one.
+~~That is very likely the same defect the FreeBSD panic sees from the other side.~~
+
+**The second half of that is refuted; the first half is not confirmed.**  The
+inference that the FreeBSD failures shared this cause is withdrawn: they came from
+the b-map **extent** leaf, and
+[86 failures were the extent fork](#the-integration-failures-were-the-extent-fork-not-the-attribute-fork).
+83 of the 86 were b-tree files.
+
+The type conflation itself is still there and is still wrong: `di_aformat` is
+`__s8 /* format of attr fork's data */` and is decoded as an `XfsDinodeFmt`, so the
+two enums' *numbers* are being treated as their *meanings*.  But **no image here
+exercises a form where it changes anything**, and that is the finding: every
+attribute fork in the suite — local, extents and B+tree, across all five images —
+decodes correctly, so the numbers that occur happen to land on the right arm.  A
+block-form attribute fork is the case that would break it, and this repository has
+no image with one that has been shown to break.
+
+So it is an **open question with a decisive test**, not a defect:
+
+* **What is not established:** whether `links` in `xfsv4.img` has its attributes
+  silently dropped.  The claim rested on `xfs_db`, and `xfs_db` could not be made
+  to read that inode's fields reproducibly here — it returns the right inode for
+  `100553` and the wrong bytes for `128` on the same image — so the one measurement
+  behind it is not currently reproducible.
+* **What would decide it:** read `links` through a mounted `xfs_fuse` and ask for
+  one of its attributes by name.  A name that exists and returns `ENODATA` is the
+  defect; a name that returns its value is not.  `lsextattr::ok`'s template is the
+  place to add it, because it already asks exactly that question of every other
+  attribute fork in every image.
+* **What the fix would be, if it is one:** decode `di_aformat` as its own enum, and
+  read the record count from the field that counts *this* form's records rather
+  than from `di_anextents`, which counts shortform entries.
 
 Two things came out of chasing it that are worth more than the fix would have been
 on its own:
@@ -950,6 +981,9 @@ Concretely, in order:
    The extent boundary in front of the first is pinned rather than crossed: a file
    needing a tenth extent is refused with `ENOSYS`, and the layout of a fresh
    chunk's slots is repair-validated but not confirmed against a chunk XFS made.
+   **The reader that refusal used to be waiting for now exists**, so the remaining
+   work is the writer: a leaf, an interior root, and the `di_format`, `di_nblocks`
+   and `di_forkoff` that move with them.
    Both are rows in the
    [audit](#how-strong-each-measurement-is-and-how-to-read-one).
 
