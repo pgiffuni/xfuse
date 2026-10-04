@@ -695,6 +695,65 @@ With the diagnostics visible, the question this section was opened for is settle
 and the answer is the honest one: **the boundary is deliberate, at two leaves, and
 the code says so.**
 
+### The free-space trees disagree with each other, and with their own summary
+
+What now stops a file growing is **not** the b-tree.  Growth reaches roughly 250
+extents and then stops, and the diagnostics say why:
+
+```text
+inode 100551: a write past its end was refused: no free run in this node starts at
+block 17700 (errno 2)
+```
+
+A group that was nearly empty refused a single block.  The group's own header says
+otherwise:
+
+| Field | Value |
+|:------|:------|
+| `agf_length` | 32768 blocks |
+| `agf_freeblks` | **30144** |
+| `agf_longest` | 29528 |
+| `agf_bno_root` | level 4, 5 records |
+| `agf_cnt_root` | level 0, **1 record** |
+
+Thirty thousand free blocks and no run to be found.  `xfs_repair` agrees with the
+header's *complaint* and not with its numbers:
+
+```text
+free space (1,17694-17694) only seen by one free space btree
+free space (1,17700-17700) only seen by one free space btree
+```
+
+A free run is supposed to appear in **both** trees — the bno tree keyed by where it
+starts, the cnt tree keyed by how long it is — and these two single blocks appear in
+only one.  They are six apart, which is what the two halves of a run look like after
+a block has been taken out of the middle of it, and 17700 is the very block the
+allocator was looking for.
+
+So the shape of the fault is: **when a run is split, the two halves do not both
+reach both trees.**  That is the same family as everything else in this section --
+a structure written on one path and not the other -- and it is in
+`alloc/free_space.rs`, which has its own writer rather than reusing the b-tree
+node writers.
+
+Two things make it worth naming precisely rather than "the allocator is broken":
+
+* **The counters are not the trees.**  `agf_freeblks` and `agf_longest` are updated
+  from the allocation's own arithmetic, so they can be right while the trees they
+  summarise are not -- which is exactly what a summary is, and exactly why it is the
+  wrong place to stop looking.  The plan's own invariant says
+  `sb_fdblocks == sum(freeblks + btreeblks + flcount)`, and that identity is
+  satisfied here while the structures underneath it are not.
+* **A `cnt_root` of level 0 with one record, beside a `bno_root` of level 4, is
+  itself odd** for a group holding runs of at least two different lengths.  It is
+  the kind of thing to ask about *after* the split, not instead of it.
+
+The honest next step is a measurement in the same shape as the others here: take a
+run, take a block from the middle of it, and read **both** trees back -- the entries
+before, the entries after, and what `xfs_db` says each tree holds.  The
+perturbation is the allocation; the two reads are the observation; and the question
+is which of the two trees is missing a piece of a split run.
+
 ### A write test proves xfuse can read its own output; `xfs_repair` proves more
 
 This is the lesson the last three milestones rest on, and it is worth stating
