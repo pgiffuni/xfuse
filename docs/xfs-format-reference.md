@@ -291,10 +291,43 @@ lands on the superblock. Both were wrong for most of an hour.
 | 2 | 4 | 5 | 1 | 1 | 25536 | 25464 |
 | **3** | **609** | **615** | **3** | **3** | 23868 | 15921 |
 
-**So group 3 is the deepest, at level 3, and group 1 is already level 2** -- which
-does not explain why group 1 works and group 3 does not, and so the hypothesis
-above about the *length*-ordered tree's search is not established. Groups 0 and 2
-have level-1 trees, group 1 level 2, group 3 level 3, and three of the four work.
+**MEASURED -- and this is the distinction.**  Dumping each group's bno root shows
+the *root's own* level, which is one less than the AGF's `bnolevel`:
+
+```text
+xfs_db -r -c "sb 0" -c "daddr <agno * agblocks + root>" -c "print"
+```
+
+| Group | root magic | root `bb_level` | root numrecs |
+|:------|:-----------|:----------------|:-------------|
+| 0, 2 | `0x41425442` (`XFS_ABTB_MAGIC`) | **0 -- the root is a leaf** | -- |
+| 1 | `0x41425442` | 1 | 29 |
+| **3** | `0x41425442` | **2** | 4 |
+
+So the trees are: groups 0 and 2 a single leaf; group 1 an interior root over
+leaves, one step down; **group 3 an interior root over interior nodes, two steps
+down**. Group 3 is the only group whose root's *children are not leaves*.
+
+This **does** support the hypothesis that was withdrawn -- the level-2 root is
+exactly what makes a difference, and it was withdrawn for a bad reason.  The
+withdrawal compared the AGF's `bnolevel` across groups and concluded "group 1 is
+level 2 and works, so depth does not track the failure".  But `bnolevel` counts the
+root; the quantity that matters is the root's own `bb_level`, which is `bnolevel - 1`.
+Group 1's root is level 1 and group 3's is level 2, so group 1 never descends
+through an interior node and group 3 does.
+
+**A suspect that fits, and one caveat.**  In `take_in_tree`, the descent in the tree
+keyed by **length** cannot use keys, so it searches: for each child it reads the
+node and asks for its `runs()`.  A child that is an interior node answers
+`runs()` with "this node holds subtrees, not free runs".  That is the observed
+error's text and the observed error's group.
+
+The caveat is that this site **swallows** that error --
+`.and_then(|n| n.runs())...unwrap_or(false)` -- so it would produce "no leaf of the
+tree holds the run ...", not the message actually seen.  So this is a real defect
+at a real site, and it is *a* suspect for the observed failure, but it is not
+established as **the** site.  Something on the propagating path reads a non-leaf's
+records without swallowing, and finding it is the next measurement.
 
 **The striking part is the root block numbers.** Group 3's bno root is block **609**
 and its first free run is blocks **1-7953** (`freesp -a 3`), so the tree's root
