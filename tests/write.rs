@@ -1040,6 +1040,103 @@ fn read_only_mount_refuses_writes() {
     assert_eq!(before, std::fs::read(&image).expect("reading the image"));
 }
 
+/// A file whose extents are in a B+tree can be made shorter, and the tree goes
+/// away in the process.
+///
+/// This is the case that was refused for as long as the extent record's data-block
+/// field was unknown, and it is refused for a second, quite different reason now:
+/// `drop_extents_above` could only shorten a file whose extents are in its inode.
+/// So this is not one read path but two facts meeting -- the tree can be read, and
+/// what it holds can be written back into the inode.
+///
+/// The direction is deliberate.  The survivors go **back into the inode** and the
+/// fork's format returns to `extents`, which is what XFS itself does when a file's
+/// extent list fits, and it leaves no node charged for that names nothing.  The
+/// alternative -- rewriting the tree -- needs a writer that does not exist yet.
+///
+/// The cut is strictly inside a run, for the reason the extents-format test gives:
+/// landing the new end exactly on an extent boundary hides the straddling extent,
+/// which is the one the arithmetic is about.
+#[test]
+fn a_btree_fork_given_back_to_the_inode_when_it_is_shortened() {
+    require_fusefs!();
+    let image = writable_copy(&GOLDENV4, "btree-truncate");
+    const CANDIDATES: [&str; 4] = [
+        "files/btree2.2.txt",
+        "files/btree2.4.txt",
+        "files/btree3.txt",
+        "files/btree2.txt",
+    ];
+
+    // Find a file whose data fork really is a B+tree, and say so if none can be
+    // found: a test that shortened an `extents` file and called it a b-tree test
+    // would pass without exercising any of this.
+    let mut chosen = None;
+    for name in CANDIDATES {
+        let Some(fmt) = xfs_db_field(
+            &image,
+            &["inode 128", &format!("path {name}")],
+            "core.format",
+        ) else {
+            eprintln!("skipping: no xfs_db to read {name}'s data fork format with");
+            return;
+        };
+        if fmt.contains("btree") {
+            chosen = Some(name);
+            break;
+        }
+    }
+    let Some(name) = chosen else {
+        eprintln!("skipping: no file in {GOLDENV4:?} has a B+tree data fork");
+        return;
+    };
+
+    let before = with_rw_mount_at(&image, "btree-probe", |mnt| {
+        let meta = std::fs::metadata(mnt.join(name)).expect("the chosen file is there");
+        assert!(
+            meta.len() > 8192,
+            "{name} is too small to cut strictly inside a run"
+        );
+        // The first bytes, so the kept part can be checked afterwards: a
+        // conversion that loses or reorders extents would show up here even if
+        // the size is right.
+        let head = std::fs::read(mnt.join(name)).expect("reading the file before");
+        (meta.len(), head)
+    });
+    let (size, head) = before;
+
+    with_rw_mount_at(&image, "btree-truncate", |mnt| {
+        let file = mnt.join(name);
+        open_rw(&file)
+            .set_len(size - 1500)
+            .expect("shortening a file whose extents are in a B+tree");
+        assert_eq!(std::fs::metadata(&file).unwrap().len(), size - 1500);
+
+        // What the file still owns must read back unchanged.
+        let after = std::fs::read(&file).expect("reading the file after");
+        assert_eq!(
+            &after[..head.len() / 2],
+            &head[..head.len() / 2],
+            "{name}: the part that was kept did not survive the conversion"
+        );
+    });
+
+    // And the image is still a file system XFS accepts.
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("{name}: {e}"));
+
+    // The fork is an `extents` fork now, and holds only the file's own blocks.
+    let fmt = xfs_db_field(
+        &image,
+        &["inode 128", &format!("path {name}")],
+        "core.format",
+    )
+    .expect("xfs_db");
+    assert!(
+        !fmt.contains("btree"),
+        "{name}: the data fork is still a B+tree after the conversion: {fmt}"
+    );
+}
+
 /// Writing must not damage the file system, as far as XFS's own tools can tell.
 #[test]
 fn xfs_repair_is_happy() {

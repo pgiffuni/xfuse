@@ -578,11 +578,14 @@ impl Volume {
                 .get_mut(&ino)
                 .ok_or_else(|| no_entry(b"an inode the kernel has not looked up"))?;
             let dinode = &oi.dinode;
-            if !matches!(dinode.di_core.di_format, XfsDinodeFmt::Extents) {
+            if !matches!(
+                dinode.di_core.di_format,
+                XfsDinodeFmt::Extents | XfsDinodeFmt::Btree
+            ) {
                 return Err(FsError::invalid(
                     libc::ENOTSUP,
                     format!(
-                        "truncating a file whose extents are in a B+tree (data fork format {:?})",
+                        "truncating a file whose data fork is in format {:?}",
                         dinode.di_core.di_format
                     ),
                 ));
@@ -611,6 +614,29 @@ impl Volume {
             }
             return Ok(0);
         }
+        // A file whose extents are in a B+tree is read out of the tree here,
+        // **before** the transaction starts, because the walk needs a reader and
+        // the transaction holds the only mutable one.  Nothing it reads can change
+        // underneath it: it is all image content, and this transaction does not
+        // write any of it until the walk is finished.
+        let tree: Option<(Vec<crate::libxfuse::bmbt_rec::BmbtRec>, Vec<u64>)> = {
+            let mut peek = vec![0u8; inode_size];
+            self.device
+                .device()
+                .read_at(&mut peek, inode_offset)
+                .map_err(|e| FsError::Corrupt {
+                    what: format!("reading inode {xfs_ino} to look at its data fork: {e}"),
+                })?;
+            let probe = RawDinode::from_bytes(peek)?;
+            if probe.format() == 2 {
+                None
+            } else {
+                let root = probe.data_btree_root()?;
+                let (bmx, nodes) = root.all_extents(self.device.by_ref())?;
+                Some((bmx.extents().to_vec(), nodes))
+            }
+        };
+
         let now = std::time::SystemTime::now();
         let mut tx = self.begin();
         let mut raw = RawDinode::from_bytes(tx.read_bytes(inode_offset, sb.inode_size())?)?;
@@ -627,7 +653,30 @@ impl Volume {
         // image blocks and the allocator names blocks within a group, and a
         // group-relative number used as an absolute one points at the right block
         // in the *wrong group*.
-        let freed = raw.drop_extents_above(last_block)?;
+        //
+        // A file whose extents are in the inode is the easy case and the one that
+        // has always worked.  A file whose extents are in a B+tree is read out of
+        // the tree, cut the same way, and written **back into the inode**, which
+        // turns its fork back into an `extents` one.
+        //
+        // That direction is chosen deliberately rather than because it is easier.
+        // The alternative -- rewriting the tree with fewer leaves -- needs a
+        // writer this code does not have, and a tree left with the extents it no
+        // longer needs would keep a node charged for that names nothing.  Shrinking
+        // back to the inode is a transition XFS itself makes when the list fits,
+        // and it leaves nothing behind that a later reader cannot follow.
+        //
+        // If the survivors do **not* fit the fork, `set_core_extents` refuses, and
+        // that refusal is the honest answer: the file keeps its tree and its blocks
+        // rather than losing either to a list that cannot hold it.
+        let (nodes, freed): (Vec<u64>, Vec<(u64, u32)>) = match tree {
+            None => (Vec::new(), raw.drop_extents_above(last_block)?),
+            Some((extents, nodes)) => {
+                let (kept, freed) = RawDinode::split_extents_above(&extents, last_block);
+                raw.set_data_extents_from_tree(&kept)?;
+                (nodes, freed)
+            }
+        };
         let mask = u64::from(1u32 << sb.sb_agblklog) - 1;
         let freed: Vec<(u32, FreeRun)> = freed
             .into_iter()
@@ -644,6 +693,20 @@ impl Volume {
 
         for (ag, run) in freed {
             free_in_group(&mut tx, &sb, ag, run)?;
+        }
+        // The tree's own blocks, one at a time, because a node is a single block
+        // and `free_in_group` is given a run.
+        //
+        // `agf_btreeblks` does not move: it counts the blocks held in a group's
+        // *free space* trees (`xfs_format.h`: "of blocks held in AGF btrees"), and
+        // this is a file's b-map b-tree.  What moves is the file's own count,
+        // below, which counts a node like any other block the file uses -- and that
+        // is why giving these back and lowering `di_nblocks` are the same operation
+        // and have to happen in the same transaction.
+        for fsb in nodes {
+            let ag = (fsb >> sb.sb_agblklog) as u32;
+            let start = (fsb & mask) as u32;
+            free_in_group(&mut tx, &sb, ag, FreeRun { start, len: 1 })?;
         }
         let blocks: u64 = raw
             .core_extents()

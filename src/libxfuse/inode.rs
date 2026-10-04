@@ -77,11 +77,16 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bincode_next::{
+    de::{read::Reader, Decoder},
+    Decode,
+};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use crc::{Crc, CRC_32_ISCSI};
 
 use super::{
     bmbt_rec::BmbtRec,
+    btree::{BmbtKey, BmdrBlock, BtreeRoot},
     definitions::{XfsFsize, XfsIno, XFS_DINODE_MAGIC},
     error::{FsError, FsResult},
 };
@@ -858,26 +863,45 @@ impl RawDinode {
                 "a file whose extents are not in its inode",
             ));
         };
+        let (kept, freed) = RawDinode::split_extents_above(&extents, last_block);
+        if freed.is_empty() {
+            return Ok(freed);
+        }
+        self.set_core_extents(&kept)?;
+        Ok(freed)
+    }
+
+    /// Which of a file's extents survive a cut at `last_block`, and which blocks
+    /// that frees.
+    ///
+    /// The two halves of a shortening, and nothing else, so that a caller holding
+    /// the extents can do it whether they came from the inode or from a tree.  An
+    /// extent wholly below the cut is kept; one wholly above goes; one that
+    /// straddles it is **trimmed**, and keeps the block it started at, because the
+    /// file's data does not move.
+    ///
+    /// Both numbers come from the same `last_block`, and getting them from
+    /// different ones is a bug worth naming: taking "where the file keeps to" as
+    /// `min(start, last_block)` makes it the extent's *start* for a straddling
+    /// extent, so nothing is trimmed off the front and the whole extent is given
+    /// back -- including the block the file still reads from.  The file then goes
+    /// on naming a block that something else has been given, and an extent longer
+    /// than the file is legal, so `xfs_repair` does not object either.
+    pub fn split_extents_above(
+        extents: &[BmbtRec],
+        last_block: u64,
+    ) -> (Vec<BmbtRec>, Vec<(u64, u32)>) {
         let mut kept: Vec<BmbtRec> = Vec::new();
         let mut freed: Vec<(u64, u32)> = Vec::new();
         for e in extents {
             let end = e.br_startoff + e.br_blockcount;
             if end <= last_block {
-                kept.push(e);
+                kept.push(*e);
                 continue;
             }
-            // How much of this extent is still the file's, and how much is not.
-            //
-            // Both come from the same number, and getting them from different ones
-            // is a bug worth naming: taking "where the file keeps to" as
-            // `min(start, last_block)` makes it the extent's *start* for a
-            // straddling extent, so nothing is trimmed off the front and the whole
-            // extent is given back -- including the block the file still reads
-            // from.  The file then goes on naming a block that something else has
-            // been given.
             let kept_blocks = last_block.saturating_sub(e.br_startoff);
             if kept_blocks > 0 {
-                let mut trimmed = e;
+                let mut trimmed = *e;
                 trimmed.br_blockcount = kept_blocks;
                 kept.push(trimmed);
             }
@@ -886,11 +910,94 @@ impl RawDinode {
                 freed.push((e.br_startblock + kept_blocks, len as u32));
             }
         }
-        if freed.is_empty() {
-            return Ok(freed);
+        (kept, freed)
+    }
+
+    /// The root of a data fork that is a B+tree, decoded from the inode.
+    ///
+    /// The mirror of what `Dinode` does when it reads the same fork, and in the
+    /// same place in the fork for the same reason: this is the only code that
+    /// should know how a root is laid out among the keys, the gap and the
+    /// pointers.
+    pub fn data_btree_root(&self) -> FsResult<BtreeRoot> {
+        if self.format() != 3 {
+            return Err(FsError::unsupported(format!(
+                "a data fork in format {} is not a B+tree",
+                self.format()
+            )));
         }
-        self.set_core_extents(&kept)?;
-        Ok(freed)
+        let start = self.literal_area_offset();
+        let config = bincode_next::config::standard()
+            .with_big_endian()
+            .with_fixed_int_encoding();
+        let reader = bincode_next::de::read::SliceReader::new(&self.bytes[start..]);
+        let mut decoder = bincode_next::de::DecoderImpl::new(reader, config, ());
+        let bmdr = BmdrBlock::decode(&mut decoder).map_err(|e| {
+            FsError::corrupt(format!("a data fork's B+tree root is not one: {e:?}"))
+        })?;
+        let mut keys = Vec::new();
+        for _ in 0..bmdr.bb_numrecs {
+            keys.push(
+                BmbtKey::decode(&mut decoder)
+                    .map_err(|e| FsError::corrupt(format!("a data fork root key: {e:?}")))?,
+            );
+        }
+        // The keys and the pointers are not adjacent: the space is halved between
+        // them and the remainder is padding.  `dfork_btree_ptr_gap` is the same
+        // arithmetic `Dinode` uses, and it is copied rather than shared because it
+        // needs fields a raw inode does not keep.
+        let gap = self.dfork_ptr_gap(bmdr.bb_numrecs);
+        decoder.reader().consume(gap);
+        let mut ptrs = Vec::new();
+        for _ in 0..bmdr.bb_numrecs {
+            ptrs.push(
+                u64::decode(&mut decoder)
+                    .map_err(|e| FsError::corrupt(format!("a data fork root pointer: {e:?}")))?,
+            );
+        }
+        Ok(BtreeRoot::new(bmdr, keys, ptrs))
+    }
+
+    /// The padding between a data fork root's keys and its pointers.
+    ///
+    /// Half the fork's space each, rounded up to eight for the keys' half, less
+    /// the root and the keys themselves, rounded down to eight.
+    fn dfork_ptr_gap(&self, numrecs: u16) -> usize {
+        let start = self.literal_area_offset();
+        let space = match self.forkoff() {
+            0 => (self.bytes.len() - start) / 2,
+            n => {
+                let half = n as usize * 8 / 2;
+                half + (8 - half % 8) % 8
+            }
+        };
+        let used = BmdrBlock::SIZE + numrecs as usize * BmbtKey::SIZE;
+        space.saturating_sub(used) - (space.saturating_sub(used)) % 8
+    }
+
+    /// Put a data fork's extents back in the inode, turning a B+tree fork into
+    /// an `extents` one.
+    ///
+    /// This is a real transition and not a shortcut: XFS shrinks a file's b-map
+    /// b-tree back to an in-inode extent list when the list fits, and it is the
+    /// only direction available here.  A tree with more extents than the fork
+    /// holds cannot be written back this way and is refused by
+    /// `set_core_extents`, which is the honest answer rather than a truncated list.
+    ///
+    /// The space between the last record and the attribute fork is zeroed, because
+    /// it held the root, its keys, its gap and its pointers and they are now
+    /// meaningless.  A reader that decoded them would find a `bmdr_block` in what
+    /// it expects to be unused fork.
+    pub fn set_data_extents_from_tree(&mut self, kept: &[BmbtRec]) -> FsResult<()> {
+        self.set_format(2);
+        self.set_core_extents(kept)?;
+        let start = self.literal_area_offset();
+        let limit = self.attribute_fork_offset().unwrap_or(self.bytes.len());
+        let end = start + kept.len() * EXTENT_REC_SIZE;
+        for b in &mut self.bytes[end..limit] {
+            *b = 0;
+        }
+        Ok(())
     }
 
     /// Where the attribute fork begins, in bytes, if there is one.

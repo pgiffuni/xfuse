@@ -436,7 +436,12 @@ pub trait Btree: BtreePriv {
 }
 
 impl BtreeRoot {
-    /// Every extent in the tree, in file-offset order.
+    /// Every extent in the tree, and every block the tree occupies.
+    ///
+    /// The two go together because they are what an operation that *removes* a
+    /// tree needs: the extents to decide what the file still owns, and the node
+    /// blocks to give back, because a node that is still charged for is a block
+    /// nobody can allocate.
     ///
     /// `map_block` answers "which extent holds *this* block", which is the question
     /// a read asks and the only one this code has asked of a b-tree.  An operation
@@ -466,12 +471,15 @@ impl BtreeRoot {
     /// happened to be readable would be a short list, and a short list is a file
     /// that is quietly shorter than it is.
     #[allow(dead_code)] // Used as soon as a b-tree data fork can be truncated.
-    pub fn all_extents<R>(&self, buf_reader: &mut R) -> Result<Bmx, i32>
+    pub fn all_extents<R>(&self, buf_reader: &mut R) -> Result<(Bmx, Vec<XfsFsblock>), i32>
     where
         R: bincode_next::de::read::Reader + BufRead + Seek,
     {
         let sb = super::volume::try_superblock().ok_or(libc::ENODEV)?;
         let mut out: Vec<BmbtRec> = Vec::new();
+        // Every node below the root.  The root itself is in the inode and so is
+        // not here: it costs the file nothing beyond its own inode bytes.
+        let mut nodes: Vec<XfsFsblock> = Vec::new();
         let mut stack: Vec<(Vec<XfsBmbtPtr>, u16)> = vec![(self.ptrs.clone(), self.level())];
 
         while let Some((ptrs, level)) = stack.pop() {
@@ -481,6 +489,7 @@ impl BtreeRoot {
                 buf_reader
                     .seek(SeekFrom::Start(offset))
                     .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+                nodes.push(ptr);
                 if child == 0 {
                     let mut bytes = vec![0u8; sb.sb_blocksize as usize];
                     buf_reader
@@ -502,7 +511,7 @@ impl BtreeRoot {
                 }
             }
         }
-        Ok(Bmx::new(&out))
+        Ok((Bmx::new(&out), nodes))
     }
 }
 
