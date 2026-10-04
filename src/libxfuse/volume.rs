@@ -75,7 +75,11 @@ use super::{
     sb::Sb,
     transaction::{CommitMode, Transaction, TransactionContext},
 };
-use crate::libxfuse::alloc::free_space::FreeRun;
+use crate::libxfuse::{
+    alloc::free_space::FreeRun,
+    bmbt_rec::BmbtRec,
+    btree::{BmbtLeafBlock, BmbtLeafRecord, BtreeLblockHdr, BMBT_NULL_PTR},
+};
 
 /// We must store the Superblock in a global variable.  This is unfortunate, and limits us to only
 /// opening one disk image at a time, but it's necessary in order to use information from the
@@ -356,9 +360,12 @@ impl Volume {
                 .get_mut(&ino)
                 .ok_or_else(|| no_entry(b"an inode the kernel has not looked up"))?;
             let size = u64::try_from(oi.dinode.fsize()).map_err(FsError::from)?;
-            if !matches!(oi.dinode.di_core.di_format, XfsDinodeFmt::Extents) {
+            if !matches!(
+                oi.dinode.di_core.di_format,
+                XfsDinodeFmt::Extents | XfsDinodeFmt::Btree
+            ) {
                 return Err(FsError::unsupported(format!(
-                    "growing a file whose extents are in a B+tree (data fork format {:?})",
+                    "growing a file whose data fork is in format {:?}",
                     oi.dinode.di_core.di_format
                 )));
             }
@@ -402,6 +409,32 @@ impl Volume {
         let xfs_ino = self.xfs_ino(ino);
         let inode_offset = sb.inode_offset(xfs_ino);
         let inode_size = sb.inode_size();
+        // A file whose extents are already in a tree is read out of it here,
+        // **before** the transaction starts, because the walk needs a reader and
+        // the transaction holds the only mutable one.  Nothing it reads can change
+        // underneath it: it is image content, and this transaction writes none of
+        // it until the walk has finished.
+        let tree: Option<(Vec<BmbtRec>, Vec<u64>, u64)> = {
+            let mut peek = vec![0u8; inode_size];
+            self.device
+                .device()
+                .read_at(&mut peek, inode_offset)
+                .map_err(|e| FsError::Corrupt {
+                    what: format!("reading inode {xfs_ino} to look at its data fork: {e}"),
+                })?;
+            let probe = RawDinode::from_bytes(peek)?;
+            if probe.format() != 3 {
+                None
+            } else {
+                let root = probe.data_btree_root()?;
+                let (bmx, blocks) = root.all_extents(self.device.by_ref())?;
+                let ptr = *root.ptrs.first().ok_or_else(|| {
+                    FsError::corrupt("a data fork's b-tree root points at nothing")
+                })?;
+                Some((bmx.extents().to_vec(), blocks, ptr))
+            }
+        };
+
         let now = SystemTime::now();
 
         // A file grows where it is, so the groups are tried from the one its
@@ -499,7 +532,153 @@ impl Volume {
             // The extent names two spaces: the file blocks it covers, and the
             // image blocks they live at.
             let fsb = sb.ag_block_to_fsb(agno, run.start);
-            raw.add_extent(first_new, fsb, run.len)?;
+            // How many blocks the file's data occupies, and how many of them are
+            // tree nodes.  Both are counted **before** the fork changes shape,
+            // because after a conversion `core_extents` is nothing and a count
+            // taken then would be zero -- which is what `xfs_repair` calls
+            // `bad nblocks`.
+            let data_blocks: u64;
+            let mut nodes = 0u64;
+
+            // A file already in a tree: the new extent goes into the leaf the root
+            // points at, which is rewritten in place.  The root's shape does not
+            // change -- still one key, one pointer -- because there is still one
+            // leaf.  A second leaf would need an interior node, and refusing that
+            // is honest where silently building a root that names a block nothing
+            // wrote is not.
+            if let Some((existing, blocks, ptr)) = tree {
+                let mut all = existing;
+                all.push(BmbtRec {
+                    br_startoff:   first_new,
+                    br_startblock: fsb,
+                    br_blockcount: u64::from(run.len),
+                    br_flag:       false,
+                });
+                all.sort_by_key(|r| r.br_startoff);
+                // A leaf that will not hold the list is refused here rather than discovered
+                // as a write past the end of the block: the step after this is a second
+                // leaf and an interior node, which is not built, and saying so is better
+                // than a slice range.
+                let room = BmbtLeafBlock::max_records(sb.sb_blocksize as usize, sb.has_crc());
+                if all.len() > room {
+                    return Err(FsError::fork_full(format!(
+                        "a file's b-tree needs {} extents in one leaf and a block of {} holds {}",
+                        all.len(),
+                        sb.sb_blocksize,
+                        room
+                    )));
+                }
+                let leaf = BmbtLeafBlock {
+                    level:   0,
+                    records: all.iter().map(BmbtLeafRecord::from_extent).collect(),
+                };
+                let (leaf_fsb, leftsib, rightsib) = (blocks[0], BMBT_NULL_PTR, BMBT_NULL_PTR);
+                let at = sb.fsb_to_offset(leaf_fsb);
+                let block = if sb.has_crc() {
+                    leaf.to_bytes(
+                        &BtreeLblockHdr {
+                            blkno: ptr,
+                            lsn: 0,
+                            leftsib,
+                            rightsib,
+                            owner: xfs_ino,
+                            uuid: sb.uuid(),
+                        },
+                        sb.sb_blocksize as usize,
+                    )
+                } else {
+                    leaf.to_bytes_v4(leftsib, rightsib, sb.sb_blocksize as usize)
+                };
+                tx.write_bytes(at, &block)?;
+                data_blocks = all.iter().map(|r| r.br_blockcount).sum();
+                nodes = blocks.len() as u64;
+                // `di_nextents` is the file's **total** extent count, not the
+                // records in the fork, so it has to follow a conversion and keep
+                // following it.  Leaving it at the count the fork held when it
+                // converted is what `xfs_repair` calls `bad nextents`.
+                raw.set_nextents(all.len() as u64);
+                raw.set_size(end as i64);
+                raw.set_mtime(now);
+                raw.set_ctime(now);
+                raw.set_nblocks(data_blocks + nodes);
+                raw.finalise();
+                tx.write_bytes(inode_offset, raw.as_bytes())?;
+                tx.commit()?;
+                self.device.invalidate();
+                let dinode = Dinode::from(self.device.by_ref(), &sb, xfs_ino);
+                if let Some(oi) = self.open_files.get_mut(&ino) {
+                    oi.dinode = dinode;
+                }
+                return Ok(data.len() as u32);
+            }
+
+            match raw.add_extent(first_new, fsb, run.len) {
+                Ok(()) => {
+                    data_blocks = raw
+                        .core_extents()
+                        .map(|e| e.iter().map(|r| r.br_blockcount).sum())
+                        .unwrap_or(0);
+                }
+                // The inode's own fork is full, which is not the group running out
+                // and not something a retry fixes.  The format's answer is to turn
+                // the fork into a B+tree, which needs a block for the records and
+                // a root in the inode.
+                Err(FsError::ForkFull { .. }) => {
+                    let all = {
+                        let mut e = raw.core_extents().ok_or_else(|| {
+                            FsError::corrupt("a data fork reported itself full and cannot be read")
+                        })?;
+                        e.push(BmbtRec {
+                            br_startoff:   first_new,
+                            br_startblock: fsb,
+                            br_blockcount: u64::from(run.len),
+                            br_flag:       false,
+                        });
+                        e.sort_by_key(|r| r.br_startoff);
+                        e
+                    };
+                    data_blocks = all.iter().map(|r| r.br_blockcount).sum();
+                    nodes = 1;
+
+                    // A block for the records, taken from the group like any other.
+                    let node = allocate(&mut tx, &sb, agno, 1)?;
+                    let node_fsb = sb.ag_block_to_fsb(agno, node.start);
+
+                    // A leaf that will not hold the list is refused here rather than discovered
+                    // as a write past the end of the block: the step after this is a second
+                    // leaf and an interior node, which is not built, and saying so is better
+                    // than a slice range.
+                    let room = BmbtLeafBlock::max_records(sb.sb_blocksize as usize, sb.has_crc());
+                    if all.len() > room {
+                        return Err(FsError::fork_full(format!(
+                            "a file's b-tree needs {} extents in one leaf and a block of {} holds \
+                             {}",
+                            all.len(),
+                            sb.sb_blocksize,
+                            room
+                        )));
+                    }
+                    let leaf = BmbtLeafBlock {
+                        level:   0,
+                        records: all.iter().map(BmbtLeafRecord::from_extent).collect(),
+                    };
+                    // A file system with checksums and one without have different
+                    // block headers, down to the magic, and a version 5 leaf
+                    // written into a version 4 file system is what `xfs_repair`
+                    // calls `bad magic` and then, further down, a bad data fork.
+                    let at = sb.fsb_to_offset(node_fsb);
+                    let block = if sb.has_crc() {
+                        let hdr = BtreeLblockHdr::for_single_leaf(node_fsb, xfs_ino, sb.uuid());
+                        leaf.to_bytes(&hdr, sb.sb_blocksize as usize)
+                    } else {
+                        leaf.to_bytes_v4(BMBT_NULL_PTR, BMBT_NULL_PTR, sb.sb_blocksize as usize)
+                    };
+                    tx.write_bytes(at, &block)?;
+
+                    raw.set_data_extents_as_tree(node_fsb, &all)?;
+                }
+                Err(e) => return Err(e),
+            }
             // The file's own count of the blocks it occupies has to follow its
             // extents, or every reader of the file system -- including
             // xfs_repair -- will say the inode disagrees with its own data.
@@ -512,11 +691,11 @@ impl Volume {
             // does not move, 24 more blocks are covered, and an inode still
             // carrying the old count is one `bad nblocks` away from being
             // repairable.
-            let blocks: u64 = raw
-                .core_extents()
-                .map(|extents| extents.iter().map(|e| e.br_blockcount).sum())
-                .unwrap_or(0);
-            raw.set_nblocks(blocks);
+            // The file's block count is its data blocks **and** any node the tree
+            // it now lives in.  Counting only the data leaves a tree charged for
+            // nothing, which `xfs_repair` reports and which is how this code got
+            // three of its "the header was read before the work was done" bugs.
+            raw.set_nblocks(data_blocks + nodes);
         }
         raw.set_size(end as i64);
         raw.set_mtime(now);
@@ -759,28 +938,18 @@ impl Volume {
             )));
         }
 
-        // A file whose mapping is in a B+tree rather than in its inode.
+        // Writing into a file whose mapping is a B+tree is allowed, and the reason
+        // it used not be allowed is worth keeping: a b-map record's data-block
+        // field was not attributed, so the reader returned a provisional value and
+        // a write through a value known to be provisional is a write to an
+        // arbitrary block.
         //
-        // Writing *into* an existing extent would be legitimate in principle --
-        // the data moves, the mapping does not -- and the inode update at the end of
-        // this function only touches timestamps.  But the write has to find the
-        // extent first, and a b-map record's data-block field is **not yet
-        // attributed**: the record's shape is measured and its file offset is
-        // measured, and where the block lives is not.  The reader therefore
-        // returns a provisional value for it, and a write through a value known to
-        // be wrong is a write to an arbitrary block.
-        //
-        // So this is refused, with the reason, rather than attempted.  It used not
-        // to be reachable: the b-map reader used to decode records with the inode's
-        // packed form, which produced numbers that happened to be inside the image
-        // and satisfied `xfs_repair -n`.  That was an accident that looked like a
-        // success, and making the reader honest is what exposed it.
-        if matches!(oi.dinode.di_core.di_format, XfsDinodeFmt::Btree) {
-            return Err(FsError::unsupported(
-                "writing to a file whose extent mapping is a B+tree: the record's data-block \
-                 field is not yet established, so the extent cannot be located safely",
-            ));
-        }
+        // It **is** attributed now -- `btree.rs`, two 64-bit words with the block
+        // number split across them, checked by re-encoding a leaf and getting the
+        // file system's own bytes back -- so the reason has gone and the refusal
+        // with it.  What replaces it is not a blank cheque but a test: the write
+        // path below resolves the extent through the same reader that reads it, and
+        // `xfs_repair` is what says whether the result is a file system.
 
         let size = u64::try_from(oi.dinode.fsize()).map_err(FsError::from)?;
         let end = offset

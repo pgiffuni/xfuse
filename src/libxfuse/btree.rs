@@ -476,6 +476,54 @@ impl BmbtLeafBlock {
         b
     }
 
+    /// The most records a leaf can hold in one block of this shape.
+    ///
+    /// Asked before writing, because the alternative is writing past the end of the
+    /// block: 31 records fit a 512-byte version 4 leaf and 253 fit a 4096-byte
+    /// checksummed one, and a file that outgrows its leaf needs a **second leaf and
+    /// an interior node**, which is a different piece of work and has to be refused
+    /// rather than discovered as a slice range.
+    pub const fn max_records(sb_blocksize: usize, has_crc: bool) -> usize {
+        let header = if has_crc {
+            BMBT_CRC_HEADER_LEN
+        } else {
+            BMBT_HEADER_LEN
+        };
+        sb_blocksize.saturating_sub(header) / BMBT_RECORD_LEN
+    }
+
+    /// This leaf as the bytes a block of a file system **without** checksums holds.
+    ///
+    /// A version 4 file system has no checksum, no UUID and no log, so its b-tree
+    /// blocks carry neither: the header is the magic, the level, the count and the
+    /// two siblings, twenty-four bytes, and the records start there.  That is
+    /// `XFS_BTREE_LBLOCK_LEN`, and it is the same long form as the checksummed one
+    /// with everything after the siblings left out.
+    ///
+    /// **The magic is not the checksummed one**, which is the mistake this exists to
+    /// prevent: a version 5 leaf written into a version 4 file system is rejected by
+    /// `xfs_repair` as `bad magic # 0x424d4133`, and the tree it belongs to is then
+    /// "bad data fork in inode ...", which reads like a mapping fault and is not
+    /// one.
+    pub fn to_bytes_v4(
+        &self,
+        leftsib: XfsFsblock,
+        rightsib: XfsFsblock,
+        sb_blocksize: usize,
+    ) -> Vec<u8> {
+        let mut b = vec![0u8; sb_blocksize];
+        b[0..4].copy_from_slice(&XFS_BMAP_MAGIC.to_be_bytes());
+        b[4..6].copy_from_slice(&self.level.to_be_bytes());
+        b[6..8].copy_from_slice(&(self.records.len() as u16).to_be_bytes());
+        b[8..16].copy_from_slice(&leftsib.to_be_bytes());
+        b[16..24].copy_from_slice(&rightsib.to_be_bytes());
+        for (i, r) in self.records.iter().enumerate() {
+            let at = BMBT_HEADER_LEN + i * BMBT_RECORD_LEN;
+            b[at..at + BMBT_RECORD_LEN].copy_from_slice(&r.to_bytes());
+        }
+        b
+    }
+
     /// The extents as the rest of this program represents them.
     ///
     /// Each record carries its own block count, so nothing here is assumed about

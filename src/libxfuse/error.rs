@@ -61,6 +61,22 @@ pub enum FsError {
     NotEmpty { path: PathBuf },
     /// The file system is full.
     NoSpace,
+    /// The inode's **data fork** is full: its extent records no longer fit
+    /// between its core and its attribute fork.
+    ///
+    /// Distinct from [`FsError::NoSpace`] on purpose, and distinct from
+    /// `Unsupported` because the two mean opposite things to a caller.  `NoSpace`
+    /// is "the group has nothing left", which no amount of retrying fixes and which
+    /// the file system cannot work around.  This is "**this inode** has run out of
+    /// room", which is not a shortage of anything at all -- the group may be
+    /// almost empty -- and which the format's answer is to change what is in the
+    /// fork: turn it into a B+tree whose records live in blocks of their own.
+    ///
+    /// A caller that can do that should; a caller that cannot should report
+    /// `ENOSPC`, which is what this maps to, and which is also what the group
+    /// running out would report.  The caller is the only one that can tell the
+    /// difference and so the only one that can act on it.
+    ForkFull { msg: String },
     /// The file system was mounted read-only, or the operation needs a feature
     /// that this implementation cannot maintain.
     ReadOnly { msg: String },
@@ -79,6 +95,11 @@ impl FsError {
             errno,
             msg: msg.into(),
         }
+    }
+
+    /// Build an [`FsError::ForkFull`].
+    pub fn fork_full(msg: impl Into<String>) -> Self {
+        FsError::ForkFull { msg: msg.into() }
     }
 
     /// Build an [`FsError::Corrupt`].
@@ -105,7 +126,7 @@ impl FsError {
             FsError::NoEntry { .. } => libc::ENOENT,
             FsError::Exists { .. } => libc::EEXIST,
             FsError::NotEmpty { .. } => libc::ENOTEMPTY,
-            FsError::NoSpace => libc::ENOSPC,
+            FsError::NoSpace | FsError::ForkFull { .. } => libc::ENOSPC,
             FsError::ReadOnly { .. } => libc::EROFS,
             FsError::Unsupported { .. } => libc::ENOSYS,
             FsError::Corrupt { .. } => crate::libxfuse::EUCLEAN,
@@ -134,6 +155,7 @@ impl fmt::Display for FsError {
                 write!(f, "directory not empty: {}", path.display())
             }
             FsError::NoSpace => write!(f, "no space left on device"),
+            FsError::ForkFull { msg } => write!(f, "the inode's data fork is full: {msg}"),
             FsError::ReadOnly { msg } => write!(f, "read-only file system: {msg}"),
             FsError::Unsupported { feature } => {
                 write!(f, "not supported: {feature}")

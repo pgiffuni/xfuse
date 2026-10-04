@@ -87,7 +87,7 @@ use crc::{Crc, CRC_32_ISCSI};
 use super::{
     bmbt_rec::BmbtRec,
     btree::{BmbtKey, BmdrBlock, BtreeRoot},
-    definitions::{XfsFsize, XfsIno, XFS_DINODE_MAGIC},
+    definitions::{XfsFsblock, XfsFsize, XfsIno, XFS_DINODE_MAGIC},
     error::{FsError, FsResult},
 };
 
@@ -711,16 +711,12 @@ impl RawDinode {
         if extents.len() > room {
             // Saying *why* is worth the words even though the caller only gets
             // `ENOSPC`: this is not the group running out, and a file that has
-            // nine extents and wants a tenth has a problem no amount of free
-            // space solves.  The format's answer is a b-tree rooted in the inode,
-            // whose reader exists and is verified -- `btree.rs`, both header forms,
-            // checked against `xfs_db`'s own reading of the same leaf -- so what is
-            // missing is the *writer*: a leaf, an interior root, and the inode
-            // fields that move with them.  Until those exist the honest answer is
-            // to refuse and say so.
-            return Err(FsError::unsupported(format!(
-                "a {} byte inode holds {room} extent records and this file needs {}: its data \
-                 fork has to become a b-tree, which is not implemented",
+            // nine extents and wants a tenth has a problem no amount of free space
+            // solves.  The caller can tell the two apart -- `ForkFull` is this, and
+            // `NoSpace` is the other -- and that is the whole reason it is its own
+            // error rather than a string inside `Unsupported`.
+            return Err(FsError::fork_full(format!(
+                "a {} byte inode holds {room} extent records and this file needs {}",
                 self.bytes.len(),
                 extents.len()
             )));
@@ -997,6 +993,73 @@ impl RawDinode {
         for b in &mut self.bytes[end..limit] {
             *b = 0;
         }
+        Ok(())
+    }
+
+    /// Set `di_nextents`, in whichever of its two widths this inode has.
+    pub fn set_nextents(&mut self, n: u64) {
+        if self.nrext64() {
+            BigEndian::write_u64(&mut self.bytes[offset::NEXTENTS..], n);
+        } else {
+            BigEndian::write_u32(&mut self.bytes[offset::NEXTENTS32..], n as u32);
+        }
+    }
+
+    /// Put a data fork's extents into a B+tree rooted in this inode.
+    ///
+    /// `leaf` is the block the records went to, and `records` are all of them --
+    /// the ones the fork held plus the new one -- because the root's key is the
+    /// **first** offset in the tree and there is only one key while there is one
+    /// child.
+    ///
+    /// The fork becomes a level-1 root: four bytes of `bmdr_block`, one eight-byte
+    /// key, then the padding `dfork_ptr_gap` measures, then one eight-byte pointer.
+    /// Everything after the pointer is zeroed, because what was there was extent
+    /// records and a reader that found one of those where it expects the end of
+    /// the root would be reading a stale record as a structure.
+    ///
+    /// The fork's **size** does not change: `di_forkoff` still says where the
+    /// attribute fork begins, and the root lives in the same bytes the records did.
+    /// That is why a level-0 root is never built here -- it would hold records, and
+    /// holding records is exactly what has just stopped working.
+    pub fn set_data_extents_as_tree(
+        &mut self,
+        leaf: XfsFsblock,
+        records: &[BmbtRec],
+    ) -> FsResult<()> {
+        if records.is_empty() {
+            return Err(FsError::corrupt(
+                "a data fork's b-tree was built with no records in it",
+            ));
+        }
+        let start = self.literal_area_offset();
+        let limit = self.attribute_fork_offset().unwrap_or(self.bytes.len());
+        for b in &mut self.bytes[start..limit] {
+            *b = 0;
+        }
+        // `bb_level` and `bb_numrecs`, and **no magic**: `xfs_bmdr_block_t` is
+        // those two fields and nothing else, four bytes, which is what
+        // `BmdrBlock::SIZE` has always said and what the pointer gap is measured
+        // from.  A root inside the inode is not a block, so it has none of a
+        // block's header -- and a writer that puts one here produces an inode that
+        // reads back as a tree of depth 16973 with sixteen thousand keys in it.
+        let mut at = start;
+        self.bytes[at..at + 2].copy_from_slice(&1u16.to_be_bytes());
+        self.bytes[at + 2..at + 4].copy_from_slice(&1u16.to_be_bytes());
+        at += BmdrBlock::SIZE;
+        // One key: the first offset in the tree.  The pointer comes after the gap,
+        // which is measured from the same arithmetic `data_btree_root` uses.
+        self.bytes[at..at + 8].copy_from_slice(&records[0].br_startoff.to_be_bytes());
+        at += BmbtKey::SIZE;
+        at += self.dfork_ptr_gap(1);
+        if at + 8 > limit {
+            return Err(FsError::fork_full(
+                "an inode has no room for a b-tree root and its key",
+            ));
+        }
+        self.bytes[at..at + 8].copy_from_slice(&leaf.to_be_bytes());
+        self.set_format(3);
+        self.set_nextents(records.len() as u64);
         Ok(())
     }
 

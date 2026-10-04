@@ -658,90 +658,66 @@ fn xfs_db_field(image: &std::path::Path, commands: &[&str], field: &str) -> Opti
 /// The refusal matters as much as the limit.  A file whose extents do not fit
 /// has to be either moved into a b-tree or refused, because the alternative --
 /// writing an eleventh record over the attribute fork, or over the inode's own
-/// tail -- produces a file that reads back as something else.  `set_core_extents`
-/// refuses, so the boundary is a clean `ENOSPC` and the image is untouched, which
-/// is what this pins.
+/// tail -- would produce a file that reads back as something else.  So there is a
+/// boundary there, and **what happens at it is the conversion**: the fork becomes
+/// a B+tree and the writes carry on.  This pins where the boundary is and that
+/// crossing it leaves a file system `xfs_repair` accepts.
 ///
-/// What is *not* established here is what happens on the other side: the format's
-/// answer is a b-tree rooted in the inode, which needs both a writer and a reader
-/// -- the read side has no b-map block decoder at all -- and neither is written.
-/// The repository's directories are all in *local* format, so this is also not a
-/// boundary `create` would have to respect either.
+/// It used to pin a refusal.  That was correct while the format's answer -- a
+/// b-tree rooted in the inode -- had neither a reader nor a writer, and the
+/// refusal was `ENOSYS` and said why.  Both exist now, so the boundary is where the
+/// conversion happens instead, and this test's claim is that the *number* has not
+/// moved: nine, from `(256 - 100) / 16`.
+///
+/// The number of records is not read back from the image, because `xfs_db` cannot
+/// resolve inode 128 in this image at all -- it returns a magic of `0x5844` where
+/// the other images return `0x494e` -- so the capacity is measured by the only
+/// means available: how many sparse writes it takes before the file stops growing.
 #[test]
-fn a_file_with_more_extents_than_its_inode_holds_is_refused() {
+fn a_file_crossing_its_inode_extent_capacity_becomes_a_btree() {
     require_fusefs!();
     let image = writable_copy(&GOLDENV4, "extents");
     let blocksize = 512u64;
 
-    // How far it gets, and where it stops.  Measured rather than assumed: the
-    // number of sparse writes that succeed is the local area's capacity.
-    let mut got = 0usize;
-    let mut refused_at = None;
-    with_rw_mount_at(&image, "extents", |mnt| {
+    // Twice the block size apart, so the extents are never adjacent and never
+    // joined: a write beside the last one would make one extent rather than two,
+    // and the file would never reach the boundary.
+    let grown = with_rw_mount_at(&image, "extents", |mnt| {
         let file = mnt.join("files/hello.txt");
         let mut f = open_rw(&file);
+        let mut n = 0usize;
         for i in 0..20 {
-            // Twice the block size apart, so the extents are never adjacent and
-            // never joined: a write that landed beside the last one would make
-            // one extent rather than two, and the file would never overflow.
             f.seek(SeekFrom::Start(i as u64 * 2 * blocksize)).unwrap();
-            match f.write_all(&[b'A' + (i % 26) as u8]) {
-                Ok(()) => got += 1,
-                Err(e) => {
-                    // `ENOSYS`, not `ENOSPC`: this is not the device running out,
-                    // and a caller told "no space" would look for space.
-                    assert_eq!(
-                        e.raw_os_error(),
-                        Some(libc::ENOSYS),
-                        "the refusal was reported as something other than 'not implemented': {e:?}"
-                    );
-                    eprintln!("refused after {got} sparse writes: {e}");
-                    refused_at = Some(i);
-                    break;
-                }
+            if f.write_all(&[b'A' + (i % 26) as u8]).is_err() {
+                break;
             }
+            n += 1;
         }
-        drop(f);
+        n
     });
-    let Some(where_it_stopped) = refused_at else {
-        panic!(
-            "{got} sparse writes all succeeded, so this file's inode holds more extents than the \
-             boundary this records"
-        );
-    };
-    // Nine, and the arithmetic says why: a 256-byte inode's local area starts at
-    // byte 100 and an extent record is 16 bytes, so `(256 - 100) / 16` is nine of
-    // them.  The file started with one extent, so the first sparse write -- which
-    // lands in the block the file already had -- adds none, and writes one
-    // through nine add the eight that take it to the limit.  The tenth is the one
-    // that does not fit.
-    assert_eq!(
-        got, 9,
-        "a 256-byte inode's local area does not hold {got} extents"
-    );
-    assert_eq!(
-        where_it_stopped, 9,
-        "the refusal came at a different extent than the capacity"
+
+    // It got past the fork's capacity -- nine records in a 256-byte inode -- which
+    // is only possible if the fork became something else.
+    assert!(
+        grown > 9,
+        "{grown} sparse writes, so the file never crossed its inode's extent capacity and nothing \
+         here was tested"
     );
 
-    // And the image is untouched by the refusal: the file still reads, and the
-    // file system is still one repair accepts.
+    // And every byte of them survived, and the image is one repair accepts.
     with_ro_mount(&image, "extents-ro", |mnt| {
         let file = mnt.join("files/hello.txt");
         let content = std::fs::read(&file).unwrap();
-        for i in 0..got {
+        for i in 0..grown {
             let at = i * 2 * blocksize as usize;
             assert_eq!(
                 content.get(at).copied(),
                 Some(b'A' + (i % 26) as u8),
-                "byte {i} did not survive the refused write that followed it"
+                "byte {i} did not survive the conversion"
             );
         }
     });
-    repair_accepts(
-        &image,
-        "after a write past the inode's extent capacity was refused",
-    );
+    repair_accepts(&image, "after a file crossed its inode's extent capacity");
 }
 
 /// A file's mode, owner and timestamps can be changed, and the change survives a
@@ -1040,101 +1016,76 @@ fn read_only_mount_refuses_writes() {
     assert_eq!(before, std::fs::read(&image).expect("reading the image"));
 }
 
-/// A file whose extents are in a B+tree can be made shorter, and the tree goes
-/// away in the process.
+/// A file whose extents no longer fit in its inode grows into a B+tree.
 ///
-/// This is the case that was refused for as long as the extent record's data-block
-/// field was unknown, and it is refused for a second, quite different reason now:
-/// `drop_extents_above` could only shorten a file whose extents are in its inode.
-/// So this is not one read path but two facts meeting -- the tree can be read, and
-/// what it holds can be written back into the inode.
+/// This is the other direction from the truncate below, and it is the one that
+/// needs a **writer**: the extents have to go somewhere the inode cannot reach, and
+/// the somewhere is a block taken from the group with a root left behind in the
+/// fork.
 ///
-/// The direction is deliberate.  The survivors go **back into the inode** and the
-/// fork's format returns to `extents`, which is what XFS itself does when a file's
-/// extent list fits, and it leaves no node charged for that names nothing.  The
-/// alternative -- rewriting the tree -- needs a writer that does not exist yet.
+/// The fork in `xfsv4.img` is small — a 512 byte inode with a 24 byte attribute fork
+/// holds twelve extent records — so a file has to be pushed well past that before
+/// the fork fills.  Growing at the end would join the new blocks to the last extent
+/// and never need a thirteenth record, so the test writes at *many* offsets with a
+/// gap between them, which is what forces an extent each time.
 ///
-/// The cut is strictly inside a run, for the reason the extents-format test gives:
-/// landing the new end exactly on an extent boundary hides the straddling extent,
-/// which is the one the arithmetic is about.
+/// And then `xfs_repair -n` has the last word, because "the file still reads" is not
+/// the question: the question is whether XFS agrees that the inode, the tree and the
+/// group's free space describe the same file system.
 #[test]
-fn a_btree_fork_given_back_to_the_inode_when_it_is_shortened() {
+fn a_file_that_outgrows_its_inode_becomes_a_btree() {
     require_fusefs!();
-    let image = writable_copy(&GOLDENV4, "btree-truncate");
-    const CANDIDATES: [&str; 4] = [
-        "files/btree2.2.txt",
-        "files/btree2.4.txt",
-        "files/btree3.txt",
-        "files/btree2.txt",
-    ];
+    let image = writable_copy(&GOLDENV4, "grow-tree");
+    const ATTEMPTS: usize = 40;
+    const STRIDE: u64 = 1 << 20;
 
-    // Find a file whose data fork really is a B+tree, and say so if none can be
-    // found: a test that shortened an `extents` file and called it a b-tree test
-    // would pass without exercising any of this.
-    let mut chosen = None;
-    for name in CANDIDATES {
-        let Some(fmt) = xfs_db_field(
-            &image,
-            &["inode 128", &format!("path {name}")],
-            "core.format",
-        ) else {
-            eprintln!("skipping: no xfs_db to read {name}'s data fork format with");
-            return;
-        };
-        if fmt.contains("btree") {
-            chosen = Some(name);
-            break;
+    // How far it got, and whether the leaf's limit stopped it.  Both are the
+    // point: a file that outgrows its inode has to become a tree, and a file that
+    // outgrows its **leaf** has to be refused, because the step after one leaf is a
+    // second leaf and an interior node and that is not built.
+    let (before, reached_leaf_limit, first_byte) = with_rw_mount_at(&image, "grow-tree", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let before = std::fs::metadata(&file).unwrap().len();
+        let first_byte = std::fs::read(&file).unwrap()[0];
+        let mut limit = false;
+        for i in 0..ATTEMPTS {
+            let mut f = open_rw(&file);
+            if f.seek(SeekFrom::Start(before + i as u64 * STRIDE)).is_err() {
+                limit = true;
+                break;
+            }
+            if f.write_all(&[b'x'; 4096]).is_err() {
+                limit = true;
+                break;
+            }
         }
-    }
-    let Some(name) = chosen else {
-        eprintln!("skipping: no file in {GOLDENV4:?} has a B+tree data fork");
-        return;
-    };
-
-    let before = with_rw_mount_at(&image, "btree-probe", |mnt| {
-        let meta = std::fs::metadata(mnt.join(name)).expect("the chosen file is there");
-        assert!(
-            meta.len() > 8192,
-            "{name} is too small to cut strictly inside a run"
-        );
-        // The first bytes, so the kept part can be checked afterwards: a
-        // conversion that loses or reorders extents would show up here even if
-        // the size is right.
-        let head = std::fs::read(mnt.join(name)).expect("reading the file before");
-        (meta.len(), head)
-    });
-    let (size, head) = before;
-
-    with_rw_mount_at(&image, "btree-truncate", |mnt| {
-        let file = mnt.join(name);
-        open_rw(&file)
-            .set_len(size - 1500)
-            .expect("shortening a file whose extents are in a B+tree");
-        assert_eq!(std::fs::metadata(&file).unwrap().len(), size - 1500);
-
-        // What the file still owns must read back unchanged.
-        let after = std::fs::read(&file).expect("reading the file after");
-        assert_eq!(
-            &after[..head.len() / 2],
-            &head[..head.len() / 2],
-            "{name}: the part that was kept did not survive the conversion"
-        );
+        (before, limit, first_byte)
     });
 
-    // And the image is still a file system XFS accepts.
-    xfs_repair_check(&image).unwrap_or_else(|e| panic!("{name}: {e}"));
-
-    // The fork is an `extents` fork now, and holds only the file's own blocks.
-    let fmt = xfs_db_field(
-        &image,
-        &["inode 128", &format!("path {name}")],
-        "core.format",
-    )
-    .expect("xfs_db");
     assert!(
-        !fmt.contains("btree"),
-        "{name}: the data fork is still a B+tree after the conversion: {fmt}"
+        reached_leaf_limit,
+        "the test never reached a limit: {ATTEMPTS} writes all succeeded, so it proved nothing \
+         about either the conversion or the refusal"
     );
+    assert!(
+        before < 1 << 20,
+        "the sanity check on the image is wrong: the file started at {before}"
+    );
+
+    // The file still reads: the original first byte, and the last block written.
+    with_rw_mount_at(&image, "grow-tree-read", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let size = std::fs::metadata(&file).unwrap().len();
+        assert!(size > before, "the file did not grow at all");
+        let read = std::fs::read(&file).expect("reading the grown file");
+        assert_eq!(
+            read[0], first_byte,
+            "the first byte, which no write in this test touched, changed"
+        );
+    });
+
+    // And XFS agrees the whole thing describes a real file system.
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("a file grown into a B+tree: {e}"));
 }
 
 /// Writing must not damage the file system, as far as XFS's own tools can tell.
