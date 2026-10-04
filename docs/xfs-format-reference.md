@@ -398,9 +398,42 @@ group 3: 200 single-block allocations from the middle of a run
 which is the first time the deepest group in this image has been allocated from at
 all.
 
+**A second, separate fault: inserting into a leaf that must split.**
+`an_overflowing_leaf_takes_a_node_off_the_free_list` has a sound fixture -- it
+allocates a 24-block run and frees single blocks from *inside* that run, so every
+block it frees is one it just allocated and no metadata is ever touched. Its trees
+grow a node at **round 14**, and from that point `xfs_repair -n` reports the freed
+blocks, and only those, as claimed **twice** by the bno tree:
+
+```text
+block (0,2281-2281) multiply claimed by bno space tree, state - 2
+block (0,2283-2283) multiply claimed by bno space tree, state - 2
+```
+
+2281, 2283, 2285 ... are exactly the single blocks freed from the middle of a run,
+and freeing one splits that run in two. So the record being split is **left in the
+tree beside the two records that replace it**, and everything it still covers is
+claimed twice. Ordinary frees leave the trees coherent and are exercised heavily
+elsewhere, so this is specifically the path where an **insert splits a leaf**.
+
+**And a hazard in the other fixture.** `a_split_leaves_the_block_count_right` frees
+blocks chosen as "not free", starting at block 16. **Not free is not the same as
+freeable**: an inode chunk's blocks are allocated, so they are chosen, and freeing
+one destroys the inode allocation tree. `xfs_repair -n` on that image says
+
+```text
+inode chunk claims used block, inobt block - agno 0, bno 16, inopb 2
+root inode chunk not found
+found inodes not in the inode allocation tree
+```
+
+which is not a free-space complaint at all. That test needs to ask the **inode
+b-tree** which blocks the group's chunks cover: "allocated" and "owned by metadata"
+are different questions and only the inobt answers the second.
+
 The two single-block runs six apart that `xfs_repair` reported as "only seen by one
-free space btree" on a grown image may or may not be this; that is not established
-either.
+free space btree" on a grown image may or may not be either of these; that is not
+established.
 
 ### Siblings
 

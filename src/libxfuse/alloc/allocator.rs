@@ -6904,7 +6904,33 @@ mod t {
     /// allocator and belong to no file, so repair rightly objects to inodes that
     /// are not giving them up.  Overflowing a leaf for real needs a file to give
     /// up its middle, which is the truncate that is not built.
-    #[ignore = "the trees do not overflow, and repair cannot judge freed blocks no file gave up"]
+    // **This one is a real defect, and the ignore reason it had was wrong.**  It
+    // said the trees do not overflow, and "repair cannot judge freed blocks no file
+    // gave up".  The trees do overflow: the loop runs to 200 rounds or until they
+    // grow a node, and they grow one at **round 14**.
+    //
+    // The fixture here is sound -- it allocates a 24-block run and frees single
+    // blocks from *inside* that run, so every block it frees is one it just
+    // allocated and no inode chunk or other metadata is ever touched.  So its
+    // failure is a product bug, not a hazard of the test.
+    //
+    // **MEASURED.** Once the trees grow a node, `xfs_repair -n` reports the blocks
+    // this test freed, and only those, as claimed **twice** by the bno tree:
+    //
+    //     block (0,2281-2281) multiply claimed by bno space tree, state - 2
+    //     block (0,2283-2283) multiply claimed by bno space tree, state - 2
+    //     block (0,2285-2285) multiply claimed by bno space tree, state - 2
+    //
+    // 2281, 2283, 2285 ... are exactly the single blocks freed from the middle of a
+    // run, and freeing one splits that run in two.  So **the record being split is
+    // left in the tree beside the two records that replace it**, and every block it
+    // still covers is claimed twice.
+    //
+    // Ordinary frees are exercised heavily elsewhere and leave the trees coherent,
+    // so this is specifically the path where the insert **splits** a leaf -- which
+    // is why it took a test that deliberately grows the tree to reach it.
+
+    #[ignore = "inserting into a leaf that must split leaves the old record behind"]
     #[test]
     fn an_overflowing_leaf_takes_a_node_off_the_free_list() {
         let Some(golden) = crate::libxfuse::alloc::golden("xfsv4.img") else {
