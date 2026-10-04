@@ -1009,7 +1009,17 @@ impl Volume {
         if end > size {
             // Past the end of the file the write has to *become* part of the
             // file: blocks allocated, extents recorded, and a size to match.
-            return self.write_extending(ino, offset, end, data);
+            //
+            // A refusal is logged, because the reasons here are the interesting
+            // ones -- "this inode's data fork is full and here are the two numbers"
+            // is the difference between a debuggable limit and `ENOSPC` from the
+            // void, and it says which of the five candidates in
+            // `docs/write-support-progress.md` was actually hit.
+            return self
+                .write_extending(ino, offset, end, data)
+                .inspect_err(|e| {
+                    warn!("inode {ino}: a write past its end at {offset}..{end} was refused: {e}");
+                });
         }
 
         // Work out where every block of the write lands before writing any of
