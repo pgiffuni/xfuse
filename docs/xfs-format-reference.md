@@ -322,12 +322,49 @@ node and asks for its `runs()`.  A child that is an interior node answers
 `runs()` with "this node holds subtrees, not free runs".  That is the observed
 error's text and the observed error's group.
 
-The caveat is that this site **swallows** that error --
-`.and_then(|n| n.runs())...unwrap_or(false)` -- so it would produce "no leaf of the
-tree holds the run ...", not the message actually seen.  So this is a real defect
-at a real site, and it is *a* suspect for the observed failure, but it is not
-established as **the** site.  Something on the propagating path reads a non-leaf's
-records without swallowing, and finding it is the next measurement.
+**The site is found, and it is not that one.**  `take_in_tree`'s own length-ordered
+search does swallow the error (`.and_then(|n| n.runs())...unwrap_or(false)`), so it
+would report "no leaf of the tree holds the run ...".  The propagating read is one
+level up, in `child_for` -- the helper `take_in_tree` uses for the block-ordered
+descent, which **also** handles the length-ordered case internally:
+
+```rust
+Order::ByLength => {
+    let mut found = None;
+    for (i, child) in children.iter().enumerate() {
+        if read_node(blocks, geometry, *child)?
+            .runs()?                       // <-- propagates
+            .iter()
+            .any(|r| r.start == start)
+        { found = Some(i); break; }
+    }
+    ...
+}
+```
+
+**MEASURED.** Making `runs()` report the offending node identified it exactly:
+
+```text
+group 3: this node holds subtrees, not free runs: level=1 numrecs=28
+```
+
+A **level-1 node with 28 records** -- a child of group 3's level-2 root, read as a
+leaf. The other propagating `runs()` call sites are all guarded by `is_leaf()`
+(`take_from_run`, `covers_range`, `containing_run`, `remove_range`), which is why
+the search for this narrowed to the two that were not.
+
+**The defect.** For the length-ordered tree, `child_for` asks each child for its
+*records* to see whether it holds the wanted run. That is only meaningful for a
+**leaf**: an interior node's records are blocks, and reading them as runs is what
+fails. The search has to descend past a non-leaf rather than read it, and it does
+not -- so in any group whose length-ordered root has interior children, this returns
+an error instead of an answer.
+
+**The fix is therefore known** and is narrow: in the `Order::ByLength` branch, when
+a child is **not** a leaf, recurse into it to find the leaf that holds the run, rather
+than asking it for runs. It is *not* implemented here, because an unverified edit to
+the allocator is worse than none -- and the check that it works is exactly the
+all-AG test, which currently stops at group 3 and would then continue.
 
 **The striking part is the root block numbers.** Group 3's bno root is block **609**
 and its first free run is blocks **1-7953** (`freesp -a 3`), so the tree's root
