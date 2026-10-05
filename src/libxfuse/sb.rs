@@ -770,19 +770,20 @@ impl Sb {
         sb
     }
 
-    /// The log's first block, and how many blocks it spans.
+    /// The log's first block and how many blocks it spans, **from `sb_logstart`**.
     ///
-    /// The log is 2 MiB by default and sits inside a group, and **it is not file
-    /// system structure**: its contents are a function of what was logged and in what
-    /// order, not of what the file system contains.  Anything comparing two images
-    /// has to exclude it, or every modification looks like 2048 changed blocks --
-    /// which is what it took to work out here, four commits and five mounts after a
-    /// `grep` in the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org) would have done it.
+    /// **This does not locate the log**, and that is measured rather than suspected.
+    /// On a 600 MiB image `sb_logstart` is 524295 and `sb_logblocks` is 65536, so
+    /// this returns fsblocks 524295..589831.  The log's magic appears at none of the
+    /// four readings of that field -- as a byte offset, as a 512-byte sector, as a
+    /// 1 KiB block or as a 4 KiB block -- and the blocks that do carry the magic sit
+    /// at 307290..372489, which is outside the range entirely.
     ///
-    /// `XLOG_HEADER_MAGIC_NUM` (`0xFEEDBABE`) is written at the start of every log
-    /// block, which is both how the log is identified and how it is checked: a range
-    /// whose blocks all carry it is the log.
-    #[allow(dead_code)] // Used by the log module's tests, which are themselves ignored.
+    /// So `sb_logstart` is not what this project's measurements should be built on,
+    /// and the name says so.  What locates the log is not yet established here; the
+    /// per-group field is the obvious next candidate, and until it is read this
+    /// function is a **trap for the next person** rather than a helper.
+    #[allow(dead_code)] // Wrong, and documented as wrong; see above.
     pub fn log_blocks(&self) -> std::ops::Range<u64> {
         self.sb_logstart..self.sb_logstart + u64::from(self.sb_logblocks)
     }

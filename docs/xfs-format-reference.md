@@ -560,6 +560,26 @@ carry `0xFEEDBABE` at offset 0 **is** the log. This is now `Sb::XLOG_HEADER_MAGI
 and `Sb::log_blocks()` returns the range from the superblock — `sb_logstart` was being
 read and thrown away, which is why this had to be found by hand.
 
+**`sb_logstart` does not locate the log, and that is measured.** On a 600 MiB image
+it reads 524295 with `sb_logblocks` 65536, and the log's magic appears at **none** of
+the four readings of that field — as a byte offset, as a 512-byte sector, as a 1 KiB
+block, or as a 4 KiB block. The blocks that do carry the magic sit at 307290–372489,
+outside the range it implies. So `Sb::log_blocks()` is wrong, is documented as wrong,
+and is the next thing to replace: the per-group field is the obvious candidate.
+
+### The magic marks a record, not the extent
+
+This is the part that is easy to get backwards, and I had it backwards.
+
+**MEASURED.** On a 600 MiB image, 4499 blocks carry the magic, the first at fsblock
+307290 and the last at 372489, and the longest **contiguous run is three blocks**. On
+a 1 GiB image, one modification changed 2048 *consecutive* magic-bearing blocks.
+
+So the magic is a property of what a block **holds** — a log record header — and a log
+whose blocks are mostly continuation data shows as almost no runs at all. It is a good
+thing to **verify** a region against and a bad thing to **derive** one from: a mask
+found by searching for the magic is right on one image and undetectable on another.
+
 **MEASURED, and it does not generalise — the previous statement here was too
 strong.** On a 1 GiB image with 1 KiB blocks, one modification changed **2048
 consecutive blocks**, all carrying the magic, at fsblocks 524299–526346. On a

@@ -278,64 +278,47 @@ impl XlogOpHeader {
 mod tests {
     use super::*;
 
-    /// The log in a real image is identified by its magic, and that is the only
-    /// reason this project can exclude it from a comparison without having been told
-    /// where it is.
+    /// The magic identifies a log **record**, not the log's extent.
     ///
-    /// **FAILS, and the failure is the finding.**  `sb_log_blocks()` on
-    /// `xfs1024.img` names fsblocks 524295-65535, and the first 65536 of them do
-    /// **not** carry `XLOG_HEADER_MAGIC_NUM` -- they read zero.  On the 1 GiB image
-    /// the magic *is* present from fsblock 524299 onwards.  So either `sb_logstart`
-    /// is not a file system block number -- it may be a sector, or an offset into
-    /// the log area -- or the log has uninitialised blocks before its first record.
+    /// Measured on a 600 MiB image: 4499 blocks carry it, the first at fsblock
+    /// 307290 and the last at 372489, and the longest contiguous run is **three**.
+    /// On a 1 GiB image one modification changed 2048 consecutive magic-bearing
+    /// blocks.  So the magic is a property of what a block *holds* -- a record header
+    /// -- and a log whose blocks are mostly continuation data shows as almost no
+    /// runs at all.
     ///
-    /// Not resolved: identifying which would need the image read at the granularity
-    /// the two candidate interpretations differ by, and that is the next thing to do
-    /// before any fixture tooling relies on `log_blocks()`.  Until then the
-    /// measurement in `docs/xfs-format-reference.md` -- the magic found
-    /// empirically at 524299 -- is the one to trust, and `log_blocks()` is not.
+    /// Which means it is a good thing to **verify** a region against and a bad thing
+    /// to **derive** one from.
     #[test]
-    #[ignore = "sb_logstart does not land on the log's magic on xfs1024.img; unresolved"]
-    fn a_log_is_a_run_of_blocks_that_all_carry_the_magic() {
+    fn the_magic_is_a_property_of_a_records_contents_not_of_the_logs_extent() {
         let Some(path) = crate::libxfuse::alloc::golden("xfs1024.img") else {
             eprintln!("skipping: no unpacked xfs1024.img");
             return;
         };
-        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let whole = std::fs::File::open(&path).unwrap();
+        let mut reader = std::io::BufReader::new(whole.try_clone().unwrap());
         let sb = crate::libxfuse::sb::Sb::from(&mut reader);
         let bs = sb.sb_blocksize as usize;
         let whole = std::fs::read(&path).expect("reading the image");
-
-        let range = sb.log_blocks();
-        assert!(
-            range.end > range.start,
-            "the superblock names a log of {} blocks",
-            range.end - range.start
-        );
-
-        // Every block the superblock names as log must carry the magic, or the
-        // identification this project relies on is wrong.
-        let mut bad = Vec::new();
-        for fsb in range.clone() {
-            let at = fsb as usize * bs;
-            let magic = u32::from_be_bytes(whole[at..at + 4].try_into().unwrap());
-            if magic != XLOG_HEADER_MAGIC_NUM {
-                bad.push((fsb, magic));
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut n = 0usize;
+        for blk in 0..whole.len() / bs {
+            let at = blk * bs;
+            if u32::from_be_bytes(whole[at..at + 4].try_into().unwrap()) == XLOG_HEADER_MAGIC_NUM {
+                n += 1;
+                match runs.last_mut() {
+                    Some(last) if last.1 + 1 == blk => last.1 = blk,
+                    _ => runs.push((blk, blk)),
+                }
             }
         }
+        assert!(n > 0, "no block carries the log magic at all");
+        let longest = runs.iter().map(|(a, b)| b - a + 1).max().unwrap();
         assert!(
-            bad.is_empty(),
-            "{} of {} blocks the superblock names do not carry the magic, first {:?}",
-            bad.len(),
-            range.end - range.start,
-            &bad[..bad.len().min(3)]
+            longest < 64,
+            "the magic forms runs of {longest} blocks, which would mean it does mark the extent"
         );
-        eprintln!(
-            "log: {} blocks of {} bytes at fsblock {}",
-            range.end - range.start,
-            bs,
-            range.start
-        );
+        eprintln!("{n} blocks carry the magic; longest contiguous run {longest}");
     }
 
     /// A block that is not a log record must be refused rather than have its
@@ -381,5 +364,66 @@ mod tests {
         assert!(!h.is_committed());
         op[9] = XLOG_COMMIT_TRANS;
         assert!(XlogOpHeader::decode(&op).unwrap().is_committed());
+    }
+}
+
+#[cfg(test)]
+mod locate {
+    use super::XLOG_HEADER_MAGIC_NUM;
+
+    /// Where does `sb_logstart` actually point?
+    ///
+    /// Three candidates, and they differ by exactly the factors that make this worth
+    /// asking: a **file system block**, a **512-byte sector**, and a **byte offset**.
+    /// For an image with 1 KiB blocks the three are all different numbers, and only
+    /// one of them is a place the magic is at.
+    ///
+    /// Run with `--nocapture`; it prints and always passes, because it is a
+    /// measurement rather than a check until the answer is agreed.
+    #[test]
+    fn print_where_the_log_start_field_points() {
+        let Some(path) = crate::libxfuse::alloc::golden("xfs1024.img") else {
+            eprintln!("skipping: no unpacked xfs1024.img");
+            return;
+        };
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let sb = crate::libxfuse::sb::Sb::from(&mut reader);
+        let bs = sb.sb_blocksize as usize;
+        let whole = std::fs::read(&path).expect("reading the image");
+        let ls = sb.sb_logstart;
+        let magic_at = |off: usize| -> bool {
+            off + 4 <= whole.len()
+                && u32::from_be_bytes(whole[off..off + 4].try_into().unwrap())
+                    == XLOG_HEADER_MAGIC_NUM
+        };
+
+        eprintln!(
+            "blocksize {bs}, sb_logstart {ls}, sb_logblocks {}",
+            sb.sb_logblocks
+        );
+        for (what, byte) in [
+            ("as a byte offset", ls as usize),
+            ("as a 512-byte sector", (ls as usize) * 512),
+            ("as a 1 KiB block", (ls as usize) * bs),
+            ("as a 4 KiB block", (ls as usize) * 4096),
+        ] {
+            eprintln!("  {what:<20} -> byte {byte}: magic {}", magic_at(byte));
+        }
+        // And where the magic actually is, first and last block in the image that
+        // carry it, so the three candidates above can be judged.
+        let mut first = None;
+        let mut last = 0usize;
+        let mut n = 0usize;
+        for blk in 0..whole.len() / bs {
+            if magic_at(blk * bs) {
+                first.get_or_insert(blk);
+                last = blk;
+                n += 1;
+            }
+        }
+        eprintln!(
+            "  {n} blocks carry the magic; first {:?}, last {last}",
+            first.unwrap_or(0)
+        );
     }
 }
