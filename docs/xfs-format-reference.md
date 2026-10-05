@@ -575,9 +575,28 @@ This is the part that is easy to get backwards, and I had it backwards.
 307290 and the last at 372489, and the longest **contiguous run is three blocks**. On
 a 1 GiB image, one modification changed 2048 *consecutive* magic-bearing blocks.
 
-So the magic is a property of what a block **holds** — a log record header — and a log
-whose blocks are mostly continuation data shows as almost no runs at all. It is a good
-thing to **verify** a region against and a bad thing to **derive** one from: a mask
+So the superblock puts the log at fsblocks 524295-589831 on that image, and the
+magic-bearing blocks are at 307290-372489 — **disjoint**. On this image the magic is
+*not* marking the log's blocks, which defeats the record-header explanation, and the
+field that should locate the log does not lead there either.
+
+There is no per-group log field to fall back on: the published structures carry
+`sb_logstart` and `sb_logblocks` and nothing else. So the superblock is the only
+place the log's location is recorded, and on this image it does not lead to the magic.
+
+So the identification is **withdrawn, not narrowed**. `0xFEEDBABE` is most likely a
+different structure's marker, or the conventional "uninitialised" sentinel other
+formats use -- which would make it a poor thing to have based an identification on,
+and it is one.
+
+**Nothing in this project should mask anything on a magic search until that is
+settled.** The safe direction is the reverse: read a region's blocks and check them
+against whatever identifies them.
+
+The one thing still standing from those measurements is the useful negative, because
+it was taken on the same image in both directions and does not depend on locating the
+log: **a mount of a pristine image changes nothing**, and **a modification's
+in-place metadata is invisible until the log is applied.**
 found by searching for the magic is right on one image and undetectable on another.
 
 **MEASURED, and it does not generalise — the previous statement here was too
