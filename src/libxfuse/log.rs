@@ -278,47 +278,45 @@ impl XlogOpHeader {
 mod tests {
     use super::*;
 
-    /// The magic identifies a log **record**, not the log's extent.
+    /// A pristine image's log has never been written, so the region the superblock
+    /// names is entirely zero.
     ///
-    /// Measured on a 600 MiB image: 4499 blocks carry it, the first at fsblock
-    /// 307290 and the last at 372489, and the longest contiguous run is **three**.
-    /// On a 1 GiB image one modification changed 2048 consecutive magic-bearing
-    /// blocks.  So the magic is a property of what a block *holds* -- a record header
-    /// -- and a log whose blocks are mostly continuation data shows as almost no
-    /// runs at all.
-    ///
-    /// Which means it is a good thing to **verify** a region against and a bad thing
-    /// to **derive** one from.
+    /// Which sounds like nothing and is actually the invariant that makes the magic
+    /// usable: it is why a **magic search is the way to check this region, and not
+    /// the way to find it.**  These golden images have never been written, so their
+    /// logs are empty, and searching one for the magic finds nothing in the log and
+    /// several thousand unrelated blocks elsewhere -- which reads exactly like "the
+    /// magic is not the log", and is not.
     #[test]
-    fn the_magic_is_a_property_of_a_records_contents_not_of_the_logs_extent() {
+    fn an_unwritten_images_log_is_empty_rather_than_full_of_magic() {
         let Some(path) = crate::libxfuse::alloc::golden("xfs1024.img") else {
             eprintln!("skipping: no unpacked xfs1024.img");
             return;
         };
-        let whole = std::fs::File::open(&path).unwrap();
-        let mut reader = std::io::BufReader::new(whole.try_clone().unwrap());
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
         let sb = crate::libxfuse::sb::Sb::from(&mut reader);
         let bs = sb.sb_blocksize as usize;
         let whole = std::fs::read(&path).expect("reading the image");
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        let mut n = 0usize;
-        for blk in 0..whole.len() / bs {
-            let at = blk * bs;
+        let range = sb.log_blocks();
+        assert!(
+            range.end > range.start,
+            "the superblock names no log at all"
+        );
+
+        let mut with_magic = 0usize;
+        for fsb in range.clone() {
+            let at = fsb as usize * bs;
             if u32::from_be_bytes(whole[at..at + 4].try_into().unwrap()) == XLOG_HEADER_MAGIC_NUM {
-                n += 1;
-                match runs.last_mut() {
-                    Some(last) if last.1 + 1 == blk => last.1 = blk,
-                    _ => runs.push((blk, blk)),
-                }
+                with_magic += 1;
             }
         }
-        assert!(n > 0, "no block carries the log magic at all");
-        let longest = runs.iter().map(|(a, b)| b - a + 1).max().unwrap();
-        assert!(
-            longest < 64,
-            "the magic forms runs of {longest} blocks, which would mean it does mark the extent"
+        assert_eq!(
+            with_magic, 0,
+            "an image that has never been written has a log with no records in it, so no block of \
+             it should carry a record header; {} do, which means either the image has been \
+             written or `log_blocks()` is wrong",
+            with_magic
         );
-        eprintln!("{n} blocks carry the magic; longest contiguous run {longest}");
     }
 
     /// A block that is not a log record must be refused rather than have its

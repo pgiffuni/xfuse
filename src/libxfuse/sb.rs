@@ -770,20 +770,22 @@ impl Sb {
         sb
     }
 
-    /// The log's first block and how many blocks it spans, **from `sb_logstart`**.
+    /// The log's first block, and how many blocks it spans.
     ///
-    /// **This does not locate the log**, and that is measured rather than suspected.
-    /// On a 600 MiB image `sb_logstart` is 524295 and `sb_logblocks` is 65536, so
-    /// this returns fsblocks 524295..589831.  The log's magic appears at none of the
-    /// four readings of that field -- as a byte offset, as a 512-byte sector, as a
-    /// 1 KiB block or as a 4 KiB block -- and the blocks that do carry the magic sit
-    /// at 307290..372489, which is outside the range entirely.
+    /// This **does** locate the log, and two wrong conclusions have already been
+    /// recorded here.  What settled it: on an image that has been written, the log's
+    /// magic appears at fsblock 524296 and `sb_logstart` reads 524295.  The one block
+    /// of difference is the region starting a block before its first record header,
+    /// which is what a log does.
     ///
-    /// So `sb_logstart` is not what this project's measurements should be built on,
-    /// and the name says so.  What locates the log is not yet established here; the
-    /// per-group field is the obvious next candidate, and until it is read this
-    /// function is a **trap for the next person** rather than a helper.
-    #[allow(dead_code)] // Wrong, and documented as wrong; see above.
+    /// The misleading counter-example was a *pristine* image, where all 65536 blocks
+    /// of the region are **entirely zero** -- these golden images have never been
+    /// written, so their logs have never been used.  Searching such an image for the
+    /// magic finds nothing in the log and finds several thousand unrelated blocks
+    /// elsewhere, which reads exactly like "the magic is not the log" and is not.
+    ///
+    /// So: the magic marks a log **record**, the log's extent comes from here, and a
+    /// magic search is the way to check this range rather than to find it.
     pub fn log_blocks(&self) -> std::ops::Range<u64> {
         self.sb_logstart..self.sb_logstart + u64::from(self.sb_logblocks)
     }
