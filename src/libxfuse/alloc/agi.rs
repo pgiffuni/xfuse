@@ -391,3 +391,66 @@ mod t {
         );
     }
 }
+
+#[cfg(test)]
+mod measurement {
+    use crate::libxfuse::{alloc::agi::Agi, sb::Sb};
+
+    /// What one file creation does to a group inode, read through **this**
+    /// decoder rather than out of a hex dump.
+    ///
+    /// Driven by `XFUSE_A` and `XFUSE_C` -- before and after -- because the images
+    /// live outside the repository.  Prints rather than asserts: it is a
+    /// measurement, and the assertion that belongs on the result is the one to
+    /// write once the answer is known.
+    ///
+    /// Doing it this way is the point.  A six-block diff has been read by hand four
+    /// times in this project's documents and misread most of those times; the
+    /// offsets here come from the table at the top of this file.
+    #[test]
+    fn report_what_one_file_creation_did_to_a_group_inode() {
+        let (pa, pc) = match (std::env::var("XFUSE_A"), std::env::var("XFUSE_C")) {
+            (Ok(a), Ok(c)) => (a, c),
+            _ => {
+                eprintln!("skipping: XFUSE_A and XFUSE_C are not both set");
+                return;
+            }
+        };
+        let mut rb = std::io::BufReader::new(std::fs::File::open(&pa).unwrap());
+        let (a, c) = (
+            std::fs::read(&pa).expect("reading the before image"),
+            std::fs::read(&pc).expect("reading the after image"),
+        );
+        let sb = Sb::from(&mut rb);
+        let bs = sb.sb_blocksize as usize;
+
+        // Blocks 4 and 5 changed identically, which is the signature of the two
+        // copies XFS writes of the group inode.  Block 1 is included because it
+        // changed too and should say so.
+        for blk in [1usize, 4, 5] {
+            let (x, y) = (&a[blk * bs..(blk + 1) * bs], &c[blk * bs..(blk + 1) * bs]);
+            if x == y {
+                eprintln!("block {blk}: unchanged");
+                continue;
+            }
+            match (
+                Agi::from_bytes(x.to_vec(), sb.has_crc()),
+                Agi::from_bytes(y.to_vec(), sb.has_crc()),
+            ) {
+                (Ok(p), Ok(q)) => eprintln!(
+                    "block {blk}: AGI -- inodes {} -> {}, free {} -> {}, next_ino {} -> {}",
+                    p.inode_count(),
+                    q.inode_count(),
+                    p.free_inodes(),
+                    q.free_inodes(),
+                    p.next_ino(),
+                    q.next_ino()
+                ),
+                (Ok(_), Err(e)) | (Err(e), Ok(_)) => {
+                    eprintln!("block {blk}: one side does not decode as a group inode: {e}")
+                }
+                (Err(x), Err(y)) => eprintln!("block {blk}: neither decodes: {x} / {y}"),
+            }
+        }
+    }
+}

@@ -712,6 +712,18 @@ twice for redundancy, so two identically-changed blocks is the signature of the 
 copies of one structure. Block 0 is the superblock. Blocks 32 and 35 are larger and
 are most likely the b-tree nodes the new inode's chunk record lives in.
 
+**The artefacts behind this are gone, and that is worth knowing.**  Every image
+compared here was built under `/tmp` — a 1 GiB prototype filesystem, and copies of
+it taken at each stage — and `/tmp` in this container has been cleaned three times
+during one session.  So these numbers are **recorded, not re-runnable**, and the
+measurements below rest on them in a way a reader cannot check.  The golden images in
+`target/tmp` are untouched and still usable; what is gone is the *before and after*
+pair, which cannot be reconstructed without redoing the native mutations.
+
+That is an argument for keeping fixture pairs somewhere durable, not in a scratch
+directory, and it is the one thing about tonight's method that would not survive a
+reboot.
+
 **Not decoded, and deliberately.** The offsets were read out by hand and this
 document has four retracted hand-readings in it already. Naming which field is at
 which offset from a hex dump is exactly the mistake, and the answer is in the
