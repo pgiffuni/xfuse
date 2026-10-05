@@ -1363,7 +1363,7 @@ pub fn allocate(
 /// cannot be checked by inspecting structs: that an allocation comes out the
 /// other end of a transaction as a coherent change.
 #[cfg(test)]
-mod t {
+pub(crate) mod t {
     use std::{
         io::{Read as _, Write as _},
         os::unix::fs::FileExt as _,
@@ -1668,7 +1668,7 @@ mod t {
     /// a filter that has been written out many times is a filter that has
     /// drifted.  A test that checks an image is a file system is only as good
     /// as this, so it lives here and new tests use it.
-    fn repair_complaints(image: &std::path::Path) -> Option<String> {
+    pub(crate) fn repair_complaints(image: &std::path::Path) -> Option<String> {
         let output = Command::new("xfs_repair")
             .arg("-n")
             .arg(image)

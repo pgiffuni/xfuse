@@ -690,6 +690,63 @@ impl RawDinode {
     /// B+tree's records live in its own blocks and rewriting them here would
     /// throw the tree away.
     #[allow(dead_code)] // Used as soon as a file's extents are changed.
+    /// Write a **local** data fork: `data` verbatim, starting at the fork.
+    ///
+    /// The counterpart to `set_core_extents`, and the reason a directory can be
+    /// written at all: a shortform directory's entries are *literal bytes in the
+    /// inode*, and until this existed nothing in this file could put bytes there --
+    /// `set_core_extents` writes extent records, `set_data_extents_as_tree` writes a
+    /// b-tree root, and both start at `literal_area_offset()` without ever writing
+    /// the fork itself.
+    ///
+    /// What it does to the rest of the inode, and why each is right:
+    ///
+    /// * `core.size` becomes the length of the data, because for a local fork the
+    ///   size *is* the byte length of the contents.  Measured on native images: an
+    ///   empty shortform directory is 6 bytes, one entry takes it to 15, four to 44.
+    /// * The rest of the fork is **zeroed**, not left alone.  A shortform directory
+    ///   that shrinks leaves the tail of the old contents behind, and a reader that
+    ///   trusts `core.size` will not look at it -- but a future grow will, and
+    ///   `xfs_repair` reads what is there.
+    /// * `di_nextents` and `di_nblocks` go to **zero**.  A local fork has no extents
+    ///   and occupies no blocks; every native image measured reports both as 0 for a
+    ///   `core.format = 1` inode.
+    ///
+    /// It refuses, rather than truncating, if the data does not fit: a shortform
+    /// directory that outgrows its inode is the transition this project has not
+    /// built, and quietly writing a prefix of it would produce a directory that
+    /// `xfs_repair` accepts and that has silently lost entries.
+    pub fn set_data_bytes(&mut self, data: &[u8]) -> FsResult<()> {
+        if self.format() != 1 {
+            return Err(FsError::unsupported(format!(
+                "writing literal data into a data fork in format {}",
+                self.format()
+            )));
+        }
+        let start = self.literal_area_offset();
+        let limit = self.attribute_fork_offset().unwrap_or(self.bytes.len());
+        if data.len() > limit.saturating_sub(start) {
+            return Err(FsError::fork_full(format!(
+                "a {} byte inode has {} bytes of local data fork and this needs {}",
+                self.bytes.len(),
+                limit.saturating_sub(start),
+                data.len()
+            )));
+        }
+        for b in &mut self.bytes[start..limit] {
+            *b = 0;
+        }
+        self.bytes[start..start + data.len()].copy_from_slice(data);
+        self.set_size(data.len() as XfsFsize);
+        self.set_nblocks(0);
+        if self.nrext64() {
+            BigEndian::write_u64(&mut self.bytes[offset::NEXTENTS..], 0);
+        } else {
+            BigEndian::write_u32(&mut self.bytes[offset::NEXTENTS32..], 0);
+        }
+        Ok(())
+    }
+
     pub fn set_core_extents(&mut self, extents: &[BmbtRec]) -> FsResult<()> {
         if self.format() != 2 {
             return Err(FsError::unsupported(format!(
@@ -1613,5 +1670,103 @@ mod t {
         BigEndian::write_u16(&mut bytes[offset::MAGIC..], XFS_DINODE_MAGIC);
         bytes[offset::VERSION] = 3;
         assert!(RawDinode::from_bytes(bytes).is_err());
+    }
+}
+
+#[cfg(test)]
+mod local_fork_tests {
+    use std::io::{Read as _, Write as _};
+
+    use super::RawDinode;
+    use crate::libxfuse::{
+        block_device::{Access, BlockDevice},
+        sb::Sb,
+    };
+
+    /// A local data fork can be written, and native XFS accepts the result.
+    ///
+    /// The primitive namespace mutation is blocked on.  Nothing in this codebase
+    /// could put **literal bytes** into an inode's data fork: `set_core_extents`
+    /// writes extent records, `set_data_extents_as_tree` writes a b-tree root, and
+    /// both begin at `literal_area_offset()` without ever writing the fork itself.
+    /// A shortform directory is nothing but literal bytes.
+    ///
+    /// The bytes are a **real** native shortform directory's -- the `sf` directory
+    /// of `xfsv4.img`, which is version 4, has no `ftype`, and stores its parent as
+    /// a 32-bit number:
+    ///
+    /// ```text
+    /// header  count=2 i8count=0 parent=32
+    /// entry   b    offset 48  inumber 36
+    /// entry   a    offset 64  inumber 37
+    /// ```
+    ///
+    /// measured from that image and confirmed against `xfs_db`, which prints
+    /// `core.size = 44` and inodes 36 and 37 for those entries.  So this is not
+    /// xfuse checked against xfuse: a directory XFS produced is written back by
+    /// this code and then judged by `xfs_repair`.
+    #[test]
+    fn a_local_data_fork_can_be_written() {
+        let fork: Vec<u8> = vec![
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x20, // count 2, i8count 0, parent 32
+            0x01, 0x00, 0x30, 0x62, 0x01, 0x00, 0x00, 0x00, 0x24, // b: off 48, ino 36
+            0x01, 0x00, 0x40, 0x61, 0x01, 0x00, 0x00, 0x00, 0x25, // a: off 64, ino 37
+        ];
+        assert_eq!(fork.len(), 24, "the fixture is the length it claims");
+
+        let Some(path) = crate::libxfuse::alloc::golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let mut copy = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut src = std::fs::File::open(&path).unwrap();
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = src.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                copy.write_all(&buf[..n]).unwrap();
+            }
+        }
+        copy.flush().unwrap();
+
+        let device = BlockDevice::open(copy.path(), Access::ReadWrite).unwrap();
+        let sb = Sb::from(&mut std::io::BufReader::new(
+            std::fs::File::open(copy.path()).unwrap(),
+        ));
+
+        // The `sf` directory is inode 35 in that image.
+        let at = sb.inode_offset(35);
+        let mut bytes = vec![0u8; sb.inode_size()];
+        device.read_at(&mut bytes, at).expect("reading the inode");
+        let mut raw = RawDinode::from_bytes(bytes).expect("an inode");
+        assert_eq!(raw.format(), 1, "the fixture inode is a local fork");
+
+        raw.set_data_bytes(&fork)
+            .expect("writing a local data fork");
+        assert_eq!(
+            raw.size() as u64,
+            fork.len() as u64,
+            "size follows the data"
+        );
+        assert_eq!(raw.nblocks(), 0, "a local fork occupies no blocks");
+        raw.finalise();
+        device
+            .write_at(raw.as_bytes(), at)
+            .expect("writing the inode back");
+        device.flush().expect("flushing");
+
+        // `repair_complaints` hands back `Some` whenever it could run the tool at
+        // all, so an **empty** string is repair being happy; only a non-empty one is
+        // a complaint.
+        match crate::libxfuse::alloc::allocator::t::repair_complaints(copy.path()) {
+            Some(ref c) if !c.is_empty() => {
+                panic!("xfs_repair rejected a written local data fork:\n{c}")
+            }
+            Some(_) => {}
+            None => eprintln!("SKIPPED ORACLE CHECK: no xfs_repair to judge the image with"),
+        }
     }
 }
