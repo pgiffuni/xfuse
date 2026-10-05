@@ -149,7 +149,63 @@ the shortform and `xfs_db` will report `core.format = 1`.
 stored even with no entries -- which the format's 6-byte minimum implies and which a
 writer must reproduce rather than assume.
 
-What is **not** done: the entry layout has not been read off these bytes.  The raw
+### The shortform layout, measured from native bytes
+
+With the kernel mounting a native image (`mkfs.xfs -p` prototype, then a real
+`touch` under `mount -o loop`), the entry layout is read directly:
+
+```text
+header  6 bytes   count u8, i8count u8, parent (u32 when i8count is 0)
+entry   8 + namelen   namelen u8, offset u16, name[namelen], ftype u8, inumber u32
+```
+
+Cross-checks that make this solid rather than plausible:
+
+* `d0`, an empty directory, is **exactly 6 bytes**: `000000000020`.
+* `d1`'s single entry decodes to inumber **1572896**, which is `d1`'s own inode.
+* `sf3` decodes to inodes 68, 69 for `b` and `a`, which are theirs.
+* My local `hashname` reproduces native hashes exactly: `a`=0x61, `b`=0x62,
+  `mmm`=0x001b76ed — all three matching `xfs_db`.
+* Entries are in **descending hash order**: `x` (0x78) was inserted between `b`
+  (0x62) and `mmm` (0x1b76ed) exactly as its hash implies, and `core.size` grew by
+  exactly the entry's size (24 -> 35 for "mmm", 9 and 11 bytes).
+
+**`ftype` is present**, so my earlier inference that these filesystems lack it was
+wrong -- I had assumed an 8-byte header, and with 6 the arithmetic closes exactly.
+
+### The offset field is NOT a byte position, and an experiment of mine said so
+
+I claimed the stored `offset` is the entry's byte position times 8.  Three data
+points fitted it.  The middle-insertion experiment refuted it:
+
+```text
+ byte pos   stored off   /8   name
+        6           96   12   'b'
+       15          112   14   'a'
+       24          128   16   'mmm'
+       35          144   18   'x'
+```
+
+The byte positions advance by 9, 9 and 11; the stored offsets advance by **16
+every time**, and `stored / 8` is 12, 14, 16, 18 -- which are the offsets `xfs_db`
+prints.  So the field is neither a byte position nor a fixed unit of one: it is a
+**running count in 8-byte units that does not track how long the entries actually
+are**, since `mmm` is two bytes longer than `a` yet advances the counter by the
+same step.
+
+**What this means for a writer, and what is still unknown.**  If the counter is a
+running count rather than a position, inserting in the middle may leave the
+following entries' offsets untouched -- which would make insertion O(1) instead of a
+renumbering pass.  The diff of that mutation is the next thing to read: it shows
+whether `b` and `a` kept 96 and 112 or were rewritten.  **Until that is read the
+offset field's meaning is open, and no writer should be written against either
+reading.**  My "× 8 byte position" claim is withdrawn.
+
+A second correction: `literal_area_offset` for a 512-byte v5 inode is **176**, not
+the 184 I estimated from the struct definition.  Measured, not derived.
+
+What is **not** done: nothing here needs re-deriving now, but the offset field is
+still unresolved.  The raw
 forks were captured (they are short enough to do by hand) and the first attempt to
 reconcile them with an assumed layout did **not** add up -- the sizes are 6, 15, 33,
 85, and a header of `count(1) + i8count(1) + parent(4)` with an entry of
