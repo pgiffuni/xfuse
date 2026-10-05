@@ -57,10 +57,29 @@ writes a b-tree root; both start at `literal_area_offset()`, but nothing writes
 
 ## What is not established
 
-* **Individual inode allocation from an existing chunk.** `allocate_new_chunk` exists
-  and is tested; `Agi::free_inodes` exists. Whether a free inode can be claimed from
-  an existing chunk was **not** confirmed by reading, and it is a prerequisite for
-  `create()`.
+* **Individual inode allocation from an existing chunk — ANSWERED, and it does not
+  exist.** `alloc/inobt.rs` can *discover* free inodes (`first_free_ino`,
+  `ChunkRecord::free_inos`) and `Agi::free_inodes` counts them, and
+  `allocate_new_chunk` + `insert_chunk` can create a whole new chunk. Nothing can
+  **claim** one: there is no writer for a chunk's free mask anywhere in the file, no
+  code that decrements a chunk's free count, and the only occurrence of `freecount`
+  in the module is inside a comment showing the record layout.
+
+  So `create()` has a real prerequisite, and it is four operations that must move
+  together or not at all:
+
+  ```text
+  clear the chunk's free bit for one inode
+  decrement that chunk's free count
+  decrement the AGI's free inode count
+  decrement the file system's free inode count
+  ```
+
+  plus initialising the inode itself and inserting it. Every one of those counters is
+  one `xfs_repair` cross-checks, so a partial version produces an image that repair
+  either accepts with a silently wrong count or refuses outright — and "accepts" is
+  the more dangerous of the two, because it is the one that would not be noticed.
+
 * **Inode reclamation.** No free/reclaim entry point was found.
 * **Inode number encoding on disk** — whether an inode's number lives in the inode at
   all, or only in its directory entry. `set_ino` patches a synthesised entry, which
