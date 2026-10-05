@@ -80,6 +80,47 @@ writes a b-tree root; both start at `literal_area_offset()`, but nothing writes
   either accepts with a silently wrong count or refuses outright — and "accepts" is
   the more dangerous of the two, because it is the one that would not be noticed.
 
+* **The chunk record's own layout -- DOCUMENTED**, and it contains a trap worth
+  naming before anyone writes to one.  `xfs_inobt_rec_t` is 16 bytes:
+
+  ```c
+  typedef struct xfs_inobt_rec {
+      __be32  ir_startino;                              /*  0 */
+      union {
+          struct { __be32 ir_freecount; } f;            /*  4: four bytes */
+          struct {
+              __be16  ir_holemask;                      /*  4: two bytes  */
+              __u8    ir_count;                         /*  6 */
+              __u8    ir_freecount;                     /*  7: ONE byte  */
+          } sp;
+      } ir_u;
+      __be64  ir_free;                                  /*  8: the mask   */
+  } xfs_inobt_rec_t;
+  ```
+
+  **A sparse chunk keeps its free count in a single byte**, sharing those four
+  bytes with a hole mask and a total count.  A writer that always writes
+  `freecount` as a `u32` at offset 4 corrupts every inode chunk on a
+  sparse-metadata filesystem -- and only those, which is what makes it the kind of
+  bug that passes every test in this repository and fails on the first real-world
+  image.  `count_agrees()` already validates `freecount == popcount(free_mask)` for
+  normal chunks, which matches this header; what is missing is a writer that
+  respects the width.
+
+  And `ir_free` being a single `__be64` is why a chunk is 64 inodes: the mask is
+  one word, so there is no second word to grow into and no wider form to store.
+
+  So claiming an inode is three operations on the record and one on the group, not
+  four counters and a bit:
+
+  ```text
+  clear that inode's bit in the 8-byte ir_free
+  decrement the chunk's free count, at the width the chunk's kind requires
+  decrement the AGI's free inode count
+  ```
+
+  plus initialising the inode and writing it back.
+
 * **Inode reclamation.** No free/reclaim entry point was found.
 * **Inode number encoding on disk** — whether an inode's number lives in the inode at
   all, or only in its directory entry. `set_ino` patches a synthesised entry, which
