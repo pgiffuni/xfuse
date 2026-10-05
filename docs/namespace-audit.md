@@ -165,3 +165,25 @@ So the cost of tonight's measurements was not ignorance of the format.  It was n
 reading what this repository had already established before measuring it again --
 and then, when the documentation turned out to answer in seconds, not reading the
 documentation either, because the file was already open.
+
+### The kernel does not mount XFS version 4 at all
+
+Found the hard way, after several mount attempts failed with ``bad option, bad
+superblock`` on images `xfs_repair -n` walked end to end without complaint.  The
+kernel says so itself, and `dmesg` is readable without `sudo`:
+
+```text
+XFS (loop0): Deprecated V4 format (crc=0) not supported by kernel.
+```
+
+`versionnum` with the CRC bit clear **is** version 4, and a version 5 file system is
+what the kernel will mount at all.  So:
+
+* every measurement fixture must be built with CRC on, whatever else it disables;
+* ``mount -o loop`` refusing an image is **not** evidence the image is malformed, and
+  is certainly not evidence about the format;
+* and ``mkfs.xfs -m crc=0``, which looks like the conservative choice for a
+  compatibility test, produces an image no ordinary mount will accept.
+
+This cost several attempts here, all of which reported the same unhelpful error for
+a filesystem that was fine.
