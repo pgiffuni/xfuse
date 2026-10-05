@@ -722,7 +722,28 @@ pair, which cannot be reconstructed without redoing the native mutations.
 
 That is an argument for keeping fixture pairs somewhere durable, not in a scratch
 directory, and it is the one thing about tonight's method that would not survive a
-reboot.
+reboot.  It is now addressed: `scripts/mkimg.sh` has `mkfs_allocpair`, which builds
+the **before** half into `resources/` the way the golden images are built, using
+`mkfs.xfs -p` so it needs neither root nor a loop device.  It is commented out of
+the default build, because it is a measurement baseline rather than a golden image.
+
+The **after** half cannot be scripted there, and the reason is the measurement
+itself: the only way to have *native XFS* allocate an inode is to have native XFS
+create the file.  The recipe is:
+
+```text
+cp resources/xfs_allocbase.img /tmp/after.img     # or any durable scratch
+sudo mount -o sync -o loop /tmp/after.img /mnt && touch /mnt/probe && sudo umount /mnt
+sudo mount -o loop /tmp/after.img /mnt && sudo umount /mnt     # apply the log
+
+XFUSE_A=resources/xfs_allocbase.img XFUSE_C=/tmp/after.img \
+    cargo test --bins -- agi::measurement --nocapture
+```
+
+`sync` before the unmount and a **second** mount are both required, and the second
+is the step every measurement in this section originally missed.  `tests/util.rs`'s
+`changed_blocks_excluding_log` masks the log for the block-level view, using the
+superblock's own numbers.
 
 **Not decoded, and deliberately.** The offsets were read out by hand and this
 document has four retracted hand-readings in it already. Naming which field is at

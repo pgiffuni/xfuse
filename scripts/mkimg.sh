@@ -583,6 +583,33 @@ mkfs_writable() {
 	zstd -f resources/xfs_writable.img
 }
 
+# Build a baseline for measuring what one file creation does to a file system.
+#
+# The "before" half is here because it needs nothing: `mkfs.xfs -p` populates a
+# prototype without mounting, so no root and no loop device.  The "after" half does
+# need root, because the only way to have **native XFS** allocate an inode is to
+# have native XFS create the file -- which is the whole point of the measurement.
+# The recipe for that half, and what to do with the two images, is in
+# docs/xfs-format-reference.md.
+#
+# **Put the images in `resources/`, not in /tmp.**  A pair like this was once built
+# under /tmp and the conclusions drawn from it outlived the files by a day, which
+# makes them a claim about a file that no longer exists.  /tmp in a container is
+# scratch and gets cleaned without warning.
+mkfs_allocpair() {
+	mkdir -p /tmp/xfuse-allocpair/dir
+	printf 'hello\n' > /tmp/xfuse-allocpair/a.txt
+	printf 'x' > /tmp/xfuse-allocpair/dir/small.txt
+
+	rm -f resources/xfs_allocbase.img
+	mkfs.xfs --unsupported -f -b size=1024 -i size=512,sparse=0 \
+		-m crc=0,finobt=0,reflink=0,rmapbt=0,bigtime=0 \
+		-d agcount=4,file=1,size=1g \
+		-p /tmp/xfuse-allocpair resources/xfs_allocbase.img
+	rm -rf /tmp/xfuse-allocpair
+	zstd -f resources/xfs_allocbase.img
+}
+
 mkfs_4096
 mkfs_512
 mkfs_v4
@@ -593,3 +620,5 @@ mkfs_nrext64
 mkfs_realtime
 mkfs_xattr_v1
 mkfs_writable
+# Not part of the golden set: a measurement baseline, built on demand.
+# mkfs_allocpair
