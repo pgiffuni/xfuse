@@ -745,6 +745,20 @@ is the step every measurement in this section originally missed.  `tests/util.rs
 `changed_blocks_excluding_log` masks the log for the block-level view, using the
 superblock's own numbers.
 
+**The recipe is verified up to the step that needs root.**  `mkfs_allocpair` was run
+and produces a 1 GiB version 5 image with 1 KiB blocks, 512-byte inodes, four groups
+and root inode 32 -- and, as an unwritten log must, **one** magic-bearing block at
+fsblock 524293.  The measurement test was then pointed at that image as *both* sides
+and reported blocks 1, 4 and 5 unchanged, which is the control every measurement
+needs and had never actually been run before.
+
+What has **not** been verified is the decode: with both sides identical nothing
+differs, so nothing is decoded.  That is the step the two mounts perform.
+
+The baseline is **not committed** -- it is a gigabyte -- which is the other reason it
+is a script rather than a file.  `mkfs_allocpair` commented out of the default
+build is the durable artefact.
+
 **Not decoded, and deliberately.** The offsets were read out by hand and this
 document has four retracted hand-readings in it already. Naming which field is at
 which offset from a hex dump is exactly the mistake, and the answer is in the
