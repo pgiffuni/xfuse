@@ -166,9 +166,39 @@ Cross-checks that make this solid rather than plausible:
 * `sf3` decodes to inodes 68, 69 for `b` and `a`, which are theirs.
 * My local `hashname` reproduces native hashes exactly: `a`=0x61, `b`=0x62,
   `mmm`=0x001b76ed — all three matching `xfs_db`.
-* Entries are in **descending hash order**: `x` (0x78) was inserted between `b`
-  (0x62) and `mmm` (0x1b76ed) exactly as its hash implies, and `core.size` grew by
-  exactly the entry's size (24 -> 35 for "mmm", 9 and 11 bytes).
+* `core.size` grows by exactly the entry's size: 24 -> 35 for "mmm", then 35 -> 44
+  for "x".
+
+### Entries are in INSERTION order -- my "descending hash order" claim is withdrawn
+
+I claimed entries are kept in descending hash order on the strength of `b`(0x62)
+preceding `a`(0x61).  Two insertions refuted it.  The final order is
+
+```text
+  slot  bytepos  name    hash
+     0        6  b     0x00000062
+     1       15  a     0x00000061
+     2       24  mmm   0x001b76ed
+     3       35  x     0x00000078
+```
+
+which is **not** descending.  The kernel **appended both** new entries at the end,
+even though `mmm`'s hash is far larger than either existing entry's and would have
+sorted first had order been maintained.  The initial pair was descending by
+coincidence: `mkfs` builds a prototype directory in sorted order, so the image
+*starts* sorted and the kernel does not keep it that way.
+
+This is the most useful thing the mutations established, and it points the opposite
+way from what I assumed.  A writer that **appends** is O(1) and never renumbers;
+one that hash-inserts must find a position and fix up everything after it.  Native
+behaviour says append -- which also makes the unresolved `offset` field much less
+dangerous, because entries never move.
+
+**Still unresolved and still not to be guessed:** what `offset` *is*.  It advances
+by exactly 16 per entry regardless of entry length (96, 112, 128, 144 while byte
+positions are 6, 15, 24, 35), so it is neither a position nor a length.  Because
+entries are appended and never move, a writer can assign offsets by the same running
+rule and check itself against those four measured values.
 
 **`ftype` is present**, so my earlier inference that these filesystems lack it was
 wrong -- I had assumed an 8-byte header, and with 6 the arithmetic closes exactly.
