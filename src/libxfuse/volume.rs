@@ -1828,3 +1828,84 @@ impl Filesystem for Volume {
         }
     }
 }
+
+#[cfg(test)]
+mod dirent_tests {
+    use std::io::Write as _;
+
+    use super::Volume;
+    use crate::libxfuse::error::FsError;
+
+    /// Inode numbers in `xfsv4.img`, measured with `xfs_db` from its root.
+    const ROOT: u64 = 32;
+    /// `sf` -- shortform, two files.
+    const SF: u64 = 35;
+    /// `block` -- 32 files in one directory block, so **not** shortform.
+    const BLOCK: u64 = 65_568;
+
+    fn open_golden(name: &str) -> Option<(tempfile::NamedTempFile, Volume)> {
+        let golden = crate::libxfuse::alloc::golden(name)?;
+        let mut copy = tempfile::NamedTempFile::new().ok()?;
+        {
+            let mut src = std::fs::File::open(&golden).ok()?;
+            std::io::copy(&mut src, &mut copy).ok()?;
+        }
+        copy.flush().ok()?;
+        let v = Volume::new(copy.path(), None, true).ok()?;
+        Some((copy, v))
+    }
+
+    /// `add_dirent` refuses a directory whose data fork is not shortform.
+    ///
+    /// **Refuses, and writes nothing.**  Block, leaf and node directories are a
+    /// different format; putting a shortform entry into one produces a directory
+    /// `xfs_repair` rejects while it appears to work.  The refusal is `ENOSYS`,
+    /// not `ENOSPC` -- the group may be nearly empty and no retry helps -- and not
+    /// `EINVAL`, which would claim the caller asked for something malformed rather
+    /// than something unimplemented.
+    #[test]
+    fn adding_an_entry_to_a_non_shortform_directory_is_refused() {
+        let Some((_copy, mut v)) = open_golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        assert_ne!(ROOT, BLOCK, "these inodes should be distinct");
+        match v.add_dirent(BLOCK, b"newfile", SF, 1) {
+            Err(FsError::Unsupported { .. }) => {}
+            Err(other) => panic!("wrong error for a non-shortform directory: {other}"),
+            Ok(()) => panic!("adding an entry to a block directory was allowed"),
+        }
+    }
+
+    /// `remove_dirent` refuses a name that is not there, with `ENOENT`.
+    #[test]
+    fn removing_an_entry_that_is_not_there_is_enoent() {
+        let Some((_copy, mut v)) = open_golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        match v.remove_dirent(SF, b"definitely-not-here") {
+            Err(FsError::Invalid { errno, .. }) if errno == libc::ENOENT => {}
+            Err(other) => panic!("wrong error for a missing name: {other}"),
+            Ok(()) => panic!("removing a name that is not there was allowed"),
+        }
+    }
+
+    /// Neither primitive touches a directory whose format it does not handle.
+    ///
+    /// The refusal has to be **before** any write, not after one, because a
+    /// directory mutated in two different formats is worse than one untouched --
+    /// there is no undo at this level, and the transaction commits as a unit.
+    #[test]
+    fn a_refused_operation_leaves_the_image_byte_identical() {
+        let Some((copy, mut v)) = open_golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let before = std::fs::read(copy.path()).expect("reading the image");
+        let _ = v.add_dirent(BLOCK, b"newfile", SF, 1);
+        let _ = v.remove_dirent(SF, b"definitely-not-here");
+        let after = std::fs::read(copy.path()).expect("reading the image");
+        assert_eq!(before, after, "a refused operation modified the image");
+    }
+}
