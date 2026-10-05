@@ -124,9 +124,44 @@ which one has not been established** -- it is on the list for the fixture work,
 because it affects nothing until a writer produces offsets that `xfs_db` and
 `xfuse` must agree about.
 
-What is still missing: fixtures with **zero** entries, with **long** names, and with
-enough entries to approach the shortform capacity, and the controlled native
-addition and removal that shows exactly which bytes change.
+### Fixtures built with native XFS
+
+Built with `mkfs.xfs -p <prototype>`, so **native XFS wrote them** -- 512-byte
+blocks, 256-byte inodes, `crc=0`, matching `xfsv4.img`'s geometry:
+
+| Directory | inode | `core.format` | `core.size` | `core.nblocks` | entries |
+|:----------|:-----|:--------------|:------------|:---------------|:--------|
+| `d0` | 50 | 1 (local) | **6** | 0 | none |
+| `d1` | 1572896 | 1 (local) | **15** | 0 | 1 |
+| `d3` | 1310752 | 1 (local) | **33** | 0 | 3 |
+| `dlong` | 524320 | 1 (local) | **85** | 0 | 1, 68-char name |
+| `dmany` | 35 | **2 (extents)** | 4096 | 8 | 14 |
+
+**`dmany` is the capacity measurement, and it is the most useful result here.**
+Fourteen entries in a 256-byte inode was already too many: native XFS converted it
+to a **block** directory on its own. So the shortform-to-block threshold for this
+geometry is reached between 3 and 14 entries, and "enough entries to approach
+shortform capacity" is answerable — a `dmany` with fewer entries will land inside
+the shortform and `xfs_db` will report `core.format = 1`.
+
+**An empty shortform directory is 6 bytes**, measured: `d0`'s whole data fork is
+`000000000020`, i.e. `count = 0`, `i8count = 0`, `parent = 32`.  So the parent *is*
+stored even with no entries -- which the format's 6-byte minimum implies and which a
+writer must reproduce rather than assume.
+
+What is **not** done: the entry layout has not been read off these bytes.  The raw
+forks were captured (they are short enough to do by hand) and the first attempt to
+reconcile them with an assumed layout did **not** add up -- the sizes are 6, 15, 33,
+85, and a header of `count(1) + i8count(1) + parent(4)` with an entry of
+`namelen(1) + offset(2) + name + inumber(4)` predicts 14, 32 and 84 for `d1`, `d3`
+and `dlong`.  **Every one is exactly one byte short**, which is the kind of signal
+that means a field is being missed rather than that arithmetic is hard, and it is
+precisely the inference the spec forbids.  The next step is to read the layout off
+those bytes -- with an aligned dump, not by counting hex characters.
+
+What is still missing, and is **not** substitutable: the controlled native addition
+and removal that shows exactly which bytes change when an entry is added or
+removed.  `mkfs.xfs -p` builds fixtures; it does not diff a mutation.
 
 ## What the first coding task therefore is
 
