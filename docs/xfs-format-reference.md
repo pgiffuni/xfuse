@@ -555,72 +555,52 @@ inode. `-o sync` did not change that. The metadata was in the log.
 ```
 
 The magic is at the start of **every** log block, which is what makes the log
-identifiable without being told where it is: a contiguous run of blocks that all
-carry `0xFEEDBABE` at offset 0 **is** the log. This is now `Sb::XLOG_HEADER_MAGIC_NUM`,
-and `Sb::log_blocks()` returns the range from the superblock — `sb_logstart` was being
-read and thrown away, which is why this had to be found by hand.
+identifiable without being told where the log is, though only as a **check** and
+not as a way to find it. It is `Sb::XLOG_HEADER_MAGIC_NUM`, and `Sb::log_blocks()`
+returns the range from the superblock — `sb_logstart` used to be read and thrown
+away, which is the only reason finding the log took as long as it did.
 
-**`sb_logstart` does not locate the log, and that is measured.** On a 600 MiB image
-it reads 524295 with `sb_logblocks` 65536, and the log's magic appears at **none** of
-the four readings of that field — as a byte offset, as a 512-byte sector, as a 1 KiB
-block, or as a 4 KiB block. The blocks that do carry the magic sit at 307290–372489,
-outside the range it implies. So `Sb::log_blocks()` is wrong, is documented as wrong,
-and is the next thing to replace: the per-group field is the obvious candidate.
 
-### The magic marks a record, not the extent
+### How the log is located, and a wrong conclusion that took three commits
 
-This is the part that is easy to get backwards, and I had it backwards.
+`Sb::log_blocks()`, from the superblock's `sb_logstart` and `sb_logblocks`, **does**
+locate the log. The decisive pair: on an image that **has been written**, the magic
+appears at fsblock **524296** and `sb_logstart` reads **524295** — one block of
+difference, the region starting a block before its first record header, which is
+what a log does.
 
-**MEASURED.** On a 600 MiB image, 4499 blocks carry the magic, the first at fsblock
-307290 and the last at 372489, and the longest **contiguous run is three blocks**. On
-a 1 GiB image, one modification changed 2048 *consecutive* magic-bearing blocks.
+**The wrong conclusion, kept because it looked entirely reasonable.** Searching a
+*pristine* 600 MiB image for the magic finds 4499 blocks, first at fsblock 307290,
+longest contiguous run **three blocks** — and none of them in the log region. That
+reads as "the magic is not the log". It is not: **all 65536 blocks of the log region
+are entirely zero**, because these golden images have never been written and their
+logs have never been used. A magic search on an unwritten log finds nothing in the log
+and several thousand unrelated blocks elsewhere.
 
-So the superblock puts the log at fsblocks 524295-589831 on that image, and the
-magic-bearing blocks are at 307290-372489 — **disjoint**. On this image the magic is
-*not* marking the log's blocks, which defeats the record-header explanation, and the
-field that should locate the log does not lead there either.
+So the settled version:
+
+* the magic marks a log **record**, not the log's extent;
+* the extent comes from the superblock;
+* a magic search is how to **check** this region, and is **not** how to find it.
+
+The invariant the false conclusion obscured is what makes the check possible, and is
+now a test: *an unwritten image's log is empty, so no block of it carries a record
+header* (`an_unwritten_images_log_is_empty_rather_than_full_of_magic`). It replaced a
+test asserting the magic does **not** form long runs — true of where the magic was
+found, false of why, and it would have failed the moment anyone located the log
+properly.
 
 There is no per-group log field to fall back on: the published structures carry
-`sb_logstart` and `sb_logblocks` and nothing else. So the superblock is the only
-place the log's location is recorded, and on this image it does not lead to the magic.
+`sb_logstart` and `sb_logblocks` and nothing else, which is why the superblock is the
+only place the log's location is recorded, and why `sb_logstart` had to be kept rather
+than discarded as it was.
 
-So the identification is **withdrawn, not narrowed**. `0xFEEDBABE` is most likely a
-different structure's marker, or the conventional "uninitialised" sentinel other
-formats use -- which would make it a poor thing to have based an identification on,
-and it is one.
+Two wrong conclusions of this shape were recorded here, and the fix in both is the
+same: a measurement from one **state** of an image, reported as a property of the
+format, is not contradicted by a second image in the same state. It is contradicted
+by the same image in a *different* state — unwritten and written — and that is the
+comparison to make first.
 
-**Nothing in this project should mask anything on a magic search until that is
-settled.** The safe direction is the reverse: read a region's blocks and check them
-against whatever identifies them.
-
-The one thing still standing from those measurements is the useful negative, because
-it was taken on the same image in both directions and does not depend on locating the
-log: **a mount of a pristine image changes nothing**, and **a modification's
-in-place metadata is invisible until the log is applied.**
-found by searching for the magic is right on one image and undetectable on another.
-
-**MEASURED, and it does not generalise — the previous statement here was too
-strong.** On a 1 GiB image with 1 KiB blocks, one modification changed **2048
-consecutive blocks**, all carrying the magic, at fsblocks 524299–526346. On a
-600 MiB image, by contrast, only about 4500 blocks carry the magic *anywhere* and
-the longest contiguous run of them is **three blocks**.
-
-So "a long run of magic blocks is the log" holds on one image and not on another,
-and `sb_logstart` did not locate the log on the second either — which is why
-`Sb::log_blocks()` is marked untrustworthy and why the test that checks it is ignored
-for exactly this reason.
-
-Likely explanation, not established: a log block carries the magic as the header of a
-*log record*, so a block holding nothing but continuation data does not look like a
-record header at all, and a mostly-empty log is mostly not record headers. That would
-make the magic a property of the log's *contents* rather than of its *extent*, which
-is the wrong thing to locate a region with.
-
-So the procedure is corrected: **mask by the superblock's numbers, then verify the
-mask against the magic** — not derive the mask from the magic. Verifying is safe in
-both directions, since a masked block that carries no magic is one holding no record
-at this moment; deriving is what produced a mask that was right on one image and
-undetectable on another.
 
 ### The log record header
 
