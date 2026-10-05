@@ -187,3 +187,58 @@ what the kernel will mount at all.  So:
 
 This cost several attempts here, all of which reported the same unhelpful error for
 a filesystem that was fine.
+
+### The answer: one file creation, measured on a real pair
+
+`xfs-fixtures/base.img` and `after.img`, differing by one `touch` from **native XFS**,
+with `sync` before the unmount and a **second** mount to apply the log.  Read
+through this project's own decoders, not out of the bytes.
+
+**The group inode:**
+
+```text
+block 1: AGI -- inodes 64 -> 64, free 58 -> 57, next_ino 64 -> 64
+```
+
+So one file creation consumes **exactly one free inode**, the group's total is
+unchanged, and the next-inode cursor does not move.  That is one counter of the three,
+confirmed: **`agi_free_count` at bytes 28..32, the group inode's only inode count
+beyond the total.**  (There is no "used" field to move, which is why this is a
+single counter rather than a pair — see the note on `offset::FREECOUNT`.)
+
+**The change as a whole, split into journal and metadata:**
+
+```text
+metadata:  blocks 0, 1, 4, 5, 32, 35        six blocks
+journal:   blocks 524297 .. 526350           the rest, contiguous
+```
+
+**The journal delta, for whoever implements logging.**  Blocks carrying a log record
+header, before and after:
+
+```text
+before   524296 .. 524296                      one block
+after    524296 .. 524297, then 524305 .. 526350
+```
+
+Three things an implementer can use, none of which are obvious:
+
+* **An unwritten log has almost nothing.**  This image had a single record header
+  before the `touch` and ~2050 after, so "how much log is in this image" is a
+  function of what has been written, not of how big the log is.
+* **The header run is not contiguous.**  524298..524304 are inside the log and carry
+  no record header, because what they hold is continuation data.  A record is
+  `XLOG_HEADER_SIZE` (512 bytes) and a log *block* is larger, so most of a used log
+  block is data rather than headers.
+* **The journal dwarfs the metadata.**  ~2050 log blocks against six metadata blocks
+  for a single file creation.  Any comparison of two images must mask the log by the
+  superblock's numbers, or it will read as a 2000-block change -- which is what
+  `changed_blocks_excluding_log` in `tests/util.rs` is for, with the control test
+  that says an image does not differ from itself.
+
+**Still not decoded: the chunk record.**  Blocks 32 and 35 are the other two
+metadata blocks and are most likely the inode-btree nodes holding the chunk record
+whose free mask lost a bit.  That is the remaining half, and
+`chunk_rec::Kind` in `alloc/inobt.rs` is what it has to be read against -- with the
+four bytes at 4..8 meaning different things depending on whether the chunk is
+sparse, and **no way to tell which from the record alone**.
