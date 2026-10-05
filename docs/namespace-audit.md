@@ -1,10 +1,65 @@
-# Namespace mutation — Milestone 0 audit
+# Namespace mutation — audit and native-XFS experiment protocol
 
 What exists today, established by reading the code rather than by inferring from
 type names. Anything not confirmed by reading is marked as not established.
 
 Scope: the first milestone is a **writable shortform-directory primitive**, not
 FUSE `create()`. This document is the audit that milestone starts from.
+
+## Milestone 0.5 — a clean native-XFS protocol, before any more mining
+
+**A bare Linux XFS mount is not a read-only observation.** Mounting an image and
+unmounting it, with nothing done to the file system, changes **2060 blocks**: the
+superblock, two metadata blocks, two single blocks, and **2054 consecutive blocks**
+beginning at AG 2 block 29. Each mount produces a *different* image -- four distinct
+checksums from four mount cycles of the same file.
+
+That run is 2054 blocks of two bytes each, at offset 31 within *each* 512-byte inode
+in the block: 4108 inodes, which is 64 inode chunks' worth. So the signature is
+**inode-chunk initialisation happening at mount time**, before any file operation.
+
+This invalidates the experiment that was about to be run. The natural design --
+snapshot, `touch`, diff -- attributes a 2054-block mount artefact to a three-byte
+inode allocation, and the counters inside it change for reasons that have nothing
+to do with `touch`. Reading that diff for the thing it was looking for would have
+produced a confident, wrong answer, which is the fourth of its kind.
+
+### The protocol
+
+Three baselines, and the third is compared with the second:
+
+```text
+A = pristine image, never mounted
+B = A after mount + unmount and nothing else
+C = B after mount + one controlled operation + unmount
+
+mount-only  = A -> B     classified once, then masked
+operation   = B -> C     the only diff that is read for meaning
+```
+
+**`operation` is `B -> C`, never `A -> C`.** Two equivalent pristine images rather
+than one image used twice, so that neither carries the other's history.
+
+Three rules that come out of this and are worth writing down:
+
+* **Warm before you snapshot.** The "before" image is taken *after* a
+  mount/unmount cycle, so the mount-time writes have already happened and cannot be
+  mistaken for the operation's.
+* **Never diff against pristine.** Once `A -> B` is known and masked, it stops
+  needing to be rediscovered on every experiment.
+* **Do not guess what the run is.** It looks like journal or free-space metadata; it
+  is inspected and classified, or it stays unnamed. A name attached to it before the
+  evidence would be the same error one level up.
+
+### What is not in doubt
+
+This affects the *native-fixture strategy*, not the format knowledge already
+established. The directory rules -- six-byte header, an entry of `8 + namelen`,
+appending, no renumbering on removal, offsets stepping by sixteen -- were each
+measured against an image that was **already mounted and already mutated**, so they
+are measurements of a real XFS directory and are not affected. What is affected is
+the plan to learn inode allocation the same way, which is why this protocol precedes
+it.
 
 ## The shortform representation cannot round-trip
 
