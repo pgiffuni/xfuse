@@ -109,3 +109,38 @@ That is the answer the classification step existed to produce, and it took one g
 `0xfeedbabe` is the most obvious thing in the diff once the magic is looked up rather
 than reasoned about -- which is the fourth time tonight that the documented answer
 was thirty seconds away and the measured one took an hour.
+
+### With the log masked, one `touch` changes one block and five bytes
+
+```text
+operation diff, log masked:  1 block
+
+    block 0, +224..+227:  0x2863bdb0 -> 0xbfbee50a     a superblock timestamp
+    block 0, +247:        0x02 -> 0x06
+```
+
+**Nothing else.** Not the AGI's free-inode count, not a chunk record's free mask, not
+the new inode's own block -- none of them appear at all.
+
+That is not surprising on reflection, and it is the last piece of the protocol.  XFS is
+a **logging** file system, so a modification writes its metadata to the log and updates
+the file system in place **later**, asynchronously.  A `touch` followed by an unmount
+leaves the in-place metadata still describing the **pre**-touch file system, with the
+change sitting in the log.  The image before and after a modification is therefore
+nearly identical **by design**, and the change is invisible until the log is applied.
+
+Which is the deepest form of the warm-up the protocol kept asking for.  It is not that
+the mount writes -- it is that **the previous mount applies what the last one logged**,
+which is "a mount of a pristine image writes nothing" seen from the other side.
+
+The rule that subsumes the earlier ones:
+
+> **Sync before unmount.**  Without it the measurement is of a file system that has
+> not yet been told what it is supposed to contain.  `sync` inside the mount, or
+> `mount -o sync`, and the operation's changes land in the in-place metadata and the
+> log can be masked as the journal it is.
+
+With that, the measurement that answers the remaining question is: sync, touch,
+unmount, and diff against `B` with the log masked -- leaving the superblock and
+whatever inode-allocation state moves.  Four counters at most, and for the first time
+this is a short read rather than a needle in 2049 blocks.
