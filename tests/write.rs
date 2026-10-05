@@ -1037,7 +1037,21 @@ fn a_file_that_outgrows_its_inode_becomes_a_btree() {
     require_fusefs!();
     let image = writable_copy(&GOLDENV4, "grow-tree");
     const ATTEMPTS: usize = 40;
-    const STRIDE: u64 = 1 << 20;
+    // Two blocks apart, so each write is one block and the forty of them are forty
+    // extents in about eighty kilobytes.
+    //
+    // The stride used to be a megabyte, which made this test depend on free space
+    // rather than on the code: forty mebibyte of file on a sixty-four mebibyte file
+    // system exhausted the group, and FreeBSD took one write where Linux took forty
+    // -- the same image, the same code, and a test whose outcome was a function of
+    // how much of the file system happened to be left.  A short stride forces an
+    // extent per write for the reason that matters, which is that an extent is what
+    // a fork has to outgrow, and costs almost nothing.
+    const STRIDE: u64 = 4096;
+    // ...starting well clear of the first byte, so the check that the original
+    // contents survived cannot be confused by a write that legitimately covered
+    // them.
+    const MARGIN: u64 = 4096;
 
     // How far it got, and whether the leaf's limit stopped it.  Both are the
     // point: a file that outgrows its inode has to become a tree, and a file that
@@ -1064,7 +1078,9 @@ fn a_file_that_outgrows_its_inode_becomes_a_btree() {
         let mut wrote = 0usize;
         for i in 0..ATTEMPTS {
             let mut f = open_rw(&file);
-            if f.seek(SeekFrom::Start(before + i as u64 * STRIDE)).is_err() {
+            if f.seek(SeekFrom::Start(before + MARGIN + i as u64 * STRIDE))
+                .is_err()
+            {
                 break;
             }
             if f.write_all(&[b'x'; 4096]).is_err() {
