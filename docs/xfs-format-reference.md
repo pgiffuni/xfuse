@@ -647,6 +647,78 @@ plainly:
   which is what "Invalid cycle number" means, and why writing a real cycle number
   where the magic belongs yields an unreadable log.
 
+### What the log *does*, measured — the record for implementing logging
+
+Everything below was measured on this project's own images and is here so that
+whoever implements logging does not have to re-derive it. The narrative is in
+`docs/write-support-progress.md`; this is the summary.
+
+**Where it is.** `sb_logstart` and `sb_logblocks`, in file system blocks. On a 1 GiB
+image they read 524295 and 65536, and the log's records begin at **524296** — one
+block in, which is what a log does.
+
+**An unwritten log is empty, and that is most of them.** On a 600 MiB golden image
+**all 65536 blocks of the region are entirely zero**. These images have never been
+written. So a search for the log's magic on a golden image finds nothing in the log
+and several thousand unrelated blocks elsewhere, which reads exactly like "the magic
+is not the log".
+
+**The magic marks a record header, not a log block.** Direct evidence, from the same
+image after a modification: the magic-bearing blocks were 524296–524299 and then
+524307–526352. The seven blocks in between are in the log and do **not** carry the
+magic, because what they hold is continuation data rather than a record header. So
+the magic is a property of a block's *contents*, and it is the way to **check** a
+region — never the way to find one.
+
+**Mounting changes nothing; modifying changes the log.** Measured on the same image
+in both directions:
+
+```text
+pristine + mount + unmount            0 blocks changed
+pristine + mount + touch + unmount    the log, ~2048 consecutive blocks
+```
+
+**A modification's in-place metadata is not visible until the log is applied.** With
+the log masked, `-o sync` plus a `touch` left **only the superblock** changed: no
+inode, no group header, no chunk record. `-o sync` does not force it. A **second**
+mount is what applies the log, and that is the step every measurement here was missing.
+
+**Therefore the protocol is two mounts and a mask**, which is now
+`changed_blocks_excluding_log` in `tests/util.rs` with its control test:
+
+```text
+mount, touch, unmount          -- the change is logged
+mount, unmount                -- the log is applied, in place
+compare B against C, log masked
+```
+
+### One file creation, with the log masked
+
+The measurement this protocol exists to produce. Baseline `B` is pristine; `C` is
+after the two mounts above. With 524295–526352 excluded:
+
+```text
+block 0     7 bytes   +101, +143, +224..+227, +247
+block 1     7 bytes   +31, +312..+315, +323, +327
+block 4     8 bytes   +27, +31, +52..+55, +63, +71
+block 5     8 bytes   +27, +31, +52..+55, +63, +71
+block 32   30 bytes   +42..+205
+block 35   54 bytes   +2..+151
+```
+
+Six blocks. The shape worth reading is that **blocks 4 and 5 changed identically**,
+byte for byte — the same offsets, the same values — and XFS writes the group inode
+twice for redundancy, so two identically-changed blocks is the signature of the two
+copies of one structure. Block 0 is the superblock. Blocks 32 and 35 are larger and
+are most likely the b-tree nodes the new inode's chunk record lives in.
+
+**Not decoded, and deliberately.** The offsets were read out by hand and this
+document has four retracted hand-readings in it already. Naming which field is at
+which offset from a hex dump is exactly the mistake, and the answer is in the
+published structures — `docs/namespace-audit.md` has the one that matters:
+`xfs_inobt_rec_t`'s four bytes that mean different things depending on the chunk,
+with a one-byte free count in the sparse case and a four-byte one otherwise.
+
 ### Log operation headers and flags
 
 A transaction is written as a sequence of operations, each preceded by a 12-byte
