@@ -49,6 +49,39 @@ second, which is the discipline working rather than failing.
 `A` and `B` now exist as a matched pair and are **identical**, so the mount-only
 baseline is zero and needs no masking at all.
 
+### And now the clean operation diff, which is not what it looks like
+
+```text
+A = pristine                      never mounted
+B = A + mount + unmount           0 blocks changed
+C = B + mount + touch + unmount   2049 blocks changed
+
+    block 0                        the superblock
+    blocks 524299..526346          2048 contiguous blocks
+```
+
+So the run is **not** a mount artefact after all -- it is the `touch`.  And that is
+the surprising part, because **one file creation rewrites 2048 blocks**, two
+mebibytes, on a filesystem with room to spare.
+
+And they are **not inode chunks**.  Their first four bytes are `feedbabe`, before and
+after: it is not `XFS_INO_MAGIC` (`0x494e`) and it is not any magic in
+`xfs_format.h`.  Their bodies show runs of `0xff` filler and repeating CRC-shaped
+values, which is the shape of a b-tree node rather than of 4096 inodes.
+
+**So one `touch` rewrites 2048 consecutive blocks of a structure that has not been
+identified.**  That is not ordinary XFS behaviour and it is the thing to understand
+before these images are used as an instrument again -- not because the directory
+facts are in doubt (each was measured on an already-modified image, which is
+exactly the right condition), but because a filesystem that rewrites two mebibytes
+per file creation is not the filesystem the rest of this project is reasoning about.
+
+**Not named here on purpose.**  The block resembles journal or free-space metadata,
+and calling it either before identifying `0xfeedbabe` would be the same error this
+section has already made once and caught.  `0xfeedbabe` is not in `xfs_format.h`, so
+identifying it means either a newer XFS structure than these headers describe, or
+something that is not XFS metadata at all.
+
 This invalidates the experiment that was about to be run. The natural design --
 snapshot, `touch`, diff -- attributes a 2054-block mount artefact to a three-byte
 inode allocation, and the counters inside it change for reasons that have nothing
