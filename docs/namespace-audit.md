@@ -144,3 +144,24 @@ With that, the measurement that answers the remaining question is: sync, touch,
 unmount, and diff against `B` with the log masked -- leaving the superblock and
 whatever inode-allocation state moves.  Four counters at most, and for the first time
 this is a short read rather than a needle in 2049 blocks.
+
+### The codebase already had this
+
+Worth writing down, because it is the lesson of this whole stretch and it is
+falsifiable rather than a moral.
+
+This project already cites the published documentation, already names its offsets,
+and already states its provenance.  `dinode_core.rs` computes the literal area as
+`0xb0` for version 3 and cites *XFS Algorithms and Data Structures* section 15.4
+for the pointer gap.  `agf.rs` and `agi.rs` carry named offset tables.  The chunk
+record's two widths were here to be read.
+
+And when I measured `literal_area_offset` as **176** for a 512-byte version 5 inode --
+after failing to calibrate it by hand, and after an hour -- the constant was
+`0xb0`, already in the source, already right.  The 184 I had written down is the
+*struct size*, and conflating the two is what the hour was spent on.
+
+So the cost of tonight's measurements was not ignorance of the format.  It was not
+reading what this repository had already established before measuring it again --
+and then, when the documentation turned out to answer in seconds, not reading the
+documentation either, because the file was already open.
