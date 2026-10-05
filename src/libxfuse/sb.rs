@@ -190,7 +190,7 @@ pub struct Sb {
     pub sb_rblocks:        XfsRfsblock,
     // sb_rextents: XfsRtblock,
     pub sb_uuid:           Uuid,
-    // sb_logstart: XfsFsblock,
+    pub sb_logstart:       XfsFsblock,
     pub sb_rootino:        XfsIno,
     // sb_rbmino: XfsIno,
     // sb_rsumino: XfsIno,
@@ -330,6 +330,18 @@ impl Sb {
     /// be eight at eight per block.
     #[allow(dead_code)] // As with `InoAddr`: built and tested, not yet read by a caller.
     pub const INODES_PER_CHUNK: u32 = 64;
+    /// `XLOG_HEADER_MAGIC_NUM`: the word at the start of every log block.
+    ///
+    /// `xfs_log_format.h` calls it "Invalid cycle number" because of what it
+    /// replaces.  It is how the log is *identified* -- a run of blocks that all
+    /// carry it at offset 0 **is** the log -- which is the only reason this
+    /// project can exclude the log from an image comparison without being told
+    /// where it is.
+    pub const XLOG_HEADER_MAGIC_NUM: u32 = 0xFEED_BABE;
+    /// `XLOG_HEADER_SIZE`: the header is padded to this, and each log block is a
+    /// multiple of it, so `h_cycle_data` is an array of this many 4-byte words
+    /// filling the block.
+    pub const XLOG_HEADER_SIZE: usize = 512;
 
     /// Decode an inode number into the place it names.
     ///
@@ -417,7 +429,7 @@ impl Sb {
         let sb_rblocks = buf_reader.read_u64::<BigEndian>().unwrap();
         let _sb_rextents = buf_reader.read_u64::<BigEndian>().unwrap();
         let sb_uuid = Uuid::from_u128(buf_reader.read_u128::<BigEndian>().unwrap());
-        let _sb_logstart = buf_reader.read_u64::<BigEndian>().unwrap();
+        let sb_logstart = buf_reader.read_u64::<BigEndian>().unwrap();
         let sb_rootino = buf_reader.read_u64::<BigEndian>().unwrap();
         let _sb_rbmino = buf_reader.read_u64::<BigEndian>().unwrap();
         let _sb_rsumino = buf_reader.read_u64::<BigEndian>().unwrap();
@@ -517,6 +529,7 @@ impl Sb {
         }
 
         Sb {
+            sb_logstart,
             sb_blocksize,
             sb_dblocks,
             sb_rblocks,
@@ -752,6 +765,22 @@ impl Sb {
         sb.sb_blocklog = blocksize.trailing_zeros() as u8;
         sb.sb_agblklog = agblocks.trailing_zeros() as u8;
         sb
+    }
+
+    /// The log's first block, and how many blocks it spans.
+    ///
+    /// The log is 2 MiB by default and sits inside a group, and **it is not file
+    /// system structure**: its contents are a function of what was logged and in what
+    /// order, not of what the file system contains.  Anything comparing two images
+    /// has to exclude it, or every modification looks like 2048 changed blocks --
+    /// which is what it took to work out here, four commits and five mounts after a
+    /// `grep` in `xfs_log_format.h` would have done it.
+    ///
+    /// `XLOG_HEADER_MAGIC_NUM` (`0xFEEDBABE`) is written at the start of every log
+    /// block, which is both how the log is identified and how it is checked: a range
+    /// whose blocks all carry it is the log.
+    pub fn log_blocks(&self) -> std::ops::Range<u64> {
+        self.sb_logstart..self.sb_logstart + u64::from(self.sb_logblocks)
     }
 
     /// Does this file system checksum its metadata?

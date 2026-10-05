@@ -526,3 +526,100 @@ the system to unmount after it has already killed the daemon and waited for it.
   along, by a test, and reported as an unrelated symptom.
 * Free-space tree **root collapse** — not implemented, and nothing reaches it:
   collapse needs a tree to shrink, and no operation available here grows it smaller.
+---
+
+## The log
+
+**DOCUMENTED** — `/usr/include/xfs/xfs_log_format.h`, which is the in-tree form of
+the published format.
+
+XFS is a **logging** file system: a modification writes its metadata to the log and
+updates the file system in place later, asynchronously. Two consequences follow, and
+both cost real time to establish here.
+
+**A mount writes nothing.** Measured: a pristine image, mounted and unmounted with
+nothing done to it, changes **zero** blocks. Every image that showed a 2048-block
+change had already been modified.
+
+**A modification is invisible until the log is applied.** With the log masked, one
+`touch` changed the superblock and nothing else — no AGI count, no chunk record, no
+inode. `-o sync` did not change that. The metadata was in the log.
+
+### Identifying it
+
+```c
+#define XLOG_HEADER_MAGIC_NUM  0xFEEDbabe   /* Invalid cycle number */
+#define XLOG_HEADER_SIZE       512
+```
+
+The magic is at the start of **every** log block, which is what makes the log
+identifiable without being told where it is: a contiguous run of blocks that all
+carry `0xFEEDBABE` at offset 0 **is** the log. This is now `Sb::XLOG_HEADER_MAGIC_NUM`,
+and `Sb::log_blocks()` returns the range from the superblock — `sb_logstart` was being
+read and thrown away, which is why this had to be found by hand.
+
+**MEASURED.** On a 1 GiB image with 1 KiB blocks the log is **2048 blocks**, two
+mebibytes, at fsblocks 524299–526346. Two mebibytes is `XFS_LOG_FACTOR` behaviour at
+this size, not a coincidence.
+
+### The log record header
+
+The structure every log record begins with. Note the padding: `h_cycle_data` is an
+array filling the rest of the block, which is why the header is *alone* in its block
+and the remainder is zeroes — and why `xlog_cksum` had to try two sizes, so a v5
+filesystem could be moved between i386 and other little-endian architectures with an
+unclean log.
+
+```c
+struct xlog_rec_header {
+    __be32  h_magicno;                          /*   0: XLOG_HEADER_MAGIC_NUM   */
+    __be32  h_cycle;                            /*   4: write cycle of the log  */
+    __be32  h_version;                          /*   8: XLOG_VERSION_1 | _2    */
+    __be32  h_len;                              /*  12: bytes, 64-bit aligned   */
+    __be64  h_lsn;                              /*  16: this record's LSN      */
+    __be64  h_tail_lsn;                         /*  24: first LR with uncommitted buffers */
+    __le32  h_crc;                              /*  32: **little-endian**      */
+    __be32  h_prev_block;                       /*  36: previous log record     */
+    __be32  h_num_logops;                       /*  40: operations in this LR   */
+    __be32  h_cycle_data[XLOG_HEADER_CYCLE_SIZE / BBSIZE];   /* 44 .. block end */
+    __be32  h_fmt;                              /*     LINUX_LE 1 / LINUX_BE 2 */
+    uuid_t  h_fs_uuid;                          /*                              */
+    __be32  h_size;                             /*     iclog size, log v2 only */
+    __u32   h_pad0;                             /*     to a 4-byte multiple    */
+} xlog_rec_header_t;
+```
+
+Two things in there that would be easy to get wrong and that the header says
+plainly:
+
+* **The checksum is little-endian** (`__le32`) while every field around it is
+  big-endian. A CRC computed big-endian here would be rejected.
+* **`h_cycle` is not a cycle number when the magic is present.** `xlog_get_cycle()`
+  reads the magic, and if it matches, takes the *next* word as the cycle instead —
+  which is what "Invalid cycle number" means, and why writing a real cycle number
+  where the magic belongs yields an unreadable log.
+
+### Log operation headers and flags
+
+A transaction is written as a sequence of operations, each preceded by a 12-byte
+`xlog_op_header` (`oh_tid` 4, `oh_len` 4, `oh_clientid` 1, `oh_flags` 1, `oh_res2` 2),
+with the transaction's regions marked in `oh_flags`:
+
+```c
+XLOG_START_TRANS   0x01    XLOG_COMMIT_TRANS    0x02
+XLOG_CONTINUE_TRANS 0x04   XLOG_WAS_CONT_TRANS 0x08
+XLOG_END_TRANS    0x10    XLOG_UNMOUNT_TRANS  0x20
+```
+
+and two client identities, `XFS_TRANSACTION` `0x69` and `XFS_LOG` `0xaa`.
+
+### What this project does with any of it
+
+Nothing yet, and that is now deliberate rather than accidental. The log is where
+write support's *ordering* problem lives — a metadata change is only durable once its
+transaction commits, which is the thing that distinguishes a write that is visible
+from one that is safe — and it is a substantial subsystem of its own.
+
+What is done is the part needed to *measure*: the magic is a named constant, the
+range is in `Sb`, and any image comparison can exclude it as a journal instead of
+subtracting 2048 blocks by hand.
