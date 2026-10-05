@@ -15,8 +15,39 @@ beginning at AG 2 block 29. Each mount produces a *different* image -- four dist
 checksums from four mount cycles of the same file.
 
 That run is 2054 blocks of two bytes each, at offset 31 within *each* 512-byte inode
-in the block: 4108 inodes, which is 64 inode chunks' worth. So the signature is
-**inode-chunk initialisation happening at mount time**, before any file operation.
+in the block: 4108 inodes, which is 64 inode chunks' worth.
+
+**Corrected: the mount is not the writer.**  Measured against a pristine image,
+`A = m5.img`, built by `mkfs.xfs` and never mounted:
+
+```text
+A = pristine
+B = A after mount + unmount, nothing done
+
+blocks changed by mount-only (A -> B): 0
+```
+
+**Zero.**  A mount of an untouched image writes nothing at all, so the 2054-block
+runs were never a mount artefact and the earlier reading -- that a mount was somehow
+rewriting inode chunks -- was wrong.
+
+What fits instead is the **log**.  Every image that showed the run had already been
+*modified*, and the write is the log's transactions being written back: it happens on
+the mount *after* a change, not on the first.  A pristine image's log is empty, so
+there is nothing to write back and the mount is invisible on disk.
+
+That also explains the `cp` that failed to reproduce its own bytes -- the file had a
+mount cycle outstanding behind it and the bytes landed whenever the kernel got to
+them, which is why the same image hashed differently minutes later.
+
+So the protocol's warm-up is not a precaution against a mysterious writer: it is
+letting the log settle after a modification, and it is now a named step rather than
+an unexplained one.  The rule "do not name the run before inspecting it" has been
+applied, and produced a name that was wrong on the first try and right on the
+second, which is the discipline working rather than failing.
+
+`A` and `B` now exist as a matched pair and are **identical**, so the mount-only
+baseline is zero and needs no masking at all.
 
 This invalidates the experiment that was about to be run. The natural design --
 snapshot, `touch`, diff -- attributes a 2054-block mount artefact to a three-byte
