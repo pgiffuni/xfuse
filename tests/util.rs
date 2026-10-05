@@ -354,3 +354,99 @@ where
         sleep(Duration::from_millis(50));
     }
 }
+
+/// The blocks two images differ in, **excluding the log**.
+///
+/// Excluding the log is not optional and not a refinement.  XFS is a logging file
+/// system, so a modification writes to the log and the in-place metadata follows
+/// later; an unmasked comparison of a change is 2048 blocks of journal in which the
+/// metadata is somewhere among them.
+///
+/// The range comes from the **superblock's own numbers** (`Sb::log_blocks()`) and
+/// never from searching for the log's magic.  That is deliberate: a magic search
+/// finds the log only on an image that has been written, so on a golden image --
+/// whose log is entirely zero -- it finds several thousand unrelated blocks and no
+/// log at all, which reads exactly like "the magic is not the log" and is wrong.
+///
+/// Returns `(block_number, first_differing_offset, last_differing_offset)` for each
+/// block that differs outside the log, which is a short list on any real operation.
+#[allow(unused)] // The bench target shares this module and has no image fixtures.
+pub fn changed_blocks_excluding_log(
+    a: &[u8],
+    b: &[u8],
+    bs: usize,
+    log: std::ops::Range<u64>,
+) -> Vec<(u64, usize, usize)> {
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "two images of different sizes cannot be compared"
+    );
+    let mut out = Vec::new();
+    for blk in 0..(a.len() / bs) as u64 {
+        if log.contains(&blk) {
+            continue;
+        }
+        let (x, y) = (&a[blk as usize * bs..][..bs], &b[blk as usize * bs..][..bs]);
+        if x == y {
+            continue;
+        }
+        let first = x
+            .iter()
+            .zip(y.iter())
+            .position(|(p, q)| p != q)
+            .unwrap_or(0);
+        let last = x
+            .iter()
+            .zip(y.iter())
+            .rposition(|(p, q)| p != q)
+            .unwrap_or(0);
+        out.push((blk, first, last));
+    }
+    out
+}
+
+/// Only the integration target runs tests here; the bench includes this module
+/// for its helpers and would otherwise compile them with no test harness.
+#[cfg(test)]
+#[allow(unused)]
+mod image_diff_tests {
+    use super::changed_blocks_excluding_log;
+
+    /// Two images of the same filesystem, compared with the log masked, differ
+    /// nowhere.
+    ///
+    /// Which sounds trivial and is the point: it is the *control* every fixture
+    /// measurement needs, and without it a 2048-block journal cannot be told from a
+    /// three-byte counter.
+    #[test]
+    fn an_image_does_not_differ_from_itself() {
+        let a = vec![0u8; 8192];
+        assert!(changed_blocks_excluding_log(&a, &a.clone(), 1024, 0..0).is_empty());
+    }
+
+    /// The log is excluded **by block number**, and nothing else is.
+    ///
+    /// Both halves matter: masking too little leaves the journal in the diff, and
+    /// masking too much hides the change being looked for.  So this pins one block
+    /// inside the masked range and one immediately outside it, and asserts that only
+    /// the second is reported.
+    #[test]
+    fn a_block_inside_the_log_is_masked_and_one_outside_it_is_not() {
+        let mut a = vec![0u8; 4096];
+        a[1024..1028].copy_from_slice(&[1, 2, 3, 4]); // block 1
+        a[2048..2052].copy_from_slice(&[5, 6, 7, 8]); // block 2
+        let mut b = a.clone();
+        b[2048..2052].copy_from_slice(&[9, 9, 9, 9]); // differs in block 2 only
+
+        // Mask blocks 0 and 1.
+        let d = changed_blocks_excluding_log(&a, &b, 1024, 0..2);
+        assert_eq!(d.len(), 1, "exactly the unmasked block should be reported");
+        assert_eq!(d[0].0, 2, "and it should be block 2");
+        assert_eq!(
+            (d[0].1, d[0].2),
+            (0, 3),
+            "with the offsets of the bytes that differ"
+        );
+    }
+}

@@ -786,6 +786,9 @@ impl Sb {
     ///
     /// So: the magic marks a log **record**, the log's extent comes from here, and a
     /// magic search is the way to check this range rather than to find it.
+    /// Used by the log module's tests and by fixture tooling; nothing in the daemon
+    /// itself needs to find the log, because it does not read or write one yet.
+    #[allow(dead_code)]
     pub fn log_blocks(&self) -> std::ops::Range<u64> {
         self.sb_logstart..self.sb_logstart + u64::from(self.sb_logblocks)
     }
