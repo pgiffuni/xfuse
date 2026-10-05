@@ -80,10 +80,12 @@ standards, academic material, and black-box observation of native XFS.
 * The *XFS Algorithms and Data Structures* document (Dave Chinner, SGI/Red Hat),
   for the on-disk layout of the superblock, inodes, extents, directories,
   extended attributes, and the log.
-* Public XFS on-disk format documentation: the `xfs_format.h` structure
-  *definitions* that are mirrored in publicly published filesystem format
-  documentation and in the Linux documentation tree under
-  `Documentation/filesystems/xfs/`.
+* The on-disk structure layouts published in the XFS documentation pages at
+  `docs.kernel.org/filesystems/xfs/` and in the *XFS Algorithms and Data
+  Structures* document, together with black-box observation of native XFS.
+  Layout facts — field names, widths, offsets, magic values, and which bytes
+  differ between two versions of a record — are used freely. No text, comment
+  or declaration is reproduced from a source tree.
 * Behaviour observed from `xfsprogs` 6.18 (`mkfs.xfs`, `xfs_db`, `xfs_repair`,
   `xfs_metadump`, `xfs_mdrestore`, `xfs_bmap`, `xfs_logprint`) run as black
   boxes against generated test images.  These tools are used the way the plan

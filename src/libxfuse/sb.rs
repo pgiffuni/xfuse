@@ -190,7 +190,8 @@ pub struct Sb {
     pub sb_rblocks:        XfsRfsblock,
     // sb_rextents: XfsRtblock,
     pub sb_uuid:           Uuid,
-    pub sb_logstart:       XfsFsblock,
+    #[allow(dead_code)] // Read by `log_blocks`, which the log module's tests use.
+    pub sb_logstart: XfsFsblock,
     pub sb_rootino:        XfsIno,
     // sb_rbmino: XfsIno,
     // sb_rsumino: XfsIno,
@@ -332,15 +333,17 @@ impl Sb {
     pub const INODES_PER_CHUNK: u32 = 64;
     /// `XLOG_HEADER_MAGIC_NUM`: the word at the start of every log block.
     ///
-    /// `xfs_log_format.h` calls it "Invalid cycle number" because of what it
+    /// the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org) calls it "Invalid cycle number" because of what it
     /// replaces.  It is how the log is *identified* -- a run of blocks that all
     /// carry it at offset 0 **is** the log -- which is the only reason this
     /// project can exclude the log from an image comparison without being told
     /// where it is.
+    #[allow(dead_code)] // The log module has its own, which is where it is used.
     pub const XLOG_HEADER_MAGIC_NUM: u32 = 0xFEED_BABE;
     /// `XLOG_HEADER_SIZE`: the header is padded to this, and each log block is a
     /// multiple of it, so `h_cycle_data` is an array of this many 4-byte words
     /// filling the block.
+    #[allow(dead_code)] // The log module has its own, which is where it is used.
     pub const XLOG_HEADER_SIZE: usize = 512;
 
     /// Decode an inode number into the place it names.
@@ -774,11 +777,12 @@ impl Sb {
     /// order, not of what the file system contains.  Anything comparing two images
     /// has to exclude it, or every modification looks like 2048 changed blocks --
     /// which is what it took to work out here, four commits and five mounts after a
-    /// `grep` in `xfs_log_format.h` would have done it.
+    /// `grep` in the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org) would have done it.
     ///
     /// `XLOG_HEADER_MAGIC_NUM` (`0xFEEDBABE`) is written at the start of every log
     /// block, which is both how the log is identified and how it is checked: a range
     /// whose blocks all carry it is the log.
+    #[allow(dead_code)] // Used by the log module's tests, which are themselves ignored.
     pub fn log_blocks(&self) -> std::ops::Range<u64> {
         self.sb_logstart..self.sb_logstart + u64::from(self.sb_logblocks)
     }

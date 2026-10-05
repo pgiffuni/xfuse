@@ -66,6 +66,8 @@ mod error;
 mod extent;
 #[allow(dead_code)]
 mod inode;
+#[allow(dead_code)]
+pub mod log;
 mod sb;
 mod symlink_extent;
 #[allow(dead_code)]

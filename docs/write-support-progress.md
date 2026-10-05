@@ -157,7 +157,7 @@ kernel usually does not send `open`/`opendir` at all.
 | Free-space tree **root** growth | in progress | A root split needs the root *leaf* to overflow, and no image here has a free-space tree whose root is close enough.  The code path is tested in memory; what is missing is an image to reach it on. |
 | Free-space tree shrinkage | in progress | Leaf merging works and is checked on a real image with `xfs_repair`.  Root collapse does not exist, and is genuinely unreachable: nothing empties an interior node, because a parent always has at least two children and the merge branch refuses to take the last one. |
 | Reading a whole b-tree data fork | done | `BtreeRoot::all_extents`, the walk `map_block` cannot do.  Not yet called: the row below needs it. |
-| **Truncating** a b-tree data fork | done | The dependency nobody wrote down, and it **inverts** the order this section had.  A file's fork becoming a B+tree is refused while `drop_extents_above` answers `ENOTSUP` for a fork that is not in the inode — so converting one would **take away** the ability to shrink the very files that had outgrown the inode.  Building the writer first would trade a capability for a bigger one.  All four pieces exist: `BtreeRoot::all_extents` reads the tree and reports the blocks it occupies, `RawDinode::data_btree_root` decodes the root, `split_extents_above` is the cut (shared with the `extents` path so the two cannot drift), and `set_data_extents_from_tree` writes the survivors back and zeroes what the root occupied.  The survivors go back into the inode rather than the tree being rewritten, which is the direction XFS itself takes when the list fits and the only one available without a writer.  `agf_btreeblks` does not move: `xfs_format.h` calls it "of blocks held in **AGF** btrees", which is a group's free-space trees, not a file's b-map tree.  The test for it skips, because `xfs_db` cannot resolve inode 128 in `xfsv4.img` — see [the oracle's own defect](#the-oracle-disagrees-with-xfs_repair-on-two-images-and-xfs_repair-is-right). |
+| **Truncating** a b-tree data fork | done | The dependency nobody wrote down, and it **inverts** the order this section had.  A file's fork becoming a B+tree is refused while `drop_extents_above` answers `ENOTSUP` for a fork that is not in the inode — so converting one would **take away** the ability to shrink the very files that had outgrown the inode.  Building the writer first would trade a capability for a bigger one.  All four pieces exist: `BtreeRoot::all_extents` reads the tree and reports the blocks it occupies, `RawDinode::data_btree_root` decodes the root, `split_extents_above` is the cut (shared with the `extents` path so the two cannot drift), and `set_data_extents_from_tree` writes the survivors back and zeroes what the root occupied.  The survivors go back into the inode rather than the tree being rewritten, which is the direction XFS itself takes when the list fits and the only one available without a writer.  `agf_btreeblks` does not move: the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org) calls it "of blocks held in **AGF** btrees", which is a group's free-space trees, not a file's b-map tree.  The test for it skips, because `xfs_db` cannot resolve inode 128 in `xfsv4.img` — see [the oracle's own defect](#the-oracle-disagrees-with-xfs_repair-on-two-images-and-xfs_repair-is-right). |
 | A data fork that becomes a B+tree | done | One leaf and a level-1 root in the inode, with `di_format`, `di_nblocks` and `di_nextents` moving in the same transaction.  A file whose records no longer fit its fork converts on the write that needs the room, and `xfs_repair -n` on the result **exits 0 with no complaints**.  Both leaf headers exist -- the 72-byte checksummed one and the 24-byte version 4 one -- because a leaf written with the wrong magic is `bad magic`, which reads like a mapping fault and is not.  See [the fork's room](#an-inodes-data-fork-size-is-di_forkoff--3-and-its-core-is-100-bytes-at-v2). |
 | **A second leaf**, and the interior root over it | done | A list that will not fit one leaf becomes two, with the root's second key and pointer, the siblings chained, and every leaf block allocated before any is written.  `xfs_repair -n` on a file grown into that shape exits 0.  Recorded as a **verified boundary** -- see [The boundary at thirty records](#the-boundary-at-thirty-records-and-the-question-it-leaves). |
 | A **third** leaf, and an interior node above them | done | An interior **block** -- allocated, written, and named by a level-2 root with one key and one pointer.  The occupancy rule is the part that bites: a leaf with a parent may not be less than half full, so the records are **spread evenly** over the leaves rather than filling each and letting the last hold the remainder.  Filling them is what produced `bad # of bmap records (7, min - 15, max - 30)`. |
@@ -256,8 +256,8 @@ exactly the thing a duplicate makes wrong.
 > `di_aformat` finding that follows — which is a real bug, still unfixed, and was
 > never their cause.  They came from the b-map **extent** leaf, for the two reasons
 > in [A b-map leaf's records begin at 72 bytes, or 24](#a-b-map-leafs-records-begin-at-72-bytes-or-24-and-each-is-two-64-bit-words):
-> the records were read from 24 instead of 72, and each was read as four `__be32`
-> rather than as the two `__be64` it is.  Eighty-three of the eighty-six were b-tree
+> the records were read from 24 instead of 72, and each was read as four 4 bytes big-endian
+> rather than as the two 8 bytes big-endian it is.  Eighty-three of the eighty-six were b-tree
 > files of one kind or another, which is what the signature said at the time and what
 > the attribution ignored in favour of a hypothesis the code supported.
 >
@@ -402,16 +402,16 @@ Each numerical claim in this document, what it rests on, and where it now stands
 | a non-root leaf needs 31 records, a root leaf none | tool | repair's `bad btree nrecs (30, min=31, max=62)`, and silence for a root | **confirmed** |
 | `next_unlinked` is at offset 96 and holds `0xffffffff` | tool | repair names the field; its offset found by writing a value at each offset and asking which it read | **confirmed** |
 | `startino` is counted from the group | tool | repair accepts below `153600 × 2` and refuses at or above it | **confirmed** |
-| an inode's data fork is `di_forkoff << 3`, and `XFS_DINODE_SIZE` is 100 (v2) / 184 (v3) | doc, cross-checked | `XFS_DFORK_DSIZE` and `XFS_DINODE_SIZE` in `xfs_format.h`; for the 256-byte inode `(256 − 100) / 16` is 9.75, which is the nine that were measured independently by nine sparse writes succeeding and the tenth being refused | **confirmed** |
+| an inode's data fork is `di_forkoff << 3`, and `XFS_DINODE_SIZE` is 100 (v2) / 184 (v3) | doc, cross-checked | `XFS_DFORK_DSIZE` and `XFS_DINODE_SIZE` in the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org); for the 256-byte inode `(256 − 100) / 16` is 9.75, which is the nine that were measured independently by nine sparse writes succeeding and the tenth being refused | **confirmed** |
 | a 256-byte inode holds nine extents | derived + tool | `(256 − 100) / 16`, and nine sparse writes succeed before the tenth is refused | **confirmed** |
 | the free slots of a new chunk: magic, version, `next_unlinked` | tool | repair's complaints, item by item | **repair-validated only** |
 | — the *version* XFS picks for a new chunk's slots | inference | none: no image here has a chunk XFS created | **unmeasured** |
 | AGFL → ordinary free space, when the list is full | tool | a full list handed to `xfs_repair` comes back with **every** one of its 42 blocks as ordinary free space | **confirmed**, with a caveat about who did it |
 | a b-map leaf's header length, and that the magic decides it | doc + tool | `XFS_BTREE_LBLOCK_CRC_LEN` is 72 and `XFS_BTREE_LBLOCK_LEN` is 24; 33 blocks in the two version 5 images carry the CRC magic and decode from 72, 102 in `xfsv4.img` carry the plain magic and decode from 24 | **confirmed** |
-| a b-map extent record is two `__be64` with fields interleaved across both | doc + tool | `xfs_format.h` gives `l0:9-62` startoff, `l0:0-8`+`l1:21-63` startblock, `l1:0-20` blockcount; the leaf of `files/btree2.txt` decodes to `xfs_db bmap`'s own `(0, 17833, 1)`, `(1, 17835, 1)`, … | **confirmed** |
+| a b-map extent record is two 8 bytes big-endian with fields interleaved across both | doc + tool | the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org) gives `l0:9-62` startoff, `l0:0-8`+`l1:21-63` startblock, `l1:0-20` blockcount; the leaf of `files/btree2.txt` decodes to `xfs_db bmap`'s own `(0, 17833, 1)`, `(1, 17835, 1)`, … | **confirmed** |
 | a b-map extent's start block is stored scaled by 512 | tool | the field reads 17833 × 512 = 9130496 for the first record of `files/btree2.txt`, and 9130496 >> 9 is 17833 | **confirmed** |
 | a b-map record's *size* is 16 bytes | doc | `sizeof(xfs_bmbt_rec_t)`; also the only stride at which perturbation puts one record in each entry | **confirmed** |
-| ~~a b-map extent's start is at offset 24, in bytes; its length is at offset 32; a record is four 4-byte words from offset 24; its fourth word is `(entry << 16) \| length`; its data block is nowhere in the record and nowhere in the image~~ | — | **withdrawn**: all of it follows from reading a 72-byte-header block from 24, and of a field that spans a `__be64` boundary as two `__be32`.  The block *is* in the record, at `l0:0-8`+`l1:21-63`.  See the invariant above and [The b-map block's extent, and how it was nearly missed](#the-b-map-blocks-extent-and-how-it-was-nearly-missed) | **withdrawn** |
+| ~~a b-map extent's start is at offset 24, in bytes; its length is at offset 32; a record is four 4-byte words from offset 24; its fourth word is `(entry << 16) \| length`; its data block is nowhere in the record and nowhere in the image~~ | — | **withdrawn**: all of it follows from reading a 72-byte-header block from 24, and of a field that spans a 8 bytes big-endian boundary as two 4 bytes big-endian.  The block *is* in the record, at `l0:0-8`+`l1:21-63`.  See the invariant above and [The b-map block's extent, and how it was nearly missed](#the-b-map-blocks-extent-and-how-it-was-nearly-missed) | **withdrawn** |
 | root collapse | — | unreachable, so nothing to confirm | **not written** |
 
 **Two rows are still open**, and both are the difference between "this is how it
@@ -883,7 +883,7 @@ one that was wrong in the code for as long as there was code to be wrong in.  Bo
 halves of it were asserted here first and both were wrong; see
 [The b-map block's extent, and how it was nearly missed](#the-b-map-blocks-extent-and-how-it-was-nearly-missed).
 
-**The header length is decided by the block's magic.**  `xfs_format.h` has two:
+**The header length is decided by the block's magic.**  the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org) has two:
 
 ```c
 #define XFS_BTREE_SBLOCK_LEN  (offsetof(struct xfs_btree_block, bb_u) + \
@@ -904,8 +904,8 @@ an LSN, the file system's UUID, the owning inode and the checksum as well, and i
 | `xfs4096.img`, `xfs1024.img` | 5 | `XFS_BMAP_CRC_MAGIC` (0x424d4133) | 33 | **72** |
 | `xfsv4.img` | 4 | `XFS_BMAP_MAGIC` (0x424d4150) | 102 | **24** |
 
-**And a record is `sizeof(xfs_bmbt_rec_t)` = 16 bytes holding two `__be64`, with its
-fields interleaved across both of them.**  `xfs_format.h` states the layout:
+**And a record is `sizeof(xfs_bmbt_rec_t)` = 16 bytes holding two 8 bytes big-endian, with its
+fields interleaved across both of them.**  the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org) states the layout:
 
 ```c
 /*
@@ -915,14 +915,12 @@ fields interleaved across both of them.**  `xfs_format.h` states the layout:
  *  l0:0-8 and l1:21-63 are startblock.
  *  l1:0-20 are blockcount.
  */
-typedef struct xfs_bmbt_rec {
-	__be64			l0, l1;
-} xfs_bmbt_rec_t;
+and the record itself is two 8-byte big-endian words, `l0` and `l1`.
 ```
 
 Fifty-four bits of offset, fifty-two of block number, twenty-one of length and one of
 flag is 128 bits, which is exactly the record, so nothing is spare and the fields
-cannot sit beside each other.  **Read as four `__be32` — which is what this code
+cannot sit beside each other.  **Read as four 4 bytes big-endian — which is what this code
 did — three of the fields become one nonsense number, and the start block is stored
 scaled by 512 besides**, so the number read unshifted is 512 times too large and
 names a block outside the image.
@@ -1481,19 +1479,14 @@ the *only* thing repair objects to afterwards.
 Two b-trees in the same file system, in the same image, with **different header
 sizes** — which is the sort of thing that reads as a contradiction and is not.
 
-`xfs_format.h` has two shapes for a b-tree block, and they differ in one thing: how
+the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org) has two shapes for a b-tree block, and they differ in one thing: how
 wide a sibling pointer is.
 
-```c
-struct xfs_btree_block_shdr {  /* short form */
-    __be32 bb_leftsib, bb_rightsib, bb_blkno, bb_pad, bb_lsn;
-    uuid_t  bb_uuid; __be32 bb_crc, bb_pad2;
-};                                  /* + 8 = XFS_BTREE_SBLOCK_CRC_LEN = 56 */
-
-struct xfs_btree_block_lhdr {  /* long form */
-    __be64 bb_leftsib, bb_rightsib, bb_blkno, bb_lsn;
-    uuid_t bb_owner; __be32 bb_crc, bb_pad;
-};                                  /* + 8 = XFS_BTREE_LBLOCK_CRC_LEN = 72 */
+```text
+short form   magic 4, level 2, numrecs 2, leftsib 4, rightsib 4, blkno 4,
+             pad 4, lsn 8, uuid 16, crc 4, pad2 4      -> 56 to the records
+long  form   magic 4, level 2, numrecs 2, leftsib 8, rightsib 8, blkno 8,
+             lsn 8, uuid 16, owner 8, crc 4, pad 4     -> 72 to the records
 ```
 
 The **free space trees are short**: `alloc/free_space.rs` puts the magic at 0, the
@@ -1564,7 +1557,7 @@ a rename is not a fix either.
 ### An inode's data fork size is `di_forkoff << 3`, and its core is 100 bytes at v2
 
 The arithmetic every fork-capacity question in this project rests on, and it is
-three macros in `xfs_format.h` rather than anything that had to be inferred:
+three macros in the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org) rather than anything that had to be inferred:
 
 ```c
 #define XFS_DFORK_BOFF(dip)   ((int)((dip)->di_forkoff << 3))
@@ -1684,7 +1677,7 @@ Nothing there resembles a record, which is exactly why a long investigation was
 needed to conclude that no block number existed: the reader was looking at the
 wrong 48 bytes and reporting the honest result for them.
 
-**And the record was read as four `__be32`.**  `xfs_bmbt_rec_t` is two `__be64`
+**And the record was read as four 4 bytes big-endian.**  the published extent record is two 8 bytes big-endian
 with the block number split across the boundary between them — nine bits in `l0`,
 forty-three in `l1`.  Read as four words, the first three fields of the record
 collapse into one nonsensical value, and the fourth word contains neither the block

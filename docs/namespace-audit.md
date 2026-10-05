@@ -66,7 +66,7 @@ mebibytes, on a filesystem with room to spare.
 
 And they are **not inode chunks**.  Their first four bytes are `feedbabe`, before and
 after: it is not `XFS_INO_MAGIC` (`0x494e`) and it is not any magic in
-`xfs_format.h`.  Their bodies show runs of `0xff` filler and repeating CRC-shaped
+the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org).  Their bodies show runs of `0xff` filler and repeating CRC-shaped
 values, which is the shape of a b-tree node rather than of 4096 inodes.
 
 **So one `touch` rewrites 2048 consecutive blocks of a structure that has not been
@@ -78,9 +78,9 @@ per file creation is not the filesystem the rest of this project is reasoning ab
 
 ### It is the log, and the whole anomaly is explained
 
-```c
-/* xfs_log_format.h */
-#define XLOG_HEADER_MAGIC_NUM 0xFEEDbabe   /* Invalid cycle number */
+```text
+XLOG_HEADER_MAGIC_NUM = 0xFEEDBABE
+    the word at the start of every log block
 ```
 
 **The 2048 blocks are the XFS log.**  Two megabytes is a log of exactly that size,

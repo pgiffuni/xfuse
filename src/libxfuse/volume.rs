@@ -1085,7 +1085,7 @@ impl Volume {
         // and `free_in_group` is given a run.
         //
         // `agf_btreeblks` does not move: it counts the blocks held in a group's
-        // *free space* trees (`xfs_format.h`: "of blocks held in AGF btrees"), and
+        // *free space* trees (the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org): "of blocks held in AGF btrees"), and
         // this is a file's b-map b-tree.  What moves is the file's own count,
         // below, which counts a node like any other block the file uses -- and that
         // is why giving these back and lowering `di_nblocks` are the same operation

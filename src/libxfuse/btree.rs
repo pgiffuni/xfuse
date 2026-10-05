@@ -116,7 +116,7 @@ pub const BMBT_MAGIC: u32 = XFS_BMAP_MAGIC;
 ///
 /// A long-form header without a checksum: a magic, a level and a record count,
 /// then a left and a right sibling of eight bytes each, which is
-/// `XFS_BTREE_LBLOCK_LEN` in `xfs_format.h`.
+/// `XFS_BTREE_LBLOCK_LEN` in the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org).
 ///
 /// This is the length a b-map block had before `xfs_repair` added a checksum to
 /// it, and it is *not* the length any image here has.  See
@@ -240,7 +240,7 @@ pub const BMBT_STARTBLOCK_SCALE_SHIFT: u32 = 9;
 
 /// One extent as a b-map leaf records it: two eight-byte words.
 ///
-/// The fields are not byte-aligned within them.  `xfs_format.h` says where they
+/// The fields are not byte-aligned within them.  the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org) says where they
 /// are, and this is that layout rather than a guess:
 ///
 /// ```text
@@ -481,7 +481,7 @@ impl BmbtLeafBlock {
     ///
     /// The records are [`BMBT_RECORD_LEN`] bytes apart, beginning at
     /// [`BMBT_CRC_HEADER_LEN`] in a checksummed block and [`BMBT_HEADER_LEN`] in
-    /// one without.  Which a block is, its magic says: `xfs_format.h` gives a
+    /// one without.  Which a block is, its magic says: the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org) gives a
     /// version 5 block [`XFS_BMAP_CRC_MAGIC`] and an older one [`BMBT_MAGIC`],
     /// and the checksummed header is the longer one, so the magic that carries a
     /// checksum is the magic that costs forty-eight more bytes of header.
@@ -549,7 +549,7 @@ impl BmbtLeafBlock {
     /// The header is the **long** form, 72 bytes, and it is worth being explicit
     /// that this is not the header the free space trees use: those are the short
     /// form, 56 bytes, with four-byte siblings and no block number.  Both are in
-    /// `xfs_format.h` and both are in the same images here, so a node writer copied
+    /// the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org) and both are in the same images here, so a node writer copied
     /// from the free space one and given a new magic would be sixteen bytes short
     /// and mis-parsed past the siblings.
     ///

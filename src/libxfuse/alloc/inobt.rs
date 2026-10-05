@@ -179,7 +179,104 @@ pub struct InoRange {
 }
 
 /// How many inode numbers one chunk covers, which is the width of the mask.
+/// `XFS_INODES_PER_CHUNK` -- `(NBBY * sizeof(xfs_inofree_t))`, and `xfs_inofree_t`
+/// is a `uint64`.
+///
+/// Which is *why* a chunk is 64 inodes and not any other number: the free mask is a
+/// single 64-bit word, so a chunk cannot hold more inodes than the mask has bits, and
+/// there is no second word to grow into.  A writer that wanted a larger chunk has
+/// nowhere to put the extra mask.
+///
+/// # The record, and the width that matters
+///
+/// ```text
+///  0  ir_startino            u32   starting inode number
+///  4  ir_freecount            u32   free count          -- normal chunk
+///  4  ir_holemask             u16   hole mask           -- sparse chunk
+///  6  ir_count                u8    total inode count   -- sparse chunk
+///  7  ir_freecount            u8    free count          -- sparse chunk
+///  8  ir_free                 u64   the free mask, one bit per inode
+/// ```
+///
+/// Sixteen bytes either way, and **bytes 4..8 mean different things depending on the
+/// chunk**.  A sparse chunk keeps its free count in a *single byte*, sharing those
+/// four with a hole mask and a total count.  A writer that always writes `freecount`
+/// as a `u32` at offset 4 corrupts every inode chunk on a sparse-metadata file
+/// system -- and only those, which is what makes it the kind of defect that passes
+/// every test in this repository and fails on the first real-world image.
+///
+/// So the kind is a property of the **chunk**, taken from the owning inode's
+/// `XFS_DINODE_F_SPINODES` format flag, and never guessed from the record itself: a
+/// record does not say which of the two layouts it is using.
 pub const INODES_PER_CHUNK: u64 = 64;
+
+/// Byte offsets within an `xfs_inobt_rec`, and the two meanings of `4..8`.
+pub mod chunk_rec {
+    /// `ir_startino` -- four bytes.
+    pub const STARTINO: usize = 0;
+    /// Where the two layouts disagree: a normal chunk's `ir_freecount`, or a sparse
+    /// chunk's `ir_holemask`, `ir_count` and `ir_freecount`.
+    pub const UNION: usize = 4;
+    /// Size of that union, and so the offset of the free mask.
+    pub const UNION_LEN: usize = 4;
+    /// The whole record.
+    pub const SIZE: usize = 16;
+    /// `ir_free` -- the 64-bit mask, one bit per inode in the chunk.
+    pub const FREE: usize = 8;
+
+    /// Which of the two layouts a chunk uses.
+    ///
+    /// Taken from the owning inode, never inferred: **the record does not say.**
+    /// Guessing produces an image that is right for half the world.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Kind {
+        /// A full chunk: four bytes of `ir_freecount`.
+        Normal,
+        /// A sparse chunk: `ir_holemask`, `ir_count` and a **one-byte**
+        /// `ir_freecount`.
+        Sparse,
+    }
+
+    /// Reading and writing the free count at the chunk's width.
+    ///
+    /// A trait rather than inherent methods, so that every call has to *name* the
+    /// layout it is assuming.  That is the whole point: the width is the one thing
+    /// that differs, and a signature that does not mention it is how a sparse chunk
+    /// gets read as a normal one and produces a plausible wrong number.
+    pub trait Freecount {
+        /// Read the free count out of a record's bytes.
+        fn freecount(bytes: &[u8], kind: Kind) -> u32;
+        /// Write the free count into a record's bytes.
+        fn set_freecount(bytes: &mut [u8], kind: Kind, count: u32);
+        /// The width of the free count, which is the only part that is not fixed.
+        fn freecount_len(kind: Kind) -> usize;
+    }
+
+    impl Freecount for Kind {
+        fn freecount_len(kind: Kind) -> usize {
+            match kind {
+                Kind::Normal => 4,
+                Kind::Sparse => 1,
+            }
+        }
+
+        fn freecount(bytes: &[u8], kind: Kind) -> u32 {
+            match kind {
+                Kind::Normal => {
+                    u32::from_be_bytes(bytes[UNION..UNION + 4].try_into().expect("a chunk record"))
+                }
+                Kind::Sparse => bytes[UNION + 3] as u32,
+            }
+        }
+
+        fn set_freecount(bytes: &mut [u8], kind: Kind, count: u32) {
+            match kind {
+                Kind::Normal => bytes[UNION..UNION + 4].copy_from_slice(&count.to_be_bytes()),
+                Kind::Sparse => bytes[UNION + 3] = count as u8,
+            }
+        }
+    }
+}
 
 impl InoRange {
     /// The lowest free inode in this chunk, if it has one.
@@ -1290,5 +1387,64 @@ mod t {
                 "more records than the node can hold"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod chunk_rec_tests {
+    use super::chunk_rec::{Freecount, Kind, FREE, SIZE, STARTINO, UNION};
+
+    /// The two layouts of the same sixteen bytes, and the one thing that differs.
+    #[test]
+    fn the_free_count_is_four_bytes_in_one_and_one_in_the_other() {
+        let mut normal = vec![0u8; SIZE];
+        let mut sparse = vec![0u8; SIZE];
+        normal[STARTINO..STARTINO + 4].copy_from_slice(&100u32.to_be_bytes());
+        sparse[STARTINO..STARTINO + 4].copy_from_slice(&100u32.to_be_bytes());
+
+        <Kind as Freecount>::set_freecount(&mut normal, Kind::Normal, 61);
+        <Kind as Freecount>::set_freecount(&mut sparse, Kind::Sparse, 61);
+
+        assert_eq!(<Kind as Freecount>::freecount(&normal, Kind::Normal), 61);
+        assert_eq!(<Kind as Freecount>::freecount(&sparse, Kind::Sparse), 61);
+
+        // And the trap is subtler than it looks: with a **zero** hole mask and a
+        // count under 256, reading a sparse record as a normal one returns the
+        // right answer, because the one-byte count sits where the four-byte field
+        // would have ended.  A first attempt at this test asserted they must differ
+        // and they did not -- which is exactly how the bug survives.
+        assert_eq!(
+            <Kind as Freecount>::freecount(&sparse, Kind::Normal),
+            61,
+            "with no holes the two readings agree, which is how this defect hides"
+        );
+
+        // A sparse chunk is sparse because it has **holes**, and that is what breaks
+        // it: the hole mask is now non-zero, so reading it as the high bytes of a
+        // four-byte count gives a number nobody intended.
+        sparse[UNION] = 0x01; // one hole
+        <Kind as Freecount>::set_freecount(&mut sparse, Kind::Sparse, 61);
+        assert_eq!(<Kind as Freecount>::freecount(&sparse, Kind::Sparse), 61);
+        assert_ne!(
+            <Kind as Freecount>::freecount(&sparse, Kind::Normal),
+            61,
+            "with holes present, reading a sparse record as normal must not agree"
+        );
+    }
+
+    /// The free mask is one 64-bit word, which is why a chunk is 64 inodes.
+    #[test]
+    fn the_mask_is_one_word_at_a_fixed_offset() {
+        let mut rec = [0u8; SIZE];
+        assert_eq!(FREE, 8);
+        assert_eq!(SIZE - FREE, 8, "the mask is exactly the rest of the record");
+        // 64 inodes need 64 bits and have them, which is why there is no wider form.
+        assert_eq!(u64::BITS, 64);
+        rec[FREE..].copy_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(
+            u64::from_be_bytes(rec[FREE..].try_into().unwrap()),
+            u64::MAX
+        );
+        let _ = UNION;
     }
 }

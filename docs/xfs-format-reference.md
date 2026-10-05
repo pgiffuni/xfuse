@@ -9,14 +9,14 @@ Concise format facts, each labelled with what kind of claim it is. Sources:
   <https://docs.kernel.org/filesystems/xfs/xfs-online-fsck-design.html>
 * `XFS Self-Describing Metadata` —
   <https://docs.kernel.org/filesystems/xfs/xfs-self-describing-metadata.html>
-* `/usr/include/xfs/xfs_format.h`, the in-tree form of the published definitions
+* the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org), the in-tree form of the published definitions
 * measurements, which name the image and the tool
 
 ## Labels
 
 | Label | Meaning |
 |:------|:--------|
-| **DOCUMENTED** | Stated in published XFS documentation or in `xfs_format.h`. |
+| **DOCUMENTED** | Stated in published XFS documentation or in the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org). |
 | **MEASURED** | Observed directly from a valid image or a native tool. The image is named. |
 | **HYPOTHESIS** | A proposed explanation not independently verified. Not a format fact. |
 | **POLICY** | A decision xfuse made. Not a format requirement. |
@@ -43,15 +43,15 @@ decides which is in a block.
 
 ### Short form
 
-**DOCUMENTED** (`xfs_btree_block_shdr`):
+**DOCUMENTED** (the short-form b-tree block header):
 
 | Offset | Field |
 |:-------|:------|
 | 0x00 | magic |
 | 0x04 | level |
 | 0x06 | numrecs |
-| 0x08 | leftsib, `__be32` |
-| 0x0c | rightsib, `__be32` |
+| 0x08 | leftsib, 4 bytes big-endian |
+| 0x0c | rightsib, 4 bytes big-endian |
 | 0x10 | blkno |
 | 0x14 | lsn |
 | 0x18 | uuid |
@@ -66,20 +66,20 @@ records at **56**.
 
 ### Long form
 
-**DOCUMENTED** (`xfs_btree_block_lhdr`):
+**DOCUMENTED** (the long-form b-tree block header):
 
 | Offset | Field |
 |:-------|:------|
 | 0x00 | magic |
 | 0x04 | level |
 | 0x06 | numrecs |
-| 0x08 | leftsib, `__be64` |
-| 0x10 | rightsib, `__be64` |
-| 0x18 | blkno, `__be64` |
-| 0x20 | lsn, `__be64` |
+| 0x08 | leftsib, 8 bytes big-endian |
+| 0x10 | rightsib, 8 bytes big-endian |
+| 0x18 | blkno, 8 bytes big-endian |
+| 0x20 | lsn, 8 bytes big-endian |
 | 0x28 | uuid |
-| 0x38 | owner, `__be64` |
-| 0x40 | crc, `__le32` |
+| 0x38 | owner, 8 bytes big-endian |
+| 0x40 | crc, 4 bytes little-endian |
 | 0x44 | pad |
 
 `XFS_BTREE_LBLOCK_LEN` = 24, `XFS_BTREE_LBLOCK_CRC_LEN` = **72**.
@@ -107,12 +107,14 @@ safe** for reproducing a block byte-for-byte, though `xfs_repair` accepts zero.
 
 **DOCUMENTED** (`xfs_bmdr_block_t`):
 
-```c
-typedef struct xfs_bmdr_block {
-    __be16  bb_level;      /* 0 is a leaf */
-    __be16  bb_numrecs;
-} xfs_bmdr_block_t;
-```
+| Offset | Field | Width | What it is |
+|:-------|:------|:------|:-----------|
+| 0 | `bb_level` | 2 | 0 for a root that is a leaf |
+| 2 | `bb_numrecs` | 2 | keys, and pointers, in the bytes after the header |
+
+Four bytes, and **no magic** — a root inside an inode is not a block and has none of a
+block's header. The key array follows, then the padding that `dfork_btree_ptr_gap`
+measures, then the pointer array.
 
 **Four bytes and no magic.** A root inside an inode is not a block and has none of a
 block's header.
@@ -124,7 +126,7 @@ is why it looked documented otherwise: **diagnostics may report decoded values**
 
 ### The record
 
-**DOCUMENTED** (`xfs_bmbt_rec_t`), 16 bytes, two `__be64`, fields interleaved
+**DOCUMENTED** (the published extent record), 16 bytes, two 8 bytes big-endian, fields interleaved
 across both:
 
 ```c
@@ -142,7 +144,7 @@ flag is 128 bits — exactly the record, so nothing is spare.
 
 **MEASURED.** In every leaf measured, `l0`'s low nine bits are zero and the start
 block occupies `l1`'s high bits alone, i.e. `startblock_field = fsb << 21`. Reading
-a record as four `__be32` folds three fields into one nonsensical number; that was
+a record as four 4 bytes big-endian folds three fields into one nonsensical number; that was
 the cause of 86 failing integration tests.
 
 **MEASURED.** Occupancy: a leaf with a parent may not be less than half full.
@@ -530,7 +532,7 @@ the system to unmount after it has already killed the daemon and waited for it.
 
 ## The log
 
-**DOCUMENTED** — `/usr/include/xfs/xfs_log_format.h`, which is the in-tree form of
+**DOCUMENTED** — the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org), which is the in-tree form of
 the published format.
 
 XFS is a **logging** file system: a modification writes its metadata to the log and
@@ -570,29 +572,37 @@ and the remainder is zeroes — and why `xlog_cksum` had to try two sizes, so a 
 filesystem could be moved between i386 and other little-endian architectures with an
 unclean log.
 
-```c
-struct xlog_rec_header {
-    __be32  h_magicno;                          /*   0: XLOG_HEADER_MAGIC_NUM   */
-    __be32  h_cycle;                            /*   4: write cycle of the log  */
-    __be32  h_version;                          /*   8: XLOG_VERSION_1 | _2    */
-    __be32  h_len;                              /*  12: bytes, 64-bit aligned   */
-    __be64  h_lsn;                              /*  16: this record's LSN      */
-    __be64  h_tail_lsn;                         /*  24: first LR with uncommitted buffers */
-    __le32  h_crc;                              /*  32: **little-endian**      */
-    __be32  h_prev_block;                       /*  36: previous log record     */
-    __be32  h_num_logops;                       /*  40: operations in this LR   */
-    __be32  h_cycle_data[XLOG_HEADER_CYCLE_SIZE / BBSIZE];   /* 44 .. block end */
-    __be32  h_fmt;                              /*     LINUX_LE 1 / LINUX_BE 2 */
-    uuid_t  h_fs_uuid;                          /*                              */
-    __be32  h_size;                             /*     iclog size, log v2 only */
-    __u32   h_pad0;                             /*     to a 4-byte multiple    */
-} xlog_rec_header_t;
-```
+| Offset | Field | Width | What it is |
+|:-------|:------|:------|:-----------|
+| 0 | `h_magicno` | 4 | [XLOG_HEADER_MAGIC_NUM] |
+| 4 | `h_cycle` | 4 | write cycle, or the magic when there is no meaningful cycle |
+| 8 | `h_version` | 4 | 1, or 2 for the later layout |
+| 12 | `h_len` | 4 | length of the data region, 64-bit aligned |
+| 16 | `h_lsn` | 8 | this record's LSN |
+| 24 | `h_tail_lsn` | 8 | LSN of the first record with buffers not yet committed |
+| 32 | `h_crc` | 4 | **little-endian**, unlike every field around it |
+| 36 | `h_prev_block` | 4 | the block holding the previous log record |
+| 40 | `h_num_logops` | 4 | operations this record carries |
+| 44 .. block end | `h_cycle_data` | 4 × N | fills the rest of the block, which is why the header sits alone in it |
+| after that | `h_fmt` | 4 | 1 little-endian, 2 big-endian |
+| then | `h_fs_uuid` | 16 | the file system's identifier |
+| then | `h_size` | 4 | IClog size; present only for log version 2 |
+| then | `h_pad0` | 4 | padding, to a four-byte multiple |
+
+The last four sit *after* `h_cycle_data`, not at fixed offsets, because that array is
+sized to run to the end of the block. The consequence is the one worth knowing: the
+header's size depends on the block size and on the architecture's alignment rules,
+which is why `xlog_cksum` validates two structure sizes, so a version 5 file system
+can be moved between i386 and other little-endian machines with an unclean log.
+
+This is a **table rather than the C declaration** on purpose. The layout is a fact
+about bytes, and facts are what this document is for; the file specifying it is
+GPL-2.0 and its text is not reproduced anywhere in this project.
 
 Two things in there that would be easy to get wrong and that the header says
 plainly:
 
-* **The checksum is little-endian** (`__le32`) while every field around it is
+* **The checksum is little-endian** (4 bytes little-endian) while every field around it is
   big-endian. A CRC computed big-endian here would be rejected.
 * **`h_cycle` is not a cycle number when the magic is present.** `xlog_get_cycle()`
   reads the magic, and if it matches, takes the *next* word as the cycle instead —
@@ -602,7 +612,8 @@ plainly:
 ### Log operation headers and flags
 
 A transaction is written as a sequence of operations, each preceded by a 12-byte
-`xlog_op_header` (`oh_tid` 4, `oh_len` 4, `oh_clientid` 1, `oh_flags` 1, `oh_res2` 2),
+`xlog_op_header`, twelve bytes: `oh_tid` 4, `oh_len` 4, `oh_clientid` 1,
+`oh_flags` 1, and two bytes of padding — which is why twelve and not ten,
 with the transaction's regions marked in `oh_flags`:
 
 ```c

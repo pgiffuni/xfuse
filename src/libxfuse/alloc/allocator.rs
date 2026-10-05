@@ -4696,7 +4696,7 @@ pub(crate) mod t {
     ///
     /// What this pins is the whole decode, not merely the shape of the bytes.  An
     /// on-disk extent record is two eight-byte words with its fields interleaved
-    /// across both of them -- `xfs_format.h` puts the start offset at `l0:9-62`,
+    /// across both of them -- the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org) puts the start offset at `l0:9-62`,
     /// the start block at `l0:0-8` together with `l1:21-63`, and the block count
     /// at `l1:0-20` -- so reading a record as four four-byte words reads three
     /// fields as one nonsense number.  That is not a detail this file used to get
