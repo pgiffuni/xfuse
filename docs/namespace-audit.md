@@ -194,11 +194,40 @@ one that hash-inserts must find a position and fix up everything after it.  Nati
 behaviour says append -- which also makes the unresolved `offset` field much less
 dangerous, because entries never move.
 
-**Still unresolved and still not to be guessed:** what `offset` *is*.  It advances
-by exactly 16 per entry regardless of entry length (96, 112, 128, 144 while byte
-positions are 6, 15, 24, 35), so it is neither a position nor a length.  Because
-entries are appended and never move, a writer can assign offsets by the same running
-rule and check itself against those four measured values.
+### Removal: measured, and it is the last piece
+
+Removing the last entry (`x`) and then the first (`b`), leaving `a` and `mmm`:
+
+```text
+before   count 4   size 44   b@96(slot 6)  a@112(15)  mmm@128(24)  x@144(35)
+after    count 2   size 26   a@112(slot  6)            mmm@128(15)
+```
+
+* `count` 4 -> 2, and `size` 44 -> 26: **exactly** 9 + 9, the two removed entries.
+* **`a` and `mmm` kept their stored offsets -- 112 and 128 -- while moving from byte
+  15 -> 6 and 24 -> 15.**
+
+So the offset is **not** a byte position, and it is **not** renumbered.  It is a
+value assigned once at insertion and left alone thereafter, advancing by exactly 16
+per appended entry regardless of entry length.
+
+**Which means neither operation renumbers anything.**  A writer appends with
+`offset = previous + 16`, and removes by deleting the entry and touching nothing
+else.  That is the whole of it, and it is the opposite of the O(n)-renumbering writer
+the "× 8 byte position" reading would have required.
+
+**One thing remains unmeasured: the base.**  The first entry's offset is 48 in
+`d1` (one entry) and in `m3` (two entries), but 96 in `m4` (four) -- and those are
+different filesystems, with different inode sizes.  So the base is a function of
+something not yet identified, most likely the inode size.  A writer cannot invent
+it; it has to be read from the directory being written, which is legitimate -- an
+existing shortform directory already carries its first entry's offset.
+
+**Not testable here, and therefore not claimed:** the 64-bit inode path.
+`i8count` selects the width, but reaching an inode number above 2^32 needs a
+filesystem with more than four billion inodes, which is not constructible at a size
+worth making.  The path must be preserved in the writable representation and must
+not carry a passing assertion.
 
 **`ftype` is present**, so my earlier inference that these filesystems lack it was
 wrong -- I had assumed an 8-byte header, and with 6 the arithmetic closes exactly.
