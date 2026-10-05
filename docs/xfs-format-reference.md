@@ -560,9 +560,28 @@ carry `0xFEEDBABE` at offset 0 **is** the log. This is now `Sb::XLOG_HEADER_MAGI
 and `Sb::log_blocks()` returns the range from the superblock — `sb_logstart` was being
 read and thrown away, which is why this had to be found by hand.
 
-**MEASURED.** On a 1 GiB image with 1 KiB blocks the log is **2048 blocks**, two
-mebibytes, at fsblocks 524299–526346. Two mebibytes is `XFS_LOG_FACTOR` behaviour at
-this size, not a coincidence.
+**MEASURED, and it does not generalise — the previous statement here was too
+strong.** On a 1 GiB image with 1 KiB blocks, one modification changed **2048
+consecutive blocks**, all carrying the magic, at fsblocks 524299–526346. On a
+600 MiB image, by contrast, only about 4500 blocks carry the magic *anywhere* and
+the longest contiguous run of them is **three blocks**.
+
+So "a long run of magic blocks is the log" holds on one image and not on another,
+and `sb_logstart` did not locate the log on the second either — which is why
+`Sb::log_blocks()` is marked untrustworthy and why the test that checks it is ignored
+for exactly this reason.
+
+Likely explanation, not established: a log block carries the magic as the header of a
+*log record*, so a block holding nothing but continuation data does not look like a
+record header at all, and a mostly-empty log is mostly not record headers. That would
+make the magic a property of the log's *contents* rather than of its *extent*, which
+is the wrong thing to locate a region with.
+
+So the procedure is corrected: **mask by the superblock's numbers, then verify the
+mask against the magic** — not derive the mask from the magic. Verifying is safe in
+both directions, since a masked block that carries no magic is one holding no record
+at this moment; deriving is what produced a mask that was right on one image and
+undetectable on another.
 
 ### The log record header
 
