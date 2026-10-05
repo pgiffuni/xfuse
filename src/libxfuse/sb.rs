@@ -104,6 +104,7 @@ impl SbFeatures2 {
         self.contains(SbFeatures2::Crc)
     }
 
+    #[allow(dead_code)] // Used as soon as a directory is written; no caller yet.
     pub const fn ftype(&self) -> bool {
         self.contains(SbFeatures2::Ftype)
     }
@@ -760,6 +761,21 @@ impl Sb {
     /// does not, and its metadata has no checksum at all.
     pub const fn has_crc(&self) -> bool {
         self.sb_features2.crc()
+    }
+
+    /// Does this file system put a file type byte in directory entries?
+    ///
+    /// A file-system-wide feature, not a per-directory one, and the difference is
+    /// **one byte per entry**.  Guessing it wrong in either direction corrupts every
+    /// entry in the directory, so it is asked rather than assumed -- which is why
+    /// `ShortformDirectory` carries it as a field even though it is derivable here:
+    /// the *decode* path cannot know it, because it is not in the directory.
+    ///
+    /// Both places it can be recorded are consulted, since a file system may carry
+    /// it in `sb_features_ro_compat` or in `sb_features_incompat` depending on when
+    /// it was made.
+    pub const fn ftype(&self) -> bool {
+        self.sb_features2.ftype() || self.sb_features_incompat.ftype()
     }
 
     /// The file system's identifier, which every checksummed structure repeats

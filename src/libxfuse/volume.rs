@@ -830,6 +830,99 @@ impl Volume {
         Ok(data.len() as u32)
     }
 
+    /// Add one entry to a **shortform** directory.
+    ///
+    /// The representation is mutated and re-serialised; persistence is the
+    /// caller's transaction, which is the shape the rest of this file uses.
+    ///
+    /// It refuses rather than approximating in three cases, each of which would
+    /// otherwise leave a directory `xfs_repair` accepts and that has lost something:
+    ///
+    /// * a directory that is **not** shortform.  Block, leaf and node directories are
+    ///   a different format and are not implemented, which is `ENOSYS` -- not
+    ///   `ENOSPC`, which would send the caller looking for space, and not `EINVAL`.
+    /// * an **empty** directory, because the offset its first entry takes cannot be
+    ///   derived: the base is 48 in one file system here and 96 in another and has
+    ///   not been identified, and an empty directory is the one case that cannot show
+    ///   it.  Inventing it would produce offsets nothing could explain.
+    /// * data that does not fit, which `set_data_bytes` refuses for the same
+    ///   reason: a shortform directory that outgrows its inode is a transition this
+    ///   project has not built.
+    #[allow(dead_code)] // Used as soon as create() and unlink() exist; only reachable then.
+    fn add_dirent(
+        &mut self,
+        parent_ino: u64,
+        name: &[u8],
+        child_ino: u64,
+        ftype: u8,
+    ) -> FsResult<()> {
+        use crate::libxfuse::dir3_sf::ShortformDirectory;
+        let sb = self.sb;
+        let inode_offset = sb.inode_offset(self.xfs_ino(parent_ino));
+        let mut tx = self.begin();
+        let bytes = tx.read_bytes(inode_offset, sb.inode_size())?;
+        let mut raw = RawDinode::from_bytes(bytes)?;
+        if raw.format() != 1 {
+            return Err(FsError::unsupported(format!(
+                "adding an entry to a directory whose data fork is in format {}",
+                raw.format()
+            )));
+        }
+        let fork = raw.data_bytes();
+        let mut dir = ShortformDirectory::decode(&fork, sb.ftype())?;
+        if dir.entries.is_empty() {
+            return Err(FsError::unsupported(
+                "adding the first entry to an empty shortform directory: the offset it takes is \
+                 not derivable and has not been measured",
+            ));
+        }
+        dir.add(name, ftype, child_ino, 0)?;
+        let now = std::time::SystemTime::now();
+        raw.set_data_bytes(&dir.serialize())?;
+        raw.set_mtime(now);
+        raw.set_ctime(now);
+        raw.finalise();
+        tx.write_bytes(inode_offset, raw.as_bytes())?;
+        tx.commit()?;
+        self.device.invalidate();
+        Ok(())
+    }
+
+    /// Remove one entry from a **shortform** directory.
+    ///
+    /// Every survivor is left byte for byte alone, because that is what the kernel
+    /// does: removing the first and last entries of a four-entry directory moved the
+    /// survivors from bytes 15 and 24 to 6 and 15 and left their stored offsets at
+    /// 112 and 128.  A renumbering implementation would diverge from XFS on the
+    /// first removal.
+    #[allow(dead_code)] // Used as soon as create() and unlink() exist; only reachable then.
+    fn remove_dirent(&mut self, parent_ino: u64, name: &[u8]) -> FsResult<()> {
+        use crate::libxfuse::dir3_sf::ShortformDirectory;
+        let sb = self.sb;
+        let inode_offset = sb.inode_offset(self.xfs_ino(parent_ino));
+        let mut tx = self.begin();
+        let bytes = tx.read_bytes(inode_offset, sb.inode_size())?;
+        let mut raw = RawDinode::from_bytes(bytes)?;
+        if raw.format() != 1 {
+            return Err(FsError::unsupported(format!(
+                "removing an entry from a directory whose data fork is in format {}",
+                raw.format()
+            )));
+        }
+        let fork = raw.data_bytes();
+        let mut dir = ShortformDirectory::decode(&fork, sb.ftype())?;
+        dir.remove(name)?;
+        let now = std::time::SystemTime::now();
+        raw.set_data_bytes(&dir.serialize())?;
+        raw.set_mtime(now);
+        raw.set_ctime(now);
+        raw.finalise();
+        tx.write_bytes(inode_offset, raw.as_bytes())?;
+        tx.commit()?;
+        self.device.invalidate();
+        Ok(())
+    }
+
     /// Shorten a file, giving the blocks it no longer covers back to the group
     /// they came from.
     ///

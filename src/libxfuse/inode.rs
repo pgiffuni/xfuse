@@ -690,6 +690,19 @@ impl RawDinode {
     /// B+tree's records live in its own blocks and rewriting them here would
     /// throw the tree away.
     #[allow(dead_code)] // Used as soon as a file's extents are changed.
+    /// Read a **local** data fork: its bytes, which for this format *are* its
+    /// contents and its size.
+    ///
+    /// The counterpart to `set_data_bytes`, and absent until now: `core_extents`
+    /// reads extent records and there was no way to get the literal bytes a
+    /// shortform directory is made of.
+    pub fn data_bytes(&self) -> Vec<u8> {
+        let start = self.literal_area_offset();
+        let limit = self.attribute_fork_offset().unwrap_or(self.bytes.len());
+        let len = (self.size() as usize).min(limit.saturating_sub(start));
+        self.bytes[start..start + len].to_vec()
+    }
+
     /// Write a **local** data fork: `data` verbatim, starting at the fork.
     ///
     /// The counterpart to `set_core_extents`, and the reason a directory can be
