@@ -102,6 +102,7 @@ type Mode = u32;
 /// -- the part after the prefix -- is the same either way, which is why the
 /// tests name attributes that way and let these helpers add what is needed.
 #[cfg(target_os = "freebsd")]
+#[allow(dead_code)]
 const XATTR_LOOKUP_PREFIX: &str = "";
 #[cfg(target_os = "linux")]
 const XATTR_LOOKUP_PREFIX: &str = "user.";
