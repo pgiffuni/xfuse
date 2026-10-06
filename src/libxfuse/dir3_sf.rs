@@ -337,6 +337,16 @@ impl ShortformDirectory {
             + self.header_len()
     }
 
+    /// Create a new empty shortform directory.
+    pub fn new(ftype: bool) -> Self {
+        ShortformDirectory {
+            parent: 0,
+            i8count: false,
+            ftype,
+            entries: Vec::new(),
+        }
+    }
+
     /// Read a shortform directory out of an inode's data fork.
     pub fn decode(bytes: &[u8], ftype: bool) -> crate::libxfuse::error::FsResult<Self> {
         use crate::libxfuse::error::FsError;
