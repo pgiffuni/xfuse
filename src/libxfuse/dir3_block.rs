@@ -38,8 +38,11 @@ use libc::{c_int, ENOENT};
 
 use super::{
     da_btree::hashname,
-    definitions::{XFS_DIR2_BLOCK_MAGIC, XFS_DIR3_BLOCK_MAGIC, XfsDahash, *},
-    dir3::{Dir2DataEntry, Dir2DataHdr, Dir2DataUnused, Dir2LeafEntry, Dir3, Dir3DataHdr, XfsDir2Dataptr},
+    definitions::{XfsDahash, XFS_DIR2_BLOCK_MAGIC, XFS_DIR3_BLOCK_MAGIC, *},
+    dir3::{
+        Dir2DataEntry, Dir2DataHdr, Dir2DataUnused, Dir2LeafEntry, Dir3, Dir3DataHdr,
+        XfsDir2Dataptr,
+    },
     sb::Sb,
     utils::{decode, get_file_type, FileKind},
 };
@@ -188,7 +191,7 @@ impl Dir2Block {
 
         // Find free space in data region
         let free_offset = self.find_free_space(entry_len)?;
-        
+
         // Write the new entry at free_offset
         let tag = free_offset as u16;
         self.write_dirent(free_offset, inumber, name_bytes, ftype, tag, has_ftype, sb)?;
@@ -269,7 +272,7 @@ impl Dir2Block {
         Ok((offset, entry))
     }
 
-/// Find free space of at least `min_len` bytes in the data region
+    /// Find free space of at least `min_len` bytes in the data region
     #[allow(dead_code, clippy::unnecessary_cast)]
     fn find_free_space(&self, min_len: usize) -> Result<usize, c_int> {
         let mut offset = self.data_offset;
@@ -303,7 +306,6 @@ impl Dir2Block {
         has_ftype: bool,
         _sb: &Sb,
     ) -> Result<(), c_int> {
-
         let namelen = name_bytes.len() as u8;
 
         // Calculate entry length
@@ -326,12 +328,12 @@ impl Dir2Block {
         if has_ftype {
             buf.push(ftype);
         }
-        
+
         // Pad to 8-byte boundary before tag
         let current_len = buf.len();
         let pad = (8 - (current_len % 8)) % 8;
         buf.extend(vec![0u8; pad]);
-        
+
         // Write tag
         buf.extend_from_slice(&tag.to_be_bytes());
 
@@ -344,8 +346,9 @@ impl Dir2Block {
     #[allow(dead_code)]
     fn add_leaf_entry(&mut self, hash: XfsDahash, address: XfsDir2Dataptr) -> Result<(), c_int> {
         // The leaf array is at the end of the block before the tail
-        let leaf_start = self.raw.len() - Dir2BlockTail::SIZE - self.tail.count as usize * Dir2LeafEntry::SIZE;
-        
+        let leaf_start =
+            self.raw.len() - Dir2BlockTail::SIZE - self.tail.count as usize * Dir2LeafEntry::SIZE;
+
         // Find insertion point (leaf is sorted by hashval)
         let mut insert_idx = 0;
         for i in 0..self.tail.count as usize {
@@ -360,7 +363,7 @@ impl Dir2Block {
 
         // Make space by shifting later entries and the tail
         let tail_offset = self.raw.len() - Dir2BlockTail::SIZE;
-        
+
         // Shift leaf entries and tail - copy data to temp buffer first to avoid borrow issues
         for i in (insert_idx..self.tail.count as usize).rev() {
             let src = leaf_start + i * Dir2LeafEntry::SIZE;
@@ -369,7 +372,7 @@ impl Dir2Block {
             tmp.copy_from_slice(&self.raw[src..src + Dir2LeafEntry::SIZE]);
             self.raw[dst..dst + Dir2LeafEntry::SIZE].copy_from_slice(&tmp);
         }
-        
+
         // Also shift the tail
         let tail_src = tail_offset;
         let tail_dst = tail_src + Dir2LeafEntry::SIZE;
@@ -379,7 +382,10 @@ impl Dir2Block {
 
         // Write new leaf entry
         let new_leaf_offset = leaf_start + insert_idx * Dir2LeafEntry::SIZE;
-        let new_leaf = Dir2LeafEntry { hashval: hash, address };
+        let new_leaf = Dir2LeafEntry {
+            hashval: hash,
+            address,
+        };
         let mut buf = Vec::with_capacity(Dir2LeafEntry::SIZE);
         buf.extend_from_slice(&new_leaf.hashval.to_be_bytes());
         buf.extend_from_slice(&new_leaf.address.to_be_bytes());
@@ -391,8 +397,9 @@ impl Dir2Block {
     /// Remove a leaf entry by hash
     #[allow(dead_code)]
     fn remove_leaf_entry(&mut self, hash: XfsDahash) -> Result<(), c_int> {
-        let leaf_start = self.raw.len() - Dir2BlockTail::SIZE - self.tail.count as usize * Dir2LeafEntry::SIZE;
-        
+        let leaf_start =
+            self.raw.len() - Dir2BlockTail::SIZE - self.tail.count as usize * Dir2LeafEntry::SIZE;
+
         // Find the leaf entry with matching hash
         for i in 0..self.tail.count as usize {
             let leaf_offset = leaf_start + i * Dir2LeafEntry::SIZE;

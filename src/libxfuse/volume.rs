@@ -40,10 +40,12 @@ use fuser::{
         FOPEN_CACHE_DIR, FOPEN_KEEP_CACHE, FUSE_ASYNC_READ, FUSE_EXPORT_SUPPORT,
         FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT,
     },
-    Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek,
-    ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, FUSE_ROOT_ID,
+    Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, FUSE_ROOT_ID,
 };
-use libc::{mode_t, ERANGE, S_IFMT, S_IFREG, S_IFDIR};
+use libc::{
+    mode_t, ERANGE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
+};
 use tracing::{debug, warn};
 
 use super::{
@@ -54,7 +56,10 @@ use super::{
     definitions::{XfsIno, XFS_DINODE_MAGIC},
     dinode::Dinode,
     dinode_core::XfsDinodeFmt,
-    dir3::{Dir3, XFS_DIR3_FT_DIR, XFS_DIR3_FT_REG_FILE},
+    dir3::{
+        Dir3, XFS_DIR3_FT_BLKDEV, XFS_DIR3_FT_CHRDEV, XFS_DIR3_FT_DIR, XFS_DIR3_FT_FIFO,
+        XFS_DIR3_FT_REG_FILE, XFS_DIR3_FT_SOCK, XFS_DIR3_FT_SYMLINK, XFS_DIR3_FT_UNKNOWN,
+    },
     dir3_sf::{ShortformDirectory, SF_OFFSET_STEP},
     error::{no_entry, FsError, FsResult},
     inode::RawDinode,
@@ -312,7 +317,12 @@ impl Volume {
         let inode_offset = sb.inode_offset(parent_ino);
         let inode_size = sb.inode_size();
         let mut bytes = vec![0u8; inode_size];
-        if self.device.device().read_at(&mut bytes, inode_offset).is_err() {
+        if self
+            .device
+            .device()
+            .read_at(&mut bytes, inode_offset)
+            .is_err()
+        {
             return 0;
         }
         let raw = RawDinode::from_bytes(bytes).ok();
@@ -327,7 +337,7 @@ impl Volume {
         0
     }
 
-/// Allocate an inode within an existing chunk in the given group.
+    /// Allocate an inode within an existing chunk in the given group.
     fn allocate_inode_in_group(
         tx: &mut Transaction<'_>,
         sb: &Sb,
@@ -338,8 +348,7 @@ impl Volume {
     ) -> FsResult<XfsIno> {
         use crate::libxfuse::alloc::allocator::allocate_ino;
 
-        let new_xfs_ino = allocate_ino(tx, sb, agno, mode, uid, gid)?
-            .ok_or(FsError::NoSpace)?;
+        let new_xfs_ino = allocate_ino(tx, sb, agno, mode, uid, gid)?.ok_or(FsError::NoSpace)?;
         Ok(new_xfs_ino)
     }
 
@@ -1442,14 +1451,15 @@ impl Filesystem for Volume {
         let gid = self.current_gid();
 
         let mut tx = self.begin();
-        let new_xfs_ino = match Self::allocate_inode_in_group(&mut tx, &sb, agno, file_mode, uid, gid) {
-            Ok(ino) => ino,
-            Err(e) => {
-                tx.abort();
-                reply.error(e.errno());
-                return;
-            }
-        };
+        let new_xfs_ino =
+            match Self::allocate_inode_in_group(&mut tx, &sb, agno, file_mode, uid, gid) {
+                Ok(ino) => ino,
+                Err(e) => {
+                    tx.abort();
+                    reply.error(e.errno());
+                    return;
+                }
+            };
         let new_ino = Self::make_fuse_ino_static(new_xfs_ino, &sb);
 
         // 2. Initialize the new inode
@@ -1520,9 +1530,18 @@ impl Filesystem for Volume {
             }
         };
 
-        eprintln!("DEBUG create: parent dir has {} entries:", dir.entries.len());
+        eprintln!(
+            "DEBUG create: parent dir has {} entries:",
+            dir.entries.len()
+        );
         for (i, e) in dir.entries.iter().enumerate() {
-            eprintln!("  entry {}: name={}, offset={}, ino={}", i, String::from_utf8_lossy(&e.name), e.offset, e.inumber);
+            eprintln!(
+                "  entry {}: name={}, offset={}, ino={}",
+                i,
+                String::from_utf8_lossy(&e.name),
+                e.offset,
+                e.inumber
+            );
         }
 
         let first_offset = if dir.entries.is_empty() {
@@ -1530,7 +1549,10 @@ impl Filesystem for Volume {
         } else {
             dir.entries.last().unwrap().offset + SF_OFFSET_STEP
         };
-        eprintln!("DEBUG create: first_offset for new entry = {}", first_offset);
+        eprintln!(
+            "DEBUG create: first_offset for new entry = {}",
+            first_offset
+        );
         if let Err(e) = dir.add(name_bytes, XFS_DIR3_FT_REG_FILE, new_xfs_ino, first_offset) {
             tx.abort();
             reply.error(e.errno());
@@ -1598,7 +1620,11 @@ impl Filesystem for Volume {
 
         // Get the child inode number
         let name_os = OsStr::from_bytes(name_bytes);
-        let child_xfs_ino = match parent_oi.dinode.get_dir(self.device.by_ref(), &sb).lookup(self.device.by_ref(), &sb, name_os) {
+        let child_xfs_ino = match parent_oi.dinode.get_dir(self.device.by_ref(), &sb).lookup(
+            self.device.by_ref(),
+            &sb,
+            name_os,
+        ) {
             Ok(ino) => ino,
             Err(_) => {
                 reply.error(libc::ENOENT);
@@ -1611,7 +1637,12 @@ impl Filesystem for Volume {
         let child_offset = sb.inode_offset(child_xfs_ino);
         let child_size = sb.inode_size();
         let mut child_bytes = vec![0u8; child_size];
-        if self.device.device().read_at(&mut child_bytes, child_offset).is_err() {
+        if self
+            .device
+            .device()
+            .read_at(&mut child_bytes, child_offset)
+            .is_err()
+        {
             reply.error(libc::EIO);
             return;
         }
@@ -1701,7 +1732,12 @@ impl Filesystem for Volume {
                             start: start as u32,
                             len: len as u32,
                         };
-                        if let Err(e) = crate::libxfuse::alloc::allocator::free_in_group(&mut tx, &sb, sb.locate_ino(child_xfs_ino).agno, run) {
+                        if let Err(e) = crate::libxfuse::alloc::allocator::free_in_group(
+                            &mut tx,
+                            &sb,
+                            sb.locate_ino(child_xfs_ino).agno,
+                            run,
+                        ) {
                             tx.abort();
                             reply.error(e.errno());
                             return;
@@ -1722,14 +1758,15 @@ impl Filesystem for Volume {
                     return;
                 }
             };
-            let mut agi = match crate::libxfuse::alloc::agi::Agi::from_bytes(agi_bytes, sb.has_crc()) {
-                Ok(a) => a,
-                Err(e) => {
-                    tx.abort();
-                    reply.error(e.errno());
-                    return;
-                }
-            };
+            let mut agi =
+                match crate::libxfuse::alloc::agi::Agi::from_bytes(agi_bytes, sb.has_crc()) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tx.abort();
+                        reply.error(e.errno());
+                        return;
+                    }
+                };
             if let Err(e) = agi.set_free_inodes(agi.free_inodes() + 1) {
                 tx.abort();
                 reply.error(e.errno());
@@ -1795,7 +1832,15 @@ impl Filesystem for Volume {
         reply.ok();
     }
 
-    fn mkdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _umask: u32, reply: ReplyEntry) {
+    fn mkdir(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
         if !self.writable {
             reply.error(libc::EROFS);
             return;
@@ -1821,14 +1866,15 @@ impl Filesystem for Volume {
         let gid = self.current_gid();
 
         let mut tx = self.begin();
-        let new_xfs_ino = match Self::allocate_inode_in_group(&mut tx, &sb, agno, dir_mode, uid, gid) {
-            Ok(ino) => ino,
-            Err(e) => {
-                tx.abort();
-                reply.error(e.errno());
-                return;
-            }
-        };
+        let new_xfs_ino =
+            match Self::allocate_inode_in_group(&mut tx, &sb, agno, dir_mode, uid, gid) {
+                Ok(ino) => ino,
+                Err(e) => {
+                    tx.abort();
+                    reply.error(e.errno());
+                    return;
+                }
+            };
         let new_ino = Self::make_fuse_ino_static(new_xfs_ino, &sb);
 
         // 2. Initialize the new directory inode
@@ -1983,7 +2029,11 @@ impl Filesystem for Volume {
             }
         };
 
-        let child_xfs_ino = match parent_oi.dinode.get_dir(self.device.by_ref(), &sb).lookup(self.device.by_ref(), &sb, OsStr::from_bytes(name_bytes)) {
+        let child_xfs_ino = match parent_oi.dinode.get_dir(self.device.by_ref(), &sb).lookup(
+            self.device.by_ref(),
+            &sb,
+            OsStr::from_bytes(name_bytes),
+        ) {
             Ok(ino) => ino,
             Err(_) => {
                 reply.error(libc::ENOENT);
@@ -1995,7 +2045,12 @@ impl Filesystem for Volume {
         let child_offset = sb.inode_offset(child_xfs_ino);
         let child_size = sb.inode_size();
         let mut child_bytes = vec![0u8; child_size];
-        if self.device.device().read_at(&mut child_bytes, child_offset).is_err() {
+        if self
+            .device
+            .device()
+            .read_at(&mut child_bytes, child_offset)
+            .is_err()
+        {
             reply.error(libc::EIO);
             return;
         }
@@ -2162,6 +2217,516 @@ impl Filesystem for Volume {
         }
 
         reply.ok();
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        if !self.writable {
+            reply.error(libc::EROFS);
+            return;
+        }
+        let name_bytes = name.as_bytes();
+        let newname_bytes = newname.as_bytes();
+        if name_bytes.is_empty()
+            || name_bytes.len() > 255
+            || newname_bytes.is_empty()
+            || newname_bytes.len() > 255
+        {
+            reply.error(libc::EINVAL);
+            return;
+        }
+        if name_bytes == b"."
+            || name_bytes == b".."
+            || newname_bytes == b"."
+            || newname_bytes == b".."
+        {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
+        let sb = self.sb;
+        let has_ftype = sb.has_ftype();
+
+        // Extract inode numbers before starting transaction to avoid borrow conflicts
+        let src_parent_ino = self.xfs_ino(parent);
+        let dst_parent_ino = self.xfs_ino(newparent);
+
+        let mut tx = self.begin();
+
+        // Read source parent directory
+        let src_parent_offset = sb.inode_offset(src_parent_ino);
+        let parent_inode_size = sb.inode_size();
+        let src_parent_bytes = match tx.read_bytes(src_parent_offset, parent_inode_size) {
+            Ok(b) => b,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+        let mut src_parent_raw = match RawDinode::from_bytes(src_parent_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+
+        if src_parent_raw.format() != XfsDinodeFmt::Local as u8 {
+            tx.abort();
+            reply.error(libc::ENOSYS);
+            return;
+        }
+
+        let mut src_dir = match ShortformDirectory::decode(&src_parent_raw.data_bytes(), has_ftype)
+        {
+            Ok(d) => d,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+
+        // Find the entry to move
+        let entry_idx = match src_dir.entries.iter().position(|e| e.name == name_bytes) {
+            Some(idx) => idx,
+            None => {
+                tx.abort();
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        let entry = src_dir.entries[entry_idx].clone();
+
+        // 2. Read destination parent directory
+        let dst_parent_offset = sb.inode_offset(dst_parent_ino);
+        let dst_parent_bytes = match tx.read_bytes(dst_parent_offset, parent_inode_size) {
+            Ok(b) => b,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+        let mut dst_parent_raw = match RawDinode::from_bytes(dst_parent_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+
+        if dst_parent_raw.format() != XfsDinodeFmt::Local as u8 {
+            tx.abort();
+            reply.error(libc::ENOSYS);
+            return;
+        }
+
+        let mut dst_dir = match ShortformDirectory::decode(&dst_parent_raw.data_bytes(), has_ftype)
+        {
+            Ok(d) => d,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+
+        // Check if destination name already exists
+        if dst_dir.entries.iter().any(|e| e.name == newname_bytes) {
+            tx.abort();
+            reply.error(libc::EEXIST);
+            return;
+        }
+
+        // 3. Remove from source directory
+        if let Err(e) = src_dir.remove(name_bytes) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        // 4. Add to destination directory with new name
+        let first_offset = if dst_dir.entries.is_empty() {
+            dst_dir.header_len() as u16
+        } else {
+            dst_dir.entries.last().unwrap().offset + SF_OFFSET_STEP
+        };
+        if let Err(e) = dst_dir.add(newname_bytes, entry.ftype, entry.inumber, first_offset) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        let now = std::time::SystemTime::now();
+
+        // 5. Update source parent
+        src_parent_raw.set_mtime(now);
+        src_parent_raw.set_ctime(now);
+        if let Err(e) = src_parent_raw.set_data_bytes(src_dir.serialize().as_slice()) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+        if let Err(e) = tx.write_bytes(src_parent_offset, src_parent_raw.as_bytes()) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        // 6. Update destination parent
+        dst_parent_raw.set_mtime(now);
+        dst_parent_raw.set_ctime(now);
+        if let Err(e) = dst_parent_raw.set_data_bytes(dst_dir.serialize().as_slice()) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+        if let Err(e) = tx.write_bytes(dst_parent_offset, dst_parent_raw.as_bytes()) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        // 7. Commit
+        if let Err(e) = tx.commit() {
+            reply.error(e.errno());
+            return;
+        }
+
+        reply.ok();
+    }
+
+    fn link(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        if !self.writable {
+            reply.error(libc::EROFS);
+            return;
+        }
+        let newname_bytes = newname.as_bytes();
+        if newname_bytes.is_empty() || newname_bytes.len() > 255 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+        if newname_bytes == b"." || newname_bytes == b".." {
+            reply.error(libc::EEXIST);
+            return;
+        }
+
+        let sb = self.sb;
+        let has_ftype = sb.has_ftype();
+        let target_xfs_ino = self.xfs_ino(ino);
+        let newparent_xfs_ino = self.xfs_ino(newparent);
+
+        let mut tx = self.begin();
+
+        // 1. Read target inode
+        let target_offset = sb.inode_offset(target_xfs_ino);
+        let inode_size = sb.inode_size();
+        let target_bytes = match tx.read_bytes(target_offset, inode_size) {
+            Ok(b) => b,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+        let mut target_raw = match RawDinode::from_bytes(target_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+
+        // Check it's not a directory (can't hardlink directories)
+        let mode = target_raw.mode();
+        if (mode as u32 & S_IFMT) == S_IFDIR {
+            tx.abort();
+            reply.error(libc::EPERM);
+            return;
+        }
+
+        // 2. Read new parent directory
+        let parent_offset = sb.inode_offset(newparent_xfs_ino);
+        let parent_bytes = match tx.read_bytes(parent_offset, inode_size) {
+            Ok(b) => b,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+        let mut parent_raw = match RawDinode::from_bytes(parent_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+
+        if parent_raw.format() != XfsDinodeFmt::Local as u8 {
+            tx.abort();
+            reply.error(libc::ENOSYS);
+            return;
+        }
+
+        let mut dir = match ShortformDirectory::decode(&parent_raw.data_bytes(), has_ftype) {
+            Ok(d) => d,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+
+        // Check if name already exists
+        if dir.entries.iter().any(|e| e.name == newname_bytes) {
+            tx.abort();
+            reply.error(libc::EEXIST);
+            return;
+        }
+
+        // 3. Add directory entry
+        let ftype = match (mode as u32) & S_IFMT {
+            S_IFREG => XFS_DIR3_FT_REG_FILE,
+            S_IFDIR => XFS_DIR3_FT_DIR,
+            S_IFLNK => XFS_DIR3_FT_SYMLINK,
+            S_IFCHR => XFS_DIR3_FT_CHRDEV,
+            S_IFBLK => XFS_DIR3_FT_BLKDEV,
+            S_IFIFO => XFS_DIR3_FT_FIFO,
+            S_IFSOCK => XFS_DIR3_FT_SOCK,
+            _ => XFS_DIR3_FT_UNKNOWN,
+        };
+        let first_offset = if dir.entries.is_empty() {
+            dir.header_len() as u16
+        } else {
+            dir.entries.last().unwrap().offset + SF_OFFSET_STEP
+        };
+        if let Err(e) = dir.add(newname_bytes, ftype, target_xfs_ino, first_offset) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        // 4. Update target inode: increment nlink, update ctime
+        let new_nlink = target_raw.nlink() + 1;
+        target_raw.set_nlink(new_nlink);
+        let now = std::time::SystemTime::now();
+        target_raw.set_ctime(now);
+        target_raw.finalise();
+
+        if let Err(e) = tx.write_bytes(target_offset, target_raw.as_bytes()) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        // 5. Update parent directory
+        parent_raw.set_mtime(now);
+        parent_raw.set_ctime(now);
+        if let Err(e) = parent_raw.set_data_bytes(dir.serialize().as_slice()) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+        if let Err(e) = tx.write_bytes(parent_offset, parent_raw.as_bytes()) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        // 6. Commit
+        if let Err(e) = tx.commit() {
+            reply.error(e.errno());
+            return;
+        }
+
+        // Return entry for new link
+        let ttl = self.ttl();
+        // Need to decode target inode with Dinode for stat
+        let target_dinode = Dinode::from_bytes(target_raw.as_bytes(), &sb, target_xfs_ino);
+        let attr = target_dinode
+            .di_core
+            .stat(target_xfs_ino)
+            .expect("target inode stat");
+        reply.entry(&ttl, &attr, 0);
+    }
+
+    fn symlink(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        if !self.writable {
+            reply.error(libc::EROFS);
+            return;
+        }
+        let name_bytes = name.as_bytes();
+        let target_bytes = target.as_os_str().as_bytes();
+        if name_bytes.is_empty() || name_bytes.len() > 255 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+        if name_bytes == b"." || name_bytes == b".." {
+            reply.error(libc::EEXIST);
+            return;
+        }
+        if target_bytes.len() >= 1024 {
+            reply.error(libc::ENAMETOOLONG);
+            return;
+        }
+
+        let sb = self.sb;
+        let has_ftype = sb.has_ftype();
+        let parent_ino = self.xfs_ino(parent);
+
+        // 1. Allocate an inode for the symlink
+        let agno = self.alloc_group_for_new_inode(parent_ino);
+        let symlink_mode = (S_IFLNK as u16) | 0o777; // symlinks typically have 777 permissions
+        let uid = self.current_uid();
+        let gid = self.current_gid();
+
+        let mut tx = self.begin();
+        let new_xfs_ino =
+            match Self::allocate_inode_in_group(&mut tx, &sb, agno, symlink_mode, uid, gid) {
+                Ok(ino) => ino,
+                Err(e) => {
+                    tx.abort();
+                    reply.error(e.errno());
+                    return;
+                }
+            };
+        let new_ino = Self::make_fuse_ino_static(new_xfs_ino, &sb);
+
+        // 2. Initialize the new symlink inode
+        let inode_offset = sb.inode_offset(new_xfs_ino);
+        let inode_size = sb.inode_size();
+        let mut raw = RawDinode::unused(inode_size);
+        raw.set_version(RawDinode::version_for(inode_size));
+        raw.set_mode(symlink_mode);
+        raw.set_nlink(1);
+        raw.set_uid(uid);
+        raw.set_gid(gid);
+        raw.set_size(target_bytes.len() as i64);
+        raw.set_format(XfsDinodeFmt::Local as u8);
+        raw.set_forkoff(0);
+        raw.set_magic(XFS_DINODE_MAGIC);
+        raw.set_aformat(XfsDinodeFmt::Extents as u8);
+        let now = std::time::SystemTime::now();
+        raw.set_mtime(now);
+        raw.set_ctime(now);
+        raw.set_atime(now);
+
+        // Store symlink target in data fork (shortform)
+        if let Err(e) = raw.set_data_bytes(target_bytes) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+        raw.finalise();
+
+        // Write the inode
+        if let Err(e) = tx.write_bytes(inode_offset, raw.as_bytes()) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        // 3. Insert directory entry in parent
+        let parent_offset = sb.inode_offset(parent_ino);
+        let parent_inode_size = sb.inode_size();
+        let parent_bytes = match tx.read_bytes(parent_offset, parent_inode_size) {
+            Ok(b) => b,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+        let mut parent_raw = match RawDinode::from_bytes(parent_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+
+        if parent_raw.format() != XfsDinodeFmt::Local as u8 {
+            tx.abort();
+            reply.error(libc::ENOSYS);
+            return;
+        }
+
+        let mut dir = match ShortformDirectory::decode(&parent_raw.data_bytes(), has_ftype) {
+            Ok(d) => d,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+
+        let first_offset = if dir.entries.is_empty() {
+            dir.header_len() as u16
+        } else {
+            dir.entries.last().unwrap().offset + SF_OFFSET_STEP
+        };
+        if let Err(e) = dir.add(name_bytes, XFS_DIR3_FT_SYMLINK, new_xfs_ino, first_offset) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        // Update parent timestamps and size
+        parent_raw.set_mtime(now);
+        parent_raw.set_ctime(now);
+        if let Err(e) = parent_raw.set_data_bytes(dir.serialize().as_slice()) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        if let Err(e) = tx.write_bytes(parent_offset, parent_raw.as_bytes()) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        // 4. Commit
+        if let Err(e) = tx.commit() {
+            reply.error(e.errno());
+            return;
+        }
+
+        let ttl = self.ttl();
+        let oi = self.open_inode(new_ino);
+        oi.dinode = Dinode::from_bytes(raw.as_bytes(), &sb, new_xfs_ino);
+        let attr = oi.dinode.di_core.stat(new_ino).expect("new symlink stat");
+        reply.entry(&ttl, &attr, 0);
     }
 
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> Result<(), i32> {

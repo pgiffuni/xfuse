@@ -1238,9 +1238,13 @@ fn create_in_shortform_directory() {
             let entry = entry.unwrap();
             let meta = entry.metadata().unwrap();
             use std::os::unix::fs::MetadataExt;
-            eprintln!("  {}: ino={}, size={}, mode={:o}", 
-                      entry.file_name().to_string_lossy(), 
-                      meta.ino(), meta.len(), meta.permissions().mode());
+            eprintln!(
+                "  {}: ino={}, size={}, mode={:o}",
+                entry.file_name().to_string_lossy(),
+                meta.ino(),
+                meta.len(),
+                meta.permissions().mode()
+            );
         }
         eprintln!("=== Inspection complete ===");
     });
