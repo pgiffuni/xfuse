@@ -131,6 +131,15 @@ impl Dir2DataEntry {
             ((namelen as i64 + 18) / 8) * 8
         }
     }
+
+    /// Get length assuming v2 format (no ftype) - used when we don't have Sb available
+    pub fn get_length_static(raw: &[u8]) -> i64 {
+        if raw.len() < 9 {
+            return 0;
+        }
+        let namelen: u8 = decode(&raw[8..]).unwrap().0;
+        ((namelen as i64 + 18 + 7) / 8) * 8
+    }
 }
 
 impl<Ctx> Decode<Ctx> for Dir2DataEntry {
@@ -171,21 +180,21 @@ impl<Ctx> Decode<Ctx> for Dir2DataEntry {
 
 #[derive(Debug)]
 pub struct Dir2DataUnused {
-    _freetag: u16,
-    _length: XfsDir2DataOff,
-    _tag: XfsDir2DataOff,
+    pub freetag: u16,
+    pub length: XfsDir2DataOff,
+    pub tag: XfsDir2DataOff,
 }
 
 impl<Ctx> Decode<Ctx> for Dir2DataUnused {
     fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, DecodeError> {
-        let _freetag = Decode::decode(decoder)?;
+        let freetag = Decode::decode(decoder)?;
         let length = Decode::decode(decoder)?;
         decoder.reader().consume(length as usize - 6);
-        let _tag = Decode::decode(decoder)?;
+        let tag = Decode::decode(decoder)?;
         Ok(Dir2DataUnused {
-            _freetag,
-            _length: length,
-            _tag,
+            freetag,
+            length,
+            tag,
         })
     }
 }
