@@ -1218,6 +1218,69 @@ fn timestamps_and_size() {
     );
 }
 
+/// create() in a shortform directory must produce a valid file with correct
+/// metadata, and the image must pass xfs_repair.
+#[test]
+fn create_in_shortform_directory() {
+    require_fusefs!();
+    eprintln!("=== Starting create_in_shortform_directory test ===");
+    let image = writable_copy(&GOLDENV4, "create");
+    eprintln!("=== Created image copy ===");
+
+    // First, inspect the sf directory to understand its structure
+    eprintln!("=== About to mount read-only for inspection ===");
+    with_ro_mount(&image, "create-inspect", |mnt| {
+        eprintln!("=== Inside read-only mount ===");
+        let sf_dir = mnt.join("sf");
+        let entries: Vec<_> = std::fs::read_dir(&sf_dir).unwrap().collect();
+        eprintln!("sf directory has {} entries:", entries.len());
+        for entry in entries {
+            let entry = entry.unwrap();
+            let meta = entry.metadata().unwrap();
+            use std::os::unix::fs::MetadataExt;
+            eprintln!("  {}: ino={}, size={}, mode={:o}", 
+                      entry.file_name().to_string_lossy(), 
+                      meta.ino(), meta.len(), meta.permissions().mode());
+        }
+        eprintln!("=== Inspection complete ===");
+    });
+    eprintln!("=== Inspection mount done ===");
+
+    // The sf/ directory in GOLDENV4 is a shortform directory with 2 entries
+    // (created by mkimg.sh: mkfiles ${MNTDIR}/sf 2).  Create a new file there.
+    eprintln!("=== About to mount read-write for create ===");
+    with_rw_mount_at(&image, "create", |mnt| {
+        eprintln!("=== Inside read-write mount ===");
+        let new_file = mnt.join("sf/newfile.txt");
+        File::create(&new_file).unwrap();
+        eprintln!("=== File created ===");
+    });
+    eprintln!("=== Create mount done ===");
+
+    // Verify the file exists with correct metadata after remount.
+    eprintln!("=== About to mount read-only for verification ===");
+    with_ro_mount(&image, "create-ro", |mnt| {
+        eprintln!("=== Inside verification mount ===");
+        let meta = std::fs::metadata(mnt.join("sf/newfile.txt")).unwrap();
+        assert_eq!(meta.len(), 0, "new file should have size 0");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o644 & 0o777,
+            "default mode should be 0o644"
+        );
+        // nlink should be 1
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(meta.nlink(), 1, "new file should have nlink=1");
+        eprintln!("=== Verification complete ===");
+    });
+    eprintln!("=== Verification mount done ===");
+
+    // The image must be structurally valid.
+    eprintln!("=== Running xfs_repair ===");
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+    eprintln!("=== Test passed ===");
+}
+
 /// A golden image that was not decompressed properly must not be silently
 /// believed.
 ///

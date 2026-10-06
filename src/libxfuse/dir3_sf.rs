@@ -487,7 +487,15 @@ impl ShortformDirectory {
             ));
         }
         let offset = match self.entries.last() {
-            Some(last) => last.offset + SF_OFFSET_STEP,
+            Some(last) => {
+                // The step between entries is the last entry's size rounded up to
+                // 8-byte alignment.  This matches native XFS behavior where the
+                // offset field in each entry is the byte position within the data
+                // fork, and entries are packed with 8-byte alignment.
+                let last_entry_len = self.entry_len(last.name.len());
+                let step = (last_entry_len + 7) & !7;
+                last.offset + step as u16
+            }
             None => first_offset,
         };
         self.entries.push(SfEntry {

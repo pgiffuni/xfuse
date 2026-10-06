@@ -1465,6 +1465,12 @@ impl Filesystem for Volume {
         raw.set_format(XfsDinodeFmt::Extents as u8);
         raw.set_forkoff(0);
         raw.set_magic(XFS_DINODE_MAGIC);
+        // A newly allocated inode must have next_unlinked set to the end-of-list
+        // marker (0xffffffff), not zero.  Zero triggers "bad next_unlinked 0x0".
+        raw.set_next_unlinked();
+        // Attribute fork format: 2 (Extents) to match data fork, with
+        // forkoff=0 indicating no attribute fork space is allocated.
+        raw.set_aformat(XfsDinodeFmt::Extents as u8);
         let now = std::time::SystemTime::now();
         raw.set_mtime(now);
         raw.set_ctime(now);
@@ -1514,11 +1520,17 @@ impl Filesystem for Volume {
             }
         };
 
+        eprintln!("DEBUG create: parent dir has {} entries:", dir.entries.len());
+        for (i, e) in dir.entries.iter().enumerate() {
+            eprintln!("  entry {}: name={}, offset={}, ino={}", i, String::from_utf8_lossy(&e.name), e.offset, e.inumber);
+        }
+
         let first_offset = if dir.entries.is_empty() {
             dir.header_len() as u16
         } else {
             dir.entries.last().unwrap().offset + SF_OFFSET_STEP
         };
+        eprintln!("DEBUG create: first_offset for new entry = {}", first_offset);
         if let Err(e) = dir.add(name_bytes, XFS_DIR3_FT_REG_FILE, new_xfs_ino, first_offset) {
             tx.abort();
             reply.error(e.errno());
@@ -1533,6 +1545,7 @@ impl Filesystem for Volume {
             reply.error(e.errno());
             return;
         }
+        parent_raw.finalise();
 
         if let Err(e) = tx.write_bytes(parent_offset, parent_raw.as_bytes()) {
             tx.abort();
