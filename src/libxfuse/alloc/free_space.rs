@@ -41,47 +41,10 @@
 //! that misreads a run will hand out a block that is in use, and two files will
 //! overwrite each other.
 //!
-//! # The shape of a node
+//! # Algorithm reference
 //!
-//! ```text
-//!  0   the magic number
-//!  4   the level, as a 16-bit number
-//!  6   how many records, as a 16-bit number
-//!  8   the block holding the node to the left, or the null block
-//! 12   the block holding the node to the right, or the null block
-//! 16   ... on a file system with checksums: the log sequence number, the
-//!      owner, a pad, the file system's identifier, and the checksum
-//!      ... then the records, and then the keys
-//! ```
-//!
-//! A record is where a run starts and how long it is, both 32-bit.  A key is
-//! where a run starts, how long it is, and -- for a run that a btree has split
-//! across nodes -- how far into the run this node begins; the last key in a node
-//! is a sentinel that starts past the end of the node's last run.
-//!
-//! The checksum, on a file system that has one, is a CRC-32C over the whole
-//! block with the checksum field read as zeroes, stored least significant byte
-//! first: the same convention the superblock, the inodes, the group header and
-//! the free list all use.
-//!
-//! # Why the header is a different size on different file systems
-//!
-//! A version 4 file system has no checksums and no owner, so its header ends
-//! after the two sibling pointers and the records start sixteen bytes into the
-//! block.  A version 5 one adds the log sequence number, the owner, the file
-//! system's identifier and the checksum, and its records start fifty-six bytes
-//! in.  This is not a detail that can be guessed from the block size, and the
-//! two are checked against real file systems in the tests below.
-//!
-//! # What is here and what is not
-//!
-//! Here: reading a node -- its header, its records, and its checksums -- and
-//! telling a leaf from an interior node.
-//!
-//! Not yet: walking from a root down through the interior nodes to the leaf that
-//! covers a given block.  That is the next step, and it is where the *keys*
-//! above start to matter, because an interior node's records are the blocks
-//! holding its children rather than free runs.
+//! See [`docs/xfs-algorithms.md`] section 2 (Free-space management) for the
+//! algorithm map with DOCUMENTED/MEASURED/IMPLEMENTED/HYPOTHESIS labels.
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use crc::{Crc, CRC_32_ISCSI};

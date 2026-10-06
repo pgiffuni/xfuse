@@ -62,6 +62,12 @@
 //! neighbours, so freeing a block belongs with the operation that frees one.  And
 //! it does not put anything in the group's free list, which in the images tested
 //! here is not initialised at all.
+//!
+//! # Algorithm reference
+//!
+//! See [`docs/xfs-algorithms.md`] sections 1--3 (Allocation groups, Free-space
+//! management, Inode allocation) for the algorithm map with
+//! DOCUMENTED/MEASURED/IMPLEMENTED/HYPOTHESIS labels.
 
 use super::{
     agf::Agf,

@@ -25,6 +25,17 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+//! B+tree for a file's extent map (BMBT).
+//!
+//! A file's data fork holds either a list of extents (in the inode) or a B+tree
+//! (the BMBT) rooted in the inode and spilling into blocks.  This module
+//! provides the on-disk block structures, reading, and bounded construction.
+//!
+//! # Algorithm reference
+//!
+//! See [`docs/xfs-algorithms.md`] sections 5--6 (File extent maps, BMBT
+//! algorithms) for the algorithm map with DOCUMENTED/MEASURED/IMPLEMENTED/
+//! HYPOTHESIS labels.
 use std::{
     cell::RefCell,
     collections::{btree_map::Entry, BTreeMap},

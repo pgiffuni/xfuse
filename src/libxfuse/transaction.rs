@@ -59,6 +59,11 @@
 //!   before the journal exists, and it is reachable only behind
 //!   `--experimental-rw`.
 //!
+//! # Algorithm reference
+//!
+//! See [`docs/xfs-algorithms.md`] section 10 (Transactions) for the algorithm
+//! map with DOCUMENTED/MEASURED/IMPLEMENTED/HYPOTHESIS labels.
+//!
 //! When the journal arrives it becomes a third strategy behind the same
 //! `commit`, and nothing above this module changes.
 

@@ -35,20 +35,10 @@
 //! [group inode header](super::agi) cannot be answered from this tree: the tree
 //! says which ranges are used, and says nothing about the gaps between them.
 //!
-//! # The two shapes of a node
+//! # Algorithm reference
 //!
-//! The tree is shaped like every other b-tree here, and the shapes differ in how
-//! much a record costs:
-//!
-//! | | a record costs | so a node holds |
-//! |:-|:-:|:-:|
-//! | a leaf | 16 bytes -- the first inode number, how many are free, the first free one, and a fourth field nothing here reads | `(blocksize - 16) / 16` |
-//! | an interior node | 8 bytes -- a four byte key and a four byte pointer | `(blocksize - 16) / 8` |
-//!
-//! The free count and the first free inode are there for a file system that
-//! tracks free inodes in a tree of their own.  On a version 1 header, which has
-//! no such tree, they are zero and the gaps between the ranges are where the
-//! free inodes are.
+//! See [`docs/xfs-algorithms.md`] section 4 (Inode B-trees) for the algorithm map
+//! with DOCUMENTED/MEASURED/IMPLEMENTED/HYPOTHESIS labels.
 
 use crate::libxfuse::{
     definitions::{XfsAgblock, XfsIno},

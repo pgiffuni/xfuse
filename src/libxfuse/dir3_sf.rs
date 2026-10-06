@@ -25,6 +25,16 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+//! Shortform (local) directory format and mutation.
+//!
+//! A directory with few entries fits entirely in the inode's data fork.  This
+//! module decodes, serializes, and mutates the shortform format: adding an
+//! entry appends it (insertion order), removing leaves survivors untouched.
+//!
+//! # Algorithm reference
+//!
+//! See [`docs/xfs-algorithms.md`] section 7 (Directories) for the algorithm map
+//! with DOCUMENTED/MEASURED/IMPLEMENTED/HYPOTHESIS labels.
 use std::{
     ffi::{OsStr, OsString},
     io::{BufRead, Seek},
