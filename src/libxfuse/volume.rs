@@ -32,7 +32,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use fuser::{
@@ -40,7 +40,7 @@ use fuser::{
         FOPEN_CACHE_DIR, FOPEN_KEEP_CACHE, FUSE_ASYNC_READ, FUSE_EXPORT_SUPPORT,
         FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT,
     },
-    Filesystem, KernelConfig, ReplyAttr, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek,
+    Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek,
     ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, FUSE_ROOT_ID,
 };
 use libc::{mode_t, ERANGE, S_IFMT, S_IFREG};
@@ -51,10 +51,11 @@ use super::{
     block_device::{Access, BlockDevice},
     block_reader::BlockReader,
     capabilities::FsCapabilities,
-    definitions::XfsIno,
+    definitions::{XfsIno, XFS_DINODE_MAGIC},
     dinode::Dinode,
     dinode_core::XfsDinodeFmt,
-    dir3::Dir3,
+    dir3::{Dir3, XFS_DIR3_FT_REG_FILE},
+    dir3_sf::{ShortformDirectory, SF_OFFSET_STEP},
     error::{no_entry, FsError, FsResult},
     inode::RawDinode,
     sb::Sb,
@@ -303,6 +304,74 @@ impl Volume {
         self.tx.begin()
     }
 
+    /// Choose an allocation group for a new inode.  For now, use the same AG as
+    /// the parent directory.  A real implementation would round-robin or pick
+    /// the AG with the most free inodes.
+    fn alloc_group_for_new_inode(&self, parent_ino: XfsIno) -> u32 {
+        let sb = &self.sb;
+        let inode_offset = sb.inode_offset(parent_ino);
+        let inode_size = sb.inode_size();
+        let mut bytes = vec![0u8; inode_size];
+        if self.device.device().read_at(&mut bytes, inode_offset).is_err() {
+            return 0;
+        }
+        let raw = RawDinode::from_bytes(bytes).ok();
+        if let Some(r) = raw {
+            if r.version() == 3 {
+                if let Some(ino) = r.ino() {
+                    return sb.locate_ino(ino).agno;
+                }
+            }
+        }
+        // Fallback: use AG 0
+        0
+    }
+
+/// Allocate an inode within an existing chunk in the given group.
+    fn allocate_inode_in_group(
+        tx: &mut Transaction<'_>,
+        sb: &Sb,
+        agno: u32,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> FsResult<XfsIno> {
+        use crate::libxfuse::alloc::allocator::allocate_ino;
+
+        let new_xfs_ino = allocate_ino(tx, sb, agno, mode, uid, gid)?
+            .ok_or(FsError::NoSpace)?;
+        Ok(new_xfs_ino)
+    }
+
+    /// Convert XFS inode number to FUSE inode number (inverse of xfs_ino).
+    #[allow(dead_code)]
+    fn make_fuse_ino(&self, xfs_ino: XfsIno) -> u64 {
+        if xfs_ino == self.sb.sb_rootino {
+            FUSE_ROOT_ID
+        } else {
+            xfs_ino
+        }
+    }
+
+    /// Static version of make_fuse_ino that takes the superblock as a parameter.
+    fn make_fuse_ino_static(xfs_ino: XfsIno, sb: &Sb) -> u64 {
+        if xfs_ino == sb.sb_rootino {
+            FUSE_ROOT_ID
+        } else {
+            xfs_ino
+        }
+    }
+
+    /// Current UID from the request context (placeholder: use root).
+    fn current_uid(&self) -> u32 {
+        0
+    }
+
+    /// Current GID from the request context (placeholder: use root).
+    fn current_gid(&self) -> u32 {
+        0
+    }
+
     /// Overwrite part of an existing file.
     ///
     /// Only bytes that are already inside a written extent of the file may be
@@ -422,7 +491,7 @@ impl Volume {
             }
         };
 
-        let now = SystemTime::now();
+        let now = std::time::SystemTime::now();
 
         // A file grows where it is, so the groups are tried from the one its
         // last block is in, and then round upwards.
@@ -1210,7 +1279,7 @@ impl Volume {
 
         let inode_offset = self.sb.inode_offset(self.xfs_ino(ino));
         let inode_size = self.sb.inode_size();
-        let now = SystemTime::now();
+        let now = std::time::SystemTime::now();
         let mut tx = self.begin();
         let mut written = 0u64;
         for (at, len, _run) in runs {
@@ -1331,6 +1400,160 @@ impl Filesystem for Volume {
             .expect("Unknown file type");
 
         reply.attr(&ttl, &attr)
+    }
+
+    fn create(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        if !self.writable {
+            reply.error(libc::EROFS);
+            return;
+        }
+        if parent == FUSE_ROOT_ID {
+            reply.error(libc::EPERM);
+            return;
+        }
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty() || name_bytes.len() > 255 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+        if name_bytes == b"." || name_bytes == b".." {
+            reply.error(libc::EEXIST);
+            return;
+        }
+
+        // Extract superblock values needed during the transaction.
+        let sb = self.sb;
+        let has_ftype = sb.has_ftype();
+        let parent_ino = self.xfs_ino(parent);
+
+        // 1. Allocate an inode number (within existing chunk if possible)
+        let agno = self.alloc_group_for_new_inode(parent_ino);
+        let file_mode = (mode as u16) | (S_IFREG as u16);
+        let uid = self.current_uid();
+        let gid = self.current_gid();
+
+        let mut tx = self.begin();
+        let new_xfs_ino = match Self::allocate_inode_in_group(&mut tx, &sb, agno, file_mode, uid, gid) {
+            Ok(ino) => ino,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+        let new_ino = Self::make_fuse_ino_static(new_xfs_ino, &sb);
+
+        // 2. Initialize the new inode
+        let inode_offset = sb.inode_offset(new_xfs_ino);
+        let inode_size = sb.inode_size();
+        let mut raw = RawDinode::unused(inode_size);
+        raw.set_version(RawDinode::version_for(inode_size));
+        raw.set_mode(file_mode);
+        raw.set_nlink(1);
+        raw.set_uid(uid);
+        raw.set_gid(gid);
+        raw.set_size(0);
+        raw.set_format(XfsDinodeFmt::Extents as u8);
+        raw.set_forkoff(0);
+        raw.set_magic(XFS_DINODE_MAGIC);
+        let now = std::time::SystemTime::now();
+        raw.set_mtime(now);
+        raw.set_ctime(now);
+        raw.set_atime(now);
+        raw.finalise();
+
+        // Write the inode
+        if let Err(e) = tx.write_bytes(inode_offset, raw.as_bytes()) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        // 3. Insert directory entry in parent
+        let parent_offset = sb.inode_offset(parent_ino);
+        let parent_inode_size = sb.inode_size();
+        let parent_bytes = match tx.read_bytes(parent_offset, parent_inode_size) {
+            Ok(b) => b,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+        let mut parent_raw = match RawDinode::from_bytes(parent_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+
+        // Parent must be a shortform directory
+        if parent_raw.format() != XfsDinodeFmt::Local as u8 {
+            tx.abort();
+            reply.error(libc::ENOSYS);
+            return;
+        }
+
+        let mut dir = match ShortformDirectory::decode(&parent_raw.data_bytes(), has_ftype) {
+            Ok(d) => d,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+
+        let first_offset = if dir.entries.is_empty() {
+            dir.header_len() as u16
+        } else {
+            dir.entries.last().unwrap().offset + SF_OFFSET_STEP
+        };
+        if let Err(e) = dir.add(name_bytes, XFS_DIR3_FT_REG_FILE, new_xfs_ino, first_offset) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        // Update parent timestamps and size
+        parent_raw.set_mtime(now);
+        parent_raw.set_ctime(now);
+        if let Err(e) = parent_raw.set_data_bytes(dir.serialize().as_slice()) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        if let Err(e) = tx.write_bytes(parent_offset, parent_raw.as_bytes()) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        // 5. Commit
+        if let Err(e) = tx.commit() {
+            reply.error(e.errno());
+            return;
+        }
+
+        let ttl = self.ttl();
+
+        // 4. Add inode to open files (after commit, so we can borrow self again)
+        let oi = self.open_inode(new_ino);
+        oi.dinode = Dinode::from_bytes(raw.as_bytes(), &sb, new_xfs_ino);
+
+        let attr = oi.dinode.di_core.stat(new_ino).expect("new inode stat");
+        reply.created(&ttl, &attr, 0, 0, 0);
     }
 
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> Result<(), i32> {
