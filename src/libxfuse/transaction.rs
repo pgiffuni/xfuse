@@ -98,15 +98,15 @@ impl CommitMode {
 /// its transactions rather than interleaving them, and it is much easier to
 /// prove correct.
 pub struct Transaction<'a> {
-    device:   &'a BlockDevice,
-    cache:    &'a mut BlockCache,
-    sb:       &'a Sb,
-    mode:     CommitMode,
+    device: &'a BlockDevice,
+    cache: &'a mut BlockCache,
+    sb: &'a Sb,
+    mode: CommitMode,
     /// Whether the device in use is the real-time device.  Real-time blocks
     /// live on a separate image, so a transaction has to know which one it is
     /// writing to.
     realtime: bool,
-    done:     bool,
+    done: bool,
 }
 
 impl<'a> Transaction<'a> {
@@ -351,9 +351,9 @@ impl Drop for Transaction<'_> {
 #[derive(Debug)]
 pub struct TransactionContext {
     device: Arc<BlockDevice>,
-    cache:  BlockCache,
-    sb:     Sb,
-    mode:   CommitMode,
+    cache: BlockCache,
+    sb: Sb,
+    mode: CommitMode,
 }
 
 impl TransactionContext {
@@ -421,10 +421,10 @@ mod t {
     }
 
     struct Harness {
-        _f:    tempfile::NamedTempFile,
-        dev:   BlockDevice,
+        _f: tempfile::NamedTempFile,
+        dev: BlockDevice,
         cache: BlockCache,
-        sb:    Sb,
+        sb: Sb,
     }
 
     fn harness(writable: bool) -> Harness {
@@ -436,10 +436,10 @@ mod t {
             Access::ReadOnly
         };
         Harness {
-            dev:   BlockDevice::open(f.path(), access).unwrap(),
+            dev: BlockDevice::open(f.path(), access).unwrap(),
             cache: BlockCache::new(512, 64),
-            sb:    sb(),
-            _f:    f,
+            sb: sb(),
+            _f: f,
         }
     }
 

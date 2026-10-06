@@ -68,14 +68,8 @@ use super::{
     agfl::Agfl,
     agi::Agi,
     free_space::{
-        first_run_from,
-        free_in_both_trees,
-        range_is_free,
-        take_from_both_trees,
-        FreeRun,
-        FreeSpace,
-        GroupBlocks,
-        GroupGeometry,
+        first_run_from, free_in_both_trees, range_is_free, take_from_both_trees, FreeRun,
+        FreeSpace, GroupBlocks, GroupGeometry,
     },
     inobt::{first_free_ino, insert_chunk, InoRange, InobtNode, INODES_PER_CHUNK},
 };
@@ -97,12 +91,12 @@ pub struct TransactionBlocks<'a, 't, 's> {
     transaction: &'a mut Transaction<'t>,
     /// The superblock, for the group header and the free list -- the two places
     /// outside the tree that have to move with it.
-    sb:          &'s Sb,
-    agno:        u32,
+    sb: &'s Sb,
+    agno: u32,
     /// The image offset of the group, so that a group-relative block number can be
     /// turned into one.
-    ag_offset:   u64,
-    blocksize:   usize,
+    ag_offset: u64,
+    blocksize: usize,
 }
 
 impl<'a, 't, 's> TransactionBlocks<'a, 't, 's> {
@@ -222,7 +216,7 @@ impl<'a, 't, 's> TransactionBlocks<'a, 't, 's> {
                     agf.extent_btree_root(),
                     FreeRun {
                         start: block,
-                        len:   1,
+                        len: 1,
                     },
                 )?;
                 let mut space = FreeSpace::new(self, geometry, by_block_root, by_size_root);
@@ -850,7 +844,7 @@ pub fn allocate_new_chunk(transaction: &mut Transaction<'_>, sb: &Sb, agno: u32)
         agno,
         FreeRun {
             start: first_block,
-            len:   chunk_blocks,
+            len: chunk_blocks,
         },
     )?;
 
@@ -899,9 +893,9 @@ pub fn allocate_new_chunk(transaction: &mut Transaction<'_>, sb: &Sb, agno: u32)
     // first insertion: seven of its nine leaves hold 31 records and a 512-byte
     // leaf holds 31.
     let range = InoRange {
-        start:      startino,
+        start: startino,
         free_count: INODES_PER_CHUNK as u32,
-        free:       u64::MAX,
+        free: u64::MAX,
     };
     let mut store = TransactionBlocks::new(transaction, sb, agno);
     let root = insert_chunk(&mut store, root, range)?;
@@ -1247,7 +1241,7 @@ pub fn free_in_group(
                 agf.extent_btree_root(),
                 FreeRun {
                     start: run.start,
-                    len:   to_trees,
+                    len: to_trees,
                 },
             )
             .map_err(|e| tag(e, "freeing into the trees"))?
@@ -1374,16 +1368,8 @@ pub(crate) mod t {
     use byteorder::{BigEndian, ByteOrder};
 
     use super::{
-        allocate,
-        allocate_in_group,
-        allocate_ino,
-        allocate_new_chunk,
-        free_in_group,
-        read_agf,
-        GroupBlocks,
-        GroupGeometry,
-        TransactionBlocks,
-        WhereTheBlockWent,
+        allocate, allocate_in_group, allocate_ino, allocate_new_chunk, free_in_group, read_agf,
+        GroupBlocks, GroupGeometry, TransactionBlocks, WhereTheBlockWent,
     };
     use crate::libxfuse::{
         alloc::{
@@ -1391,12 +1377,7 @@ pub(crate) mod t {
             agfl::Agfl,
             agi::Agi,
             free_space::{
-                FreeRun,
-                FreeSpaceNode,
-                ENTRY_LEN,
-                PTR_LEN,
-                RECORD_LEN,
-                XFS_ABTB_MAGIC,
+                FreeRun, FreeSpaceNode, ENTRY_LEN, PTR_LEN, RECORD_LEN, XFS_ABTB_MAGIC,
                 XFS_ABTC_MAGIC,
             },
             inobt::{chunks_in_order, InobtNode, INODES_PER_CHUNK},
@@ -1404,11 +1385,7 @@ pub(crate) mod t {
         block_cache::BlockCache,
         block_device::{Access, BlockDevice},
         btree::{
-            BmbtLeafBlock,
-            BmbtLeafRecord,
-            BtreeLblockHdr,
-            BMBT_CRC_HEADER_LEN,
-            BMBT_HEADER_LEN,
+            BmbtLeafBlock, BmbtLeafRecord, BtreeLblockHdr, BMBT_CRC_HEADER_LEN, BMBT_HEADER_LEN,
             BMBT_RECORD_LEN,
         },
         dinode::{DiA, DiU, Dinode},
@@ -1755,7 +1732,7 @@ pub(crate) mod t {
                 0,
                 FreeRun {
                     start: 150,
-                    len:   20,
+                    len: 20,
                 },
             )
             .expect("free");
@@ -1800,7 +1777,7 @@ pub(crate) mod t {
             assert!(
                 by_block.contains(&FreeRun {
                     start: 100,
-                    len:   70,
+                    len: 70,
                 }),
                 "the freed run did not join the one it touches: {by_block:?}"
             );
@@ -1949,7 +1926,7 @@ pub(crate) mod t {
         };
         let already = FreeRun {
             start: victim.start + 2,
-            len:   2,
+            len: 2,
         };
         {
             let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
@@ -2169,10 +2146,7 @@ pub(crate) mod t {
             assert!(decoded.verify_crc(), "a node written here must verify");
             assert_eq!(
                 decoded.runs().expect("the node's runs"),
-                vec![FreeRun {
-                    start: at,
-                    len:   1,
-                }]
+                vec![FreeRun { start: at, len: 1 }]
             );
 
             // And the transaction goes on: a second block, which is not the same
@@ -3546,7 +3520,8 @@ pub(crate) mod t {
                 shape.leaves += 1;
                 let ranges = node.ranges().expect("the leaf's records");
                 shape.records += ranges.len();
-                if ranges.len() == InobtNode::leaf_capacity(sb.sb_blocksize as usize) {
+                if ranges.len() == InobtNode::leaf_capacity(sb.sb_blocksize as usize, sb.has_crc())
+                {
                     shape.full_leaves += 1;
                 }
                 if !ranges.windows(2).all(|w| w[0].start < w[1].start) {
@@ -6070,7 +6045,7 @@ pub(crate) mod t {
                 agno,
                 FreeRun {
                     start: victim,
-                    len:   1,
+                    len: 1,
                 },
             )
             .expect("free one block from inside a run");
@@ -6750,7 +6725,7 @@ pub(crate) mod t {
         }
         let freed = FreeRun {
             start: occupied[0],
-            len:   2,
+            len: 2,
         };
         let before = measure(copy.path());
         let device = Arc::new(BlockDevice::open(copy.path(), Access::ReadWrite).unwrap());
@@ -6953,7 +6928,7 @@ pub(crate) mod t {
             while offset < taken.len {
                 let block = FreeRun {
                     start: taken.start + offset,
-                    len:   1,
+                    len: 1,
                 };
                 let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
                 free_in_group(&mut tx, &sb, 0, block).expect("free");

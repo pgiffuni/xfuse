@@ -71,11 +71,11 @@ pub use constants::*;
 #[derive(Debug, Decode)]
 pub struct Dir3BlkHdr {
     pub magic: u32,
-    _crc:      u32,
-    _blkno:    u64,
-    _lsn:      u64,
-    _uuid:     Uuid,
-    _owner:    u64,
+    _crc: u32,
+    _blkno: u64,
+    _lsn: u64,
+    _uuid: Uuid,
+    _owner: u64,
 }
 
 impl Dir3BlkHdr {
@@ -94,7 +94,7 @@ impl Dir2DataFree {
 
 #[derive(Debug, Decode)]
 pub struct Dir2DataHdr {
-    pub magic:  u32,
+    pub magic: u32,
     _best_free: [Dir2DataFree; constants::XFS_DIR2_DATA_FD_COUNT],
 }
 
@@ -104,9 +104,9 @@ impl Dir2DataHdr {
 
 #[derive(Debug, Decode)]
 pub struct Dir3DataHdr {
-    pub hdr:    Dir3BlkHdr,
+    pub hdr: Dir3BlkHdr,
     _best_free: [Dir2DataFree; constants::XFS_DIR2_DATA_FD_COUNT],
-    _pad:       u32,
+    _pad: u32,
 }
 
 impl Dir3DataHdr {
@@ -117,9 +117,9 @@ impl Dir3DataHdr {
 #[derive(Debug)]
 pub struct Dir2DataEntry {
     pub inumber: XfsIno,
-    pub name:    OsString,
-    pub ftype:   Option<u8>,
-    pub tag:     XfsDir2DataOff,
+    pub name: OsString,
+    pub ftype: Option<u8>,
+    pub tag: XfsDir2DataOff,
 }
 
 impl Dir2DataEntry {
@@ -172,8 +172,8 @@ impl<Ctx> Decode<Ctx> for Dir2DataEntry {
 #[derive(Debug)]
 pub struct Dir2DataUnused {
     _freetag: u16,
-    _length:  XfsDir2DataOff,
-    _tag:     XfsDir2DataOff,
+    _length: XfsDir2DataOff,
+    _tag: XfsDir2DataOff,
 }
 
 impl<Ctx> Decode<Ctx> for Dir2DataUnused {

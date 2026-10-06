@@ -60,13 +60,13 @@ use crate::libxfuse::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FreeIno {
     /// The inode's number across the whole file system.
-    pub ino:         XfsIno,
+    pub ino: XfsIno,
     /// The leaf that holds the chunk's record.
-    pub block:       XfsAgblock,
+    pub block: XfsAgblock,
     /// The first inode number of the chunk.
     pub chunk_start: u64,
     /// Which bit of the chunk's mask says this inode is free.
-    pub bit:         u32,
+    pub bit: u32,
 }
 
 /// Every chunk a tree holds, with the leaf it is in, in the order the tree holds
@@ -138,15 +138,27 @@ use crate::libxfuse::alloc::{agf::NULL_AGBLOCK, free_space::GroupBlocks};
 /// Both depths carry the same one: a 512-byte image's group 1 has an interior
 /// node at block 12 and a leaf at block 6 and both read `IABT`.  The level field
 /// is what tells them apart, which is why there is one magic here and not two.
+///
+/// Two magics exist depending on whether the filesystem has CRC support enabled:
+/// the non-CRC `XFS_INOBT_MAGIC` ("IABT") and the CRC `XFS_INOBT_CRC_MAGIC`
+/// ("IAB3").  `from_bytes` accepts either so that either layout decodes; which
+/// one a node carries is fixed by the superblock and is only needed when *writing*
+/// a node, to avoid rewriting a v4 image in v5 spelling or vice versa.
 const XFS_INOBT_MAGIC: u32 = 0x4941_4254;
+const XFS_INOBT_CRC_MAGIC: u32 = 0x4941_4233;
 
 const MAGIC: usize = 0;
 const LEVEL: usize = 4;
 const NUMRECS: usize = 6;
 const LEFTSIB: usize = 8;
 const RIGHTSIB: usize = 12;
-/// Where a leaf's records start, which is also where an interior node's keys do.
-const BODY: usize = 16;
+/// Where a leaf's records start on a file system without checksums.
+const BODY_NO_CRC: usize = 16;
+/// Where a leaf's records start on a file system with checksums.
+///
+/// The CRC header adds LSN (8), UUID (16), owner (8), and CRC (4) = 36 bytes,
+/// rounded to 40 bytes of additional header, making 56 total.
+const BODY_CRC: usize = 56;
 /// How much a leaf's records are apart.
 ///
 /// Sixteen, not the twelve the three fields it shows would suggest.  That is
@@ -157,9 +169,10 @@ const LEAF_RECORD: usize = 16;
 /// One node of the b-tree of used inode numbers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InobtNode {
-    bytes:   Box<[u8]>,
-    level:   u16,
+    bytes: Box<[u8]>,
+    level: u16,
     numrecs: u16,
+    has_crc: bool,
 }
 
 /// A range of inode numbers the tree says are in use.
@@ -170,12 +183,12 @@ pub struct InobtNode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InoRange {
     /// The first inode number this chunk covers.
-    pub start:      u64,
+    pub start: u64,
     /// How many of the chunk's inodes are free, which is the number of set bits
     /// in [`Self::free`] and is checked against it.
     pub free_count: u32,
     /// Which of the chunk's inodes are free, one bit per inode.
-    pub free:       u64,
+    pub free: u64,
 }
 
 /// How many inode numbers one chunk covers, which is the width of the mask.
@@ -463,9 +476,10 @@ fn insert_chunk_above<B: GroupBlocks>(
     leaf.replace_ranges(low)?;
     leaf.link_right(NULL_AGBLOCK);
     leaf.update_crc();
+    let has_crc = leaf.has_crc;
     blocks.put(leaf_block, leaf.into_bytes())?;
     let sibling_block = blocks.take_inode_tree_block()?;
-    let mut sibling = InobtNode::empty_leaf(size);
+    let mut sibling = InobtNode::empty_leaf(size, has_crc);
     sibling.replace_ranges(high)?;
     sibling.update_crc();
     blocks.put(sibling_block, sibling.into_bytes())?;
@@ -521,7 +535,7 @@ fn insert_chunk_above<B: GroupBlocks>(
     let left = InobtNode::from_bytes(blocks.get(leaf_block)?)?;
     let left_key = left.ranges()?.first().map(|c| c.start).unwrap_or(0);
     let root_block = blocks.take_inode_tree_block()?;
-    let mut new_root = InobtNode::new_interior(size);
+    let mut new_root = InobtNode::new_interior(size, has_crc);
     new_root.push_child(left_key, leaf_block)?;
     new_root.push_child(sibling_key, sibling_block)?;
     new_root.update_crc();
@@ -573,20 +587,23 @@ impl InobtNode {
     /// Read a node out of a block's bytes.
     pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> FsResult<Self> {
         let bytes = bytes.into();
-        if bytes.len() < BODY + 4 {
+        if bytes.len() < BODY_NO_CRC + 4 {
             return Err(FsError::corrupt(
                 "an inode b-tree node is too short to hold a header",
             ));
         }
-        if u32::from_be_bytes(bytes[MAGIC..MAGIC + 4].try_into().unwrap()) != XFS_INOBT_MAGIC {
+        let magic = u32::from_be_bytes(bytes[MAGIC..MAGIC + 4].try_into().unwrap());
+        if magic != XFS_INOBT_MAGIC && magic != XFS_INOBT_CRC_MAGIC {
             return Err(FsError::corrupt(
                 "expected the start of an inode b-tree node",
             ));
         }
+        let has_crc = magic == XFS_INOBT_CRC_MAGIC;
         Ok(Self {
-            level:   u16::from_be_bytes(bytes[LEVEL..LEVEL + 2].try_into().unwrap()),
+            level: u16::from_be_bytes(bytes[LEVEL..LEVEL + 2].try_into().unwrap()),
             numrecs: u16::from_be_bytes(bytes[NUMRECS..NUMRECS + 2].try_into().unwrap()),
-            bytes:   bytes.into_boxed_slice(),
+            has_crc,
+            bytes: bytes.into_boxed_slice(),
         })
     }
 
@@ -663,13 +680,15 @@ impl InobtNode {
     }
 
     /// How many records a leaf of this size can hold.
-    pub fn leaf_capacity(blocksize: usize) -> usize {
-        (blocksize - BODY) / LEAF_RECORD
+    pub fn leaf_capacity(blocksize: usize, has_crc: bool) -> usize {
+        let body = if has_crc { BODY_CRC } else { BODY_NO_CRC };
+        (blocksize - body) / LEAF_RECORD
     }
 
     /// How many children an interior node of this size can hold.
-    pub fn interior_capacity(blocksize: usize) -> usize {
-        (blocksize - BODY) / 8
+    pub fn interior_capacity(blocksize: usize, has_crc: bool) -> usize {
+        let body = if has_crc { BODY_CRC } else { BODY_NO_CRC };
+        (blocksize - body) / 8
     }
 
     /// Put a chunk into this leaf, in the order the leaf keeps them.
@@ -692,7 +711,7 @@ impl InobtNode {
                 "only a leaf of the inode tree holds chunks",
             ));
         }
-        let at = Self::leaf_capacity(self.bytes.len());
+        let at = Self::leaf_capacity(self.bytes.len(), self.has_crc);
         if self.numrecs as usize >= at {
             return Err(FsError::NoSpace);
         }
@@ -729,7 +748,8 @@ impl InobtNode {
         let start = u32::try_from(range.start).map_err(|_| FsError::Corrupt {
             what: format!("inode number {} does not fit a chunk record", range.start),
         })?;
-        let at = BODY + at * LEAF_RECORD;
+        let body = if self.has_crc { BODY_CRC } else { BODY_NO_CRC };
+        let at = body + at * LEAF_RECORD;
         let room = self.bytes.len().checked_sub(at + LEAF_RECORD);
         if room.is_none() {
             return Err(FsError::corrupt(
@@ -761,11 +781,12 @@ impl InobtNode {
         }
         (0..self.numrecs as usize)
             .map(|i| {
-                let at = BODY + i * LEAF_RECORD;
+                let body = if self.has_crc { BODY_CRC } else { BODY_NO_CRC };
+                let at = body + i * LEAF_RECORD;
                 Ok(InoRange {
-                    start:      u64::from(self.u32_at(at)),
+                    start: u64::from(self.u32_at(at)),
                     free_count: self.u32_at(at + 4),
-                    free:       self.u64_at(at + 8),
+                    free: self.u64_at(at + 8),
                 })
             })
             .collect()
@@ -780,17 +801,17 @@ impl InobtNode {
 
     /// A node of this size that holds nothing.
     fn empty_like(&self, leaf: bool) -> Self {
-        Self::blank(self.bytes.len(), if leaf { 0 } else { 1 })
+        Self::blank(self.bytes.len(), if leaf { 0 } else { 1 }, self.has_crc)
     }
 
     /// A leaf of this size that holds nothing.
-    fn empty_leaf(size: usize) -> Self {
-        Self::blank(size, 0)
+    fn empty_leaf(size: usize, has_crc: bool) -> Self {
+        Self::blank(size, 0, has_crc)
     }
 
     /// An interior node of this size that holds nothing.
-    fn new_interior(size: usize) -> Self {
-        Self::blank(size, 1)
+    fn new_interior(size: usize, has_crc: bool) -> Self {
+        Self::blank(size, 1, has_crc)
     }
 
     /// A node of this size and depth that holds nothing and has no siblings.
@@ -798,9 +819,14 @@ impl InobtNode {
     /// A new node's siblings are set by whoever links it in, and are the null
     /// block until they are: a node that claimed a sibling it had not been given
     /// would put the chain into a block that is not part of the tree.
-    fn blank(size: usize, level: u16) -> Self {
+    fn blank(size: usize, level: u16, has_crc: bool) -> Self {
         let mut bytes = vec![0u8; size];
-        bytes[MAGIC..MAGIC + 4].copy_from_slice(&XFS_INOBT_MAGIC.to_be_bytes());
+        let magic = if has_crc {
+            XFS_INOBT_CRC_MAGIC
+        } else {
+            XFS_INOBT_MAGIC
+        };
+        bytes[MAGIC..MAGIC + 4].copy_from_slice(&magic.to_be_bytes());
         bytes[LEVEL..LEVEL + 2].copy_from_slice(&level.to_be_bytes());
         bytes[LEFTSIB..LEFTSIB + 4].copy_from_slice(&u32::MAX.to_be_bytes());
         bytes[RIGHTSIB..RIGHTSIB + 4].copy_from_slice(&u32::MAX.to_be_bytes());
@@ -808,6 +834,7 @@ impl InobtNode {
             bytes: bytes.into_boxed_slice(),
             level,
             numrecs: 0,
+            has_crc,
         }
     }
 
@@ -823,7 +850,7 @@ impl InobtNode {
                 "only a leaf of the inode tree holds chunks",
             ));
         }
-        let at = Self::leaf_capacity(self.bytes.len());
+        let at = Self::leaf_capacity(self.bytes.len(), self.has_crc);
         if ranges.len() > at {
             return Err(FsError::corrupt(
                 "a split left more records in a node than the node holds",
@@ -856,7 +883,8 @@ impl InobtNode {
                 "a leaf holds chunks, not children",
             ));
         }
-        let ptrs = BODY + self.capacity() * 4 + at * 4;
+        let body = if self.has_crc { BODY_CRC } else { BODY_NO_CRC };
+        let ptrs = body + self.capacity() * 4 + at * 4;
         Ok(self.u32_at(ptrs))
     }
 
@@ -876,7 +904,7 @@ impl InobtNode {
             return Err(FsError::NoSpace);
         }
         let at = at.min(self.numrecs as usize);
-        let keys = BODY;
+        let keys = if self.has_crc { BODY_CRC } else { BODY_NO_CRC };
         let ptrs = keys + capacity * 4;
         // Shift the tail of both arrays right by one, from the back so nothing is
         // overwritten before it has been moved.
@@ -911,7 +939,7 @@ impl InobtNode {
                 "a leaf holds ranges, not children",
             ));
         }
-        let keys = BODY;
+        let keys = if self.has_crc { BODY_CRC } else { BODY_NO_CRC };
         let ptrs = keys + self.capacity() * 4;
         (0..self.numrecs as usize)
             .map(|i| {
@@ -924,7 +952,7 @@ impl InobtNode {
     }
 
     fn capacity(&self) -> usize {
-        InobtNode::interior_capacity(self.bytes.len())
+        InobtNode::interior_capacity(self.bytes.len(), self.has_crc)
     }
 }
 
@@ -1376,8 +1404,8 @@ mod t {
     /// that used one figure for both would run off the end of a node.
     #[test]
     fn the_two_node_shapes_hold_different_numbers_of_records() {
-        assert_eq!(InobtNode::leaf_capacity(512), 31);
-        assert_eq!(InobtNode::interior_capacity(512), 62);
+        assert_eq!(InobtNode::leaf_capacity(512, false), 31);
+        assert_eq!(InobtNode::interior_capacity(512, false), 62);
         // Which is what the tool's own numbering shows: the root of the tree in
         // this image holds two children and its key array is sized for sixty-two.
         if golden().is_some() {

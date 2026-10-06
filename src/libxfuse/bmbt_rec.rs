@@ -32,12 +32,12 @@ use super::definitions::*;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BmbtRec {
-    pub br_startoff:   XfsFileoff,
+    pub br_startoff: XfsFileoff,
     pub br_startblock: XfsFsblock,
     pub br_blockcount: XfsFilblks,
     /// If set, indicates that the extent has been preallocated but has not yet been written
     /// (unwritten extent)
-    pub br_flag:       bool,
+    pub br_flag: bool,
 }
 
 impl<Ctx> Decode<Ctx> for BmbtRec {
@@ -209,22 +209,22 @@ mod tests {
     fn map_dblock() {
         let bmx = Bmx::new(&[
             BmbtRec {
-                br_startoff:   0,
+                br_startoff: 0,
                 br_startblock: 20,
                 br_blockcount: 2,
-                br_flag:       false,
+                br_flag: false,
             },
             BmbtRec {
-                br_startoff:   2,
+                br_startoff: 2,
                 br_startblock: 30,
                 br_blockcount: 3,
-                br_flag:       false,
+                br_flag: false,
             },
             BmbtRec {
-                br_startoff:   5,
+                br_startoff: 5,
                 br_startblock: 40,
                 br_blockcount: 2,
-                br_flag:       false,
+                br_flag: false,
             },
         ]);
 

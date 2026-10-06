@@ -45,7 +45,7 @@ use super::{
 
 #[derive(Debug, Decode)]
 pub struct Dir2BlockTail {
-    count:  u32,
+    count: u32,
     _stale: u32,
 }
 
@@ -56,9 +56,9 @@ impl Dir2BlockTail {
 
 #[derive(Debug)]
 pub struct Dir2BlockDisk {
-    pub leaf:    Vec<Dir2LeafEntry>,
-    tail:        Dir2BlockTail,
-    raw:         Vec<u8>,
+    pub leaf: Vec<Dir2LeafEntry>,
+    tail: Dir2BlockTail,
+    raw: Vec<u8>,
     /// Start of directory entries within the directory block
     data_offset: usize,
 }
@@ -116,8 +116,8 @@ impl Dir2BlockDisk {
 
 #[derive(Debug)]
 pub struct Dir2Block {
-    ents:        Vec<Dir2LeafEntry>,
-    raw:         Box<[u8]>,
+    ents: Vec<Dir2LeafEntry>,
+    raw: Box<[u8]>,
     /// Start of directory entries within the directory block
     data_offset: usize,
 }
@@ -139,8 +139,8 @@ impl Dir2Block {
         raw.truncate(data_len as usize);
 
         Dir2Block {
-            raw:         raw.into(),
-            ents:        dir_disk.leaf,
+            raw: raw.into(),
+            ents: dir_disk.leaf,
             data_offset: dir_disk.data_offset,
         }
     }

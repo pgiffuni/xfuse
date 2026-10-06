@@ -48,12 +48,12 @@ use super::{
 
 #[derive(Clone, Copy, Debug)]
 pub struct BtreeBlockHdr<T: PrimInt + Unsigned> {
-    bb_magic:       u32,
-    pub bb_level:   u16,
+    bb_magic: u32,
+    pub bb_level: u16,
     pub bb_numrecs: u16,
     //_bb_leftsib: T,
     //_bb_rightsib: T,
-    _phantom:       PhantomData<T>,
+    _phantom: PhantomData<T>,
     // Below fields are for V5 file systems only
     //_bb_blkno: u64,
     //_bb_lsn: u64,
@@ -172,15 +172,15 @@ pub const BMBT_BLOCKCOUNT_BITLEN: u32 = 21;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BtreeLblockHdr {
     /// The block's **own** number.
-    pub blkno:    XfsFsblock,
+    pub blkno: XfsFsblock,
     /// The log sequence number; see [`BmbtLeafBlock::to_bytes`].
-    pub lsn:      u64,
-    pub leftsib:  XfsFsblock,
+    pub lsn: u64,
+    pub leftsib: XfsFsblock,
     pub rightsib: XfsFsblock,
     /// The inode whose fork the tree belongs to.
-    pub owner:    XfsIno,
+    pub owner: XfsIno,
     /// The file system's identifier.
-    pub uuid:     [u8; 16],
+    pub uuid: [u8; 16],
 }
 
 impl BtreeLblockHdr {
@@ -336,10 +336,10 @@ impl BmbtLeafRecord {
     /// This record as the extent the rest of this program works with.
     pub const fn as_extent(&self) -> BmbtRec {
         BmbtRec {
-            br_startoff:   self.startoff(),
+            br_startoff: self.startoff(),
             br_startblock: self.startblock(),
             br_blockcount: self.blockcount(),
-            br_flag:       self.extent_flag(),
+            br_flag: self.extent_flag(),
         }
     }
 }
@@ -347,7 +347,7 @@ impl BmbtLeafRecord {
 /// A b-map leaf block: the header, and the extents it holds.
 #[derive(Debug)]
 pub struct BmbtLeafBlock {
-    pub level:   u16,
+    pub level: u16,
     pub records: Vec<BmbtLeafRecord>,
 }
 
@@ -366,9 +366,9 @@ pub struct BmbtLeafBlock {
 pub struct BmbtInteriorBlock {
     pub level: u16,
     /// One per child, ascending; `keys[i]` is the first offset in child `i`.
-    pub keys:  Vec<BmbtKey>,
+    pub keys: Vec<BmbtKey>,
     /// One per child, in the same order.
-    pub ptrs:  Vec<XfsBmbtPtr>,
+    pub ptrs: Vec<XfsBmbtPtr>,
 }
 
 impl BmbtInteriorBlock {
@@ -577,6 +577,13 @@ impl BmbtLeafBlock {
     pub fn to_bytes(&self, hdr: &BtreeLblockHdr, sb_blocksize: usize) -> Vec<u8> {
         let (blkno, lsn, leftsib, rightsib) = (hdr.blkno, hdr.lsn, hdr.leftsib, hdr.rightsib);
         let (owner, uuid) = (hdr.owner, hdr.uuid);
+        let max = Self::max_records(sb_blocksize, true);
+        assert!(
+            self.records.len() <= max,
+            "b-map leaf overflow: {} records, capacity {}",
+            self.records.len(),
+            max
+        );
         let mut b = vec![0u8; sb_blocksize];
         b[0..4].copy_from_slice(&XFS_BMAP_CRC_MAGIC.to_be_bytes());
         b[4..6].copy_from_slice(&self.level.to_be_bytes());
@@ -675,6 +682,13 @@ impl BmbtLeafBlock {
         rightsib: XfsFsblock,
         sb_blocksize: usize,
     ) -> Vec<u8> {
+        let max = Self::max_records(sb_blocksize, false);
+        assert!(
+            self.records.len() <= max,
+            "b-map leaf overflow: {} records, capacity {}",
+            self.records.len(),
+            max
+        );
         let mut b = vec![0u8; sb_blocksize];
         b[0..4].copy_from_slice(&XFS_BMAP_MAGIC.to_be_bytes());
         b[4..6].copy_from_slice(&self.level.to_be_bytes());
@@ -700,7 +714,7 @@ impl BmbtLeafBlock {
 
 #[derive(Debug, Clone, Decode)]
 pub struct BmdrBlock {
-    pub bb_level:   u16,
+    pub bb_level: u16,
     pub bb_numrecs: u16,
 }
 
@@ -908,7 +922,7 @@ pub struct BtreeRoot {
     pub keys: Vec<BmbtKey>,
     pub ptrs: Vec<XfsBmdrPtr>,
     /// A cache of the object's extents, indexed by block number
-    blocks:   RefCell<BtreeBlockCache>,
+    blocks: RefCell<BtreeBlockCache>,
 }
 
 impl BtreeRoot {
@@ -1010,9 +1024,9 @@ impl Btree for BtreeRoot {}
 /// An intermediate Btree.
 #[derive(Debug)]
 struct BtreeIntermediate {
-    hdr:    XfsBmbtLblock,
-    keys:   Vec<BmbtKey>,
-    ptrs:   Vec<XfsBmbtPtr>,
+    hdr: XfsBmbtLblock,
+    keys: Vec<BmbtKey>,
+    ptrs: Vec<XfsBmbtPtr>,
     /// A cache of the object's extents, indexed by block number
     blocks: RefCell<BtreeBlockCache>,
 }
