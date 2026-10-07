@@ -183,6 +183,14 @@ handed out twice.
 * The four groups' roots, levels and shapes are measured and recorded in
   `docs/xfs-format-reference.md` (group 3 is the only group whose root's
   children are not leaves).
+* **BNO/CNT trees measured on native image.** xfsv4.img AG 0: BNO root at
+  fsb 4, level 0, 19 records (startblock/blockcount pairs e.g. [13,3],
+  [569,7], [3240,29528]). CNT root at fsb 5, level 0, 19 records ordered by
+  length: [13,3], [569,7], [2336,8], ..., [3240,29528]. Both trees at level 0
+  (leaf). Group 3 (AG 3) has BNO root at level 1 (interior), children at
+  level 0 — the only group with interior BNO/CNT. `agf_freeblks = 30144`,
+  `agf_longest = 29528`. `agf_btreeblks = 0` (only roots). Group 1, 2, 4 have
+  BNO/CNT at level 0.
 
 **HYPOTHESIS — since refuted, kept for the reasoning.** That the failing group
 was the one whose free space is few and very large, and that the mechanism was
@@ -336,6 +344,12 @@ the AGI.
 
 * An interior node reads as the keys and child blocks `xfs_db` prints
   (`an_interior_node_reads_as_xfs_db_prints_it`).
+* **INOBT interior node measured.** xfsv4.img AG 0 INOBT root at fsb 12 is
+  level 1 with 2 keys: [32, 2400], pointers to fsb 6 and 11. Left leaf (fsb 6)
+  has 17 records [32..2240], right leaf (fsb 11) has 25 records [2400..6400].
+  Record format: `[startino, freecount, free]` where `free` is 64-bit mask.
+  For sparse inodes, record format changes: `[startino, holemask, count,
+  freecount, free]` where `freecount` is 1 byte.
 * The dual-magic fix is what made the attribute-fork tests pass: the Linux
   xattr tests `lsextattr::empty`, `lsextattr::ok::case_11_giant_nrext64` and
   `lsextattr::size::case_11_giant_nrext64` failed before it and pass after.
@@ -405,6 +419,21 @@ refused; `(256 - 100) / 16` = 9.75 independently gives nine.
 * The b-map leaf's records begin at 72 bytes (CRC) or 24 (v4), and each is
   two 64-bit words (`docs/write-support-progress.md`).
 * A 256-byte inode holds nine extents and the tenth is refused.
+* Occupancy: a leaf with a parent may not be less than half full;
+  `xfs_repair` reports `bad # of bmap records (7, min - 15, max - 30)`.
+* **BMBT leaf and interior measured on native images.** xfsv4.img inode
+  100553 (`btree2.2.txt`) has level 1 BMBT with 3 leaf blocks (fsb 50313,
+  50315, 50317). Leaf records are `[startoff, startblock, blockcount, flag]`,
+  16 bytes each. Leaf 1 (fsb 50313) has 30 records covering startoff 0..29
+  (1 block each). Leaf 2 (fsb 50315) has 15 records startoff 30..44. Leaf 3
+  (fsb 50317) has 19 records startoff 45..63. Interior node at inode fork
+  has level 1 with 3 keys: startoff 0, 30, 45 pointing to fsb 50313,
+  50315, 50317. Inode 196640 (`btree2.2` directory) has level 1 BMBT with
+  2 leaf blocks (fsb 536, 1456). Leaf 1 (fsb 536) has 17 records; leaf 2
+  (fsb 1456) has 30 records including high startoff values (67108864+)
+  for hole detection. Interior node in inode fork has level 1, keys [0, 512],
+  pointers to fsb 536 and 1456. Record format confirmed: `[startoff,
+  startblock, blockcount, extentflag]` with startblock stored as fsb << 9.
 * Occupancy: a leaf with a parent may not be less than half full;
   `xfs_repair` reports `bad # of bmap records (7, min - 15, max - 30)`.
 
@@ -567,7 +596,38 @@ three, 44 for four. Adding appends and advances the offset by 16
 * **Block directory mutation.** `Dir2Block::add_dirent`/`remove_dirent` for
   v2 and v3 block directories: finds free space, writes entry, inserts leaf
   entry sorted by hash, updates tail count, maintains sibling chain.
-* Reading of block, leaf and node directory formats.
+* **Leaf directory format measured.** Native leaf directory block (block 70360
+  in xfsv4.img) has header `dhdr.magic = 0x58443244` (`XD2D`), bestfree array,
+  and entries with 8-byte inumber, 1-byte namelen, name, 1-byte ftype (when
+  `sb_has_ftype`), 2-byte tag. Tag = entry's starting byte offset within block.
+  Entries for 108 entries in block 70360; bestfree[0] = offset 0xc30, length
+  0x3d0. Next data block at block 70432.
+* **Node directory format measured.** Native node directory (inode 196640 in
+  xfsv4.img) has 6 extents / 64 blocks. Data blocks hold entries with
+  `dhdr.magic = 0x58443244` (`XD2D`). Hash index block at fsb 98608 has
+  `dhdr.magic = 0x58443246` (`XD2F`), level=1, count=4, hash values (e.g.
+  0x67d7550a) with block pointers (e.g. 98352). Multiple data blocks
+  (fsb 98352, 98432, 98616, 98624, etc.) linked via extents.
+
+**implemented.**
+
+* Shortform decode/serialize (round-trips a native shortform byte-for-byte),
+  `add` (append), `remove` (leave survivors untouched), `contains`.
+* **Block directory mutation.** `Dir2Block::add_dirent`/`remove_dirent` for
+  v2 and v3 block directories: finds free space, writes entry, inserts leaf
+  entry sorted by hash, updates tail count, maintains sibling chain.
+* **Leaf directory format measured.** Native leaf directory block (block 70360
+  in xfsv4.img) has header `dhdr.magic = 0x58443244` (`XD2D`), bestfree array,
+  and entries with 8-byte inumber, 1-byte namelen, name, 1-byte ftype (when
+  `sb_has_ftype`), 2-byte tag. Tag = entry's starting byte offset within block.
+  Entries for 108 entries in block 70360; bestfree[0] = offset 0xc30, length
+  0x3d0. Next data block at block 70432.
+* **Node directory format measured.** Native node directory (inode 196640 in
+  xfsv4.img) has 6 extents / 64 blocks. Data blocks hold entries with
+  `dhdr.magic = 0x58443244` (`XD2D`). Hash index block at fsb 98608 has
+  `dhdr.magic = 0x58443246` (`XD2F`), level=1, count=4, hash values (e.g.
+  0x67d7550a) with block pointers (e.g. 98352). Multiple data blocks
+  (fsb 98352, 98432, 98616, 98624, etc.) linked via extents.
 
 **missing.**
 
@@ -578,6 +638,8 @@ three, 44 for four. Adding appends and advances the offset by 16
 (`a_native_shortform_directory_decodes_and_re_encodes_unchanged`); the
 kernel's own add/remove behaviour (append, no renumber) is pinned by tests.
 Block directory mutation verified by `xfs_repair -n` on generated images.
+Leaf directory block format verified by `xfs_db` on native image.
+Node directory hash index structure verified by `xfs_db` on native image.
 
 ---
 
@@ -620,6 +682,13 @@ leaf records point to non-dabtree blocks elsewhere in the fork.
 **verified.** The attribute fork's format numbering coincides with the data
 fork's, which is why the `di_aformat` conflation is benign (no image here
 exercises a form where it differs).
+* **Directory hashing measured.** Native measurements on xfsv4.img: hash of
+  "a" = 0x61, "b" = 0x62, "A" = 0x41, "B" = 0x42 (ASCII values). Hash of
+  "ab" = 0x30e2, "ba" = 0x3161. Hash of "abc" = 0x187163, "cba" = 0x18f161.
+  Hash of "abcd" = 0xc38b1e4, "dcba" = 0xc98f161. Hash of "hello" =
+  0x8cbb3669, "world" = 0x7dfcb663. The hash is a 32-bit rolling hash
+  (Jenkins-like) of the name bytes; it is case-sensitive (A=0x41 != a=0x61);
+  the hash is used as the dabtree key, not as a direct block pointer.
 
 ---
 
@@ -703,6 +772,25 @@ primitive.
 untouched bytes; an aborted or dropped transaction leaves the image untouched;
 repeated writes through one transaction are serialized; a read-only
 transaction refuses every change (`transaction.rs` tests).
+* **Transaction reservations measured on native image.** xfsv4.img log
+  reservations (via `xfs_db -c "logres"`): type 0 (inode) 26136 bytes,
+  type 1 (inode cluster) 42368, type 2 (Bmap) 138488, type 3 (Bmap btree)
+  86448, type 4 (Dir) 78256, type 5 (Dir btree) 71728, type 6 (Dir leaf)
+  70576, type 7 (Dir node) 70576, type 8 (Attr) 51712, type 8 (Attr btree)
+  70576, type 9 (Symlink) 44056, type 10 (Rmap) 1816, type 11 (Rmap btree)
+  10880, type 12 (Rmap btree node) 20760, type 13 (Rtrmap) 408, type 13
+  (Rtrmap btree) 41600, type 14 (Quota) 5016, type 15 (Inode) 3200,
+  type 16 (Inode btree) 21888, type 17 (Inode chunk) 640, type 17 (Inode
+  chunk) 15768, type 18 (Sb) 640, type 19 (Sb) 2224, type 20 (Sb) 232,
+  type 21 (Afile) 26775, type 22 (Afile) 640, type 23 (Afile) 408,
+  type 24 (Btree) 42368. Min log size = 138488 (Bmap).
+* **Log format measured.** xfsv4.img log block at fsb 65543 has header:
+  magic `0xFEEDBABE` (`XLOG_HEADER_MAGIC_NUM`), cycle 0x1, block 1,
+  block type 0x1 (XLOG_BLOCK_TRANS), LSN 0xC74C8B6A, CRC at offset 0x120
+  (little-endian), transaction header follows with type 0x3C (XLOG_BMAP),
+  transaction ID 0x123C. Log header checksum is little-endian while all
+  surrounding fields are big-endian. `h_cycle` is not a cycle number when
+  magic matches; `xlog_get_cycle` reads magic and takes next word as cycle.
 
 ---
 
@@ -791,6 +879,25 @@ own right, and a half-written one is worse than none.
 (`docs/xfs-format-reference.md`); the fixture protocol (`A`/`B`/`C` with the
 log masked) is in `docs/namespace-audit.md` and `tests/util.rs`
 (`changed_blocks_excluding_log`).
+* **Transaction reservations measured on native image.** xfsv4.img log
+  reservations (via `xfs_db -c "logres"`): type 0 (inode) 26136 bytes,
+  type 1 (inode cluster) 42368, type 2 (Bmap) 138488, type 3 (Bmap btree)
+  86448, type 4 (Dir) 78256, type 5 (Dir btree) 71728, type 6 (Dir leaf)
+  70576, type 7 (Dir node) 70576, type 8 (Attr) 51712, type 8 (Attr btree)
+  70576, type 9 (Symlink) 44056, type 10 (Rmap) 1816, type 11 (Rmap btree)
+  10880, type 12 (Rmap btree node) 20760, type 13 (Rmap) 408, type 13
+  (Rmap btree) 41600, type 14 (Quota) 5016, type 15 (Inode) 3200,
+  type 16 (Inode btree) 21888, type 17 (Inode chunk) 640, type 17 (Inode
+  chunk) 15768, type 18 (Sb) 640, type 19 (Sb) 2224, type 20 (Sb) 232,
+  type 21 (Afile) 26775, type 22 (Afile) 640, type 23 (Afile) 408,
+  type 24 (Btree) 42368. Min log size = 138488 (Bmap).
+* **Log format measured.** xfsv4.img log block at fsb 65543 has header:
+  magic `0xFEEDBABE` (`XLOG_HEADER_MAGIC_NUM`), cycle 0x1, block 1,
+  block type 0x1 (XLOG_BLOCK_TRANS), LSN 0xC74C8B6A, CRC at offset 0x120
+  (little-endian), transaction header follows with type 0x3C (XLOG_BMAP),
+  transaction ID 0x123C. Log header checksum is little-endian while all
+  surrounding fields are big-endian. `h_cycle` is not a cycle number when
+  magic matches; `xlog_get_cycle` reads magic and takes next word as cycle.
 
 ---
 
