@@ -722,15 +722,15 @@ impl RawDinode {
     ///   trusts `core.size` will not look at it -- but a future grow will, and
     ///   `xfs_repair` reads what is there.
     /// * `di_nextents` and `di_nblocks` go to **zero**.  A local fork has no extents
-    ///   and occupies no blocks; every native image measured reports both as 0 for a
-    ///   `core.format = 1` inode.
+    /// * Write a **local** directory or attribute fork: its bytes, which for this format *are* its
+    ///   contents and its size.
     ///
     /// It refuses, rather than truncating, if the data does not fit: a shortform
     /// directory that outgrows its inode is the transition this project has not
     /// built, and quietly writing a prefix of it would produce a directory that
     /// `xfs_repair` accepts and that has silently lost entries.
     pub fn set_data_bytes(&mut self, data: &[u8]) -> FsResult<()> {
-        if self.format() != 1 {
+        if self.format() != 1 && self.format() != 2 {
             return Err(FsError::unsupported(format!(
                 "writing literal data into a data fork in format {}",
                 self.format()

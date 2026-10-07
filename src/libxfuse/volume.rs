@@ -945,7 +945,7 @@ impl Volume {
         test_dir.add(name, ftype, child_ino, first_offset)?;
         
         // Check if we need to transition to block directory
-        if test_dir.needs_transition(&sb, &raw) {
+if test_dir.needs_transition(&sb, &raw) {
             // For now, return ENOSYS since full implementation needs block allocation
             // which requires transaction context
             Err(FsError::unsupported(
