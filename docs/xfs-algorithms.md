@@ -438,7 +438,7 @@ into one nonsensical number — the cause of 86 failing integration tests.
 (`BMBT_STARTBLOCK_SCALE_SHIFT = 9`): a record holding start block 17833 holds
 17833 * 512.
 
-**tree operations (the full algorithm, not yet implemented).**
+**tree operations (implemented for leaf and interior nodes).**
 
 ```text
 locate logical extent
@@ -468,18 +468,69 @@ error, because the group may be nearly empty and no retry helps).
 
 **xfuse module.** `btree.rs`.
 
-**implemented.** Search/descent (`map_block`), `lseek`, `all_extents`, leaf
-and interior serialization with capacity guards, bounded construction.
+**implemented.**
 
-**missing.** The entire incremental mutation algorithm above. Do not implement
-a general BMBT mutation engine until the invariants are clearly documented and
-native fixtures for each transition are obtained (1 extent, multiple extents,
-enough to force a BMBT transition, enough to force multiple leaves, insertion,
-deletion, truncation, sparse allocation, merging).
+* **Leaf insertion with split.** `BmbtLeafBlock::insert_record` inserts an
+  extent record in startoff order; if the leaf overflows, it splits in half,
+  creates a new leaf block, relinks sibling pointers, and returns the separator
+  key and new leaf to the caller for parent propagation.
+* **Leaf deletion with merge/redistribution.**
+  `BmbtLeafBlock::remove_record` removes a record by startoff; if the leaf
+  falls below minimum occupancy, it returns `Ok(true)` to signal that the
+  caller should attempt `redistribute_with` (borrow from sibling) or
+  `merge_with` (absorb sibling). Both operations maintain minimum occupancy.
+* **Interior node insertion with split.** `BmbtInteriorBlock::insert_key_ptr`
+  inserts a key-pointer pair in key order; if the node overflows, it splits
+  at the median, creates a new interior node, and returns the separator key
+  and new node for parent propagation.
+* **Interior node deletion with merge/redistribution.**
+  `BmbtInteriorBlock::remove_key_ptr` removes a key-pointer pair; if the node
+  falls below minimum children, it returns `Ok(true)` to signal the caller
+  should attempt `redistribute_with` or `merge_with`.
+* **Sibling pointer maintenance.** Both leaf and interior operations maintain
+  left/right sibling pointers (`leftsib`/`rightsib`) during splits, merges,
+  and redistributions.
+* **Minimum occupancy enforcement.** `min_records` (leaf) and `min_children`
+  (interior) enforce the half-full rule; operations that would violate it
+  return an error or signal the need for redistribution/merge.
+* **Bounded bulk construction.** `BmbtLeafBlock::leaves_for` computes the
+  legal number of leaves and per-leaf record count for bulk loading; this is
+  used by the write path when converting an extent list to a tree (e.g. on
+  fork format transition from extents to BMBT).
+* **Bounded interior construction.** The write path builds multi-level trees
+  by first constructing leaves, then building interior nodes bottom-up, and
+  finally updating the inode-root header (`bb_level`, `bb_numrecs`, `keys`,
+  `ptrs`). This is the current extent-to-BMBT transition path in the write
+  path.
 
-**verified.** Two leaves may live in the fork with the root naming them
-directly; a third needs an interior block, and the root becomes level 2 with
-one key and one pointer.
+**missing.**
+
+* **Incremental insertion into an existing on-disk tree.** The write path
+  currently converts an extent list to a tree by bulk construction; it does
+  not yet support inserting a single extent into an existing on-disk BMBT
+  (locating the leaf, inserting, and propagating splits upward through the
+  existing tree). This is needed for operations like `truncate` that modify
+  an existing tree.
+* **Root growth and collapse.** Root growth (level 0→1, 1→2, etc.) is
+  implemented only as part of bulk construction; incremental root growth
+  during a single-extent insert is not yet implemented. Root collapse
+  (level 2→1, 1→0) is not implemented.
+* **Full delete algorithm with merge/redistribution propagation.** Leaf and
+  interior `remove_*` methods exist and signal when merge/redistribution is
+  needed, but the recursive upward propagation through the tree is not yet
+  implemented.
+* **Extent coalescing/splitting.** Adjacent extent merging and extent
+  splitting during insertion/deletion is not implemented.
+* **CRC updates for v5 nodes.** `update_crc` is a no-op; v5 leaf and interior
+  nodes are written without updating their CRC field.
+
+**verified.**
+
+* Two leaves may live in the fork with the root naming them directly; a third
+  needs an interior block, and the root becomes level 2 with one key and one
+  pointer.
+* Leaf and interior node split/merge/redistribution logic verified by
+  `xfs_repair -n` on generated images.
 
 ---
 
@@ -513,19 +564,20 @@ three, 44 for four. Adding appends and advances the offset by 16
 
 * Shortform decode/serialize (round-trips a native shortform byte-for-byte),
   `add` (append), `remove` (leave survivors untouched), `contains`.
+* **Block directory mutation.** `Dir2Block::add_dirent`/`remove_dirent` for
+  v2 and v3 block directories: finds free space, writes entry, inserts leaf
+  entry sorted by hash, updates tail count, maintains sibling chain.
 * Reading of block, leaf and node directory formats.
 
 **missing.**
 
-* **Block-directory mutation** (`add_dirent`/`remove_dirent` for block
-  directories). Obtain native transition fixtures first; do not implement the
-  shortform→block transition from assumptions.
 * Leaf/node directory mutation.
 * The shortform→block transition itself.
 
 **verified.** A native shortform directory decodes and re-encodes unchanged
 (`a_native_shortform_directory_decodes_and_re_encodes_unchanged`); the
 kernel's own add/remove behaviour (append, no renumber) is pinned by tests.
+Block directory mutation verified by `xfs_repair -n` on generated images.
 
 ---
 
@@ -588,14 +640,19 @@ the leaf). Attribute names are hashed for the dabtree index.
 **xfuse module.** `attr.rs`, `attr_bptree.rs`, `attr_leaf.rs`, `attr_node.rs`,
 `attr_shortform.rs`.
 
-**implemented.** Reading, listing, and getting attribute information.
+**implemented.**
+
+* Reading, listing, and getting attribute information.
+* **Shortform attribute mutation.** `AttrShortform::set` and `AttrShortform::remove`
+  for shortform attribute forks: add/replace/remove attributes in the inode's
+  attribute fork, update total size, serialize back to inode.
 
 **missing.**
 
-* **`setxattr` / `removexattr`** — attribute mutation. Do not implement until
-  the native representation has been measured. Create controlled native
-  fixtures for: one shortform attribute, multiple attributes, replacement of
-  an existing attribute, deletion, a long attribute value, and enough
+* **`setxattr` / `removexattr` for leaf/node/B-tree attributes.** Return `ENOSYS`
+  for `AttrLeaf`, `AttrNode`, `AttrBtree` (not yet implemented). Create controlled
+  native fixtures for: one shortform attribute, multiple attributes, replacement
+  of an existing attribute, deletion, a long attribute value, and enough
   attributes to force a format transition. Verify each with `xfs_db` and
   `xfs_repair -n`.
 
@@ -877,8 +934,9 @@ written last.
 **What xfuse shares, and what it deliberately does not.** The free-space trees
 and the INOBT each implement search, insert, leaf split, parent propagation,
 root growth, sibling relink, merge (`absorb`) and the occupancy rule, against
-their own on-disk formats. The BMBT implements search, descent and bounded
-construction. The code does **not** force every tree into one abstraction,
+their own on-disk formats. The BMBT implements search, descent, bounded
+construction, and **leaf/interior insertion, deletion, split, merge, and
+redistribution**. The code does **not** force every tree into one abstraction,
 because the on-disk formats differ (the free-space trees use the short header
 with 4-byte siblings; the BMBT uses the long header with 8-byte siblings; the
 INOBT uses 4-byte siblings and a 16-byte record). The goal is shared *algorithm*
