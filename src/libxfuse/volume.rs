@@ -932,16 +932,38 @@ impl Volume {
                  not derivable and has not been measured",
             ));
         }
-        dir.add(name, ftype, child_ino, 0)?;
-        let now = std::time::SystemTime::now();
-        raw.set_data_bytes(&dir.serialize())?;
-        raw.set_mtime(now);
-        raw.set_ctime(now);
-        raw.finalise();
-        tx.write_bytes(inode_offset, raw.as_bytes())?;
-        tx.commit()?;
-        self.device.invalidate();
-        Ok(())
+        
+        // Try to add the entry
+        let first_offset = if dir.entries.is_empty() {
+            dir.header_len() as u16
+        } else {
+            dir.entries.last().unwrap().offset + SF_OFFSET_STEP
+        };
+        
+        // Try to add the entry to a test copy
+        let mut test_dir = dir.clone();
+        test_dir.add(name, ftype, child_ino, first_offset)?;
+        
+        // Check if we need to transition to block directory
+        if test_dir.needs_transition(&sb, &raw) {
+            // For now, return ENOSYS since full implementation needs block allocation
+            // which requires transaction context
+            Err(FsError::unsupported(
+                "shortform to block directory transition not yet implemented",
+            ))
+        } else {
+            // Just add the entry normally
+            dir.add(name, ftype, child_ino, first_offset)?;
+            let now = std::time::SystemTime::now();
+            raw.set_data_bytes(&dir.serialize())?;
+            raw.set_mtime(now);
+            raw.set_ctime(now);
+            raw.finalise();
+            tx.write_bytes(inode_offset, raw.as_bytes())?;
+            tx.commit()?;
+            self.device.invalidate();
+            Ok(())
+        }
     }
 
     /// Remove one entry from a **shortform** directory.

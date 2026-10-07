@@ -54,6 +54,7 @@ const NO_IMAGE: &str = "no image has been opened in this process";
 use super::{
     definitions::*,
     dir3::{Dir3, XFS_DIR3_FT_DIR},
+    inode::RawDinode,
     sb::Sb,
     utils::{get_file_type, FileKind},
 };
@@ -335,6 +336,29 @@ impl ShortformDirectory {
             .map(|e| self.entry_len(e.name.len()))
             .sum::<usize>()
             + self.header_len()
+    }
+
+    /// The maximum size of a shortform directory before it must transition
+    /// to a block directory.  This is the maximum size of the data fork in
+    /// the inode minus the attribute fork offset (if any).
+    /// For a 256-byte inode with no attribute fork: 256 - 100 = 156 bytes.
+    /// For a 512-byte inode with no attribute fork: 512 - 100 = 412 bytes.
+    /// For a 256-byte inode with attribute fork at offset 32: 128 - 100 = 28 bytes.
+    pub fn max_size(&self, sb: &Sb, raw: &RawDinode) -> usize {
+        let inode_size = sb.inode_size();
+        let local_offset = raw.literal_area_offset();
+        let forkoff = raw.forkoff() as usize;
+        let attr_offset = if forkoff == 0 {
+            inode_size
+        } else {
+            local_offset + forkoff * 8
+        };
+        attr_offset.saturating_sub(local_offset)
+    }
+
+    /// Check if this shortform directory needs to transition to a block directory.
+    pub fn needs_transition(&self, sb: &Sb, raw: &RawDinode) -> bool {
+        self.size() > self.max_size(sb, raw)
     }
 
     /// Create a new empty shortform directory.
