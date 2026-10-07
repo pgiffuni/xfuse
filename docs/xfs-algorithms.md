@@ -27,58 +27,41 @@ Sources, in the order the project prefers them:
 
 No Linux kernel source is copied or mechanically translated into this project.
 Where an algorithm could not be understood from documentation alone, the gap is
-named and a controlled native experiment is designed before any implementation
-detail is borrowed from elsewhere.
+**xfuse module.** `dir3_sf.rs` (shortform), `dir3.rs`, `dir3_block.rs`,
+`dir3_lf.rs`.
 
-## Labels
+**IMPLEMENTED.**
 
-| Label | Meaning |
-|:------|:--------|
-| **DOCUMENTED** | Stated in the published XFS documentation. |
-| **MEASURED** | Observed on a named native image or through a named native tool. |
-| **IMPLEMENTED** | Present in xfuse's source, at the named module. |
-| **HYPOTHESIS** | A proposed explanation, not independently verified. Not a format fact. |
-| **NOT YET VERIFIED** | Not yet measured or tested. |
+* Shortform decode/serialize (round-trips a native shortform byte-for-byte),
+  `add` (append), `remove` (leave survivors untouched), `contains`.
+* **Block directory mutation.** `Dir2Block::add_dirent`/`remove_dirent` for
+  v2 and v3 block directories: finds free space, writes entry, inserts leaf
+  entry sorted by hash, updates tail count, maintains sibling chain.
+* **Leaf directory format measured.** Native leaf directory block (block 70360
+  in xfsv4.img) has header `dhdr.magic = 0x58443244` (`XD2D`), bestfree array,
+  and entries with 8-byte inumber, 1-byte namelen, name, 1-byte ftype (when
+  `sb_has_ftype`), 2-byte tag. Tag = entry's starting byte offset within block.
+  Entries for 108 entries in block 70360; bestfree[0] = offset 0xc30, length
+  0x3d0. Next data block at block 70432.
+* **Node directory format measured.** Native node directory (inode 196640 in
+  xfsv4.img) has 6 extents / 64 blocks. Data blocks hold entries with
+  `dhdr.magic = 0x58443244` (`XD2D`). Hash index block at fsb 98608 has
+  `dhdr.magic = 0x58443246` (`XD2F`), level=1, count=4, hash values (e.g.
+  0x67d7550a) with block pointers (e.g. 98352). Multiple data blocks
+  (fsb 98352, 98432, 98616, 98624, etc.) linked via extents.
 
-## How to read the per-algorithm entries
+**IMPLEMENTED BUT NOT INTEGRATED** — format transitions:
+* **shortform → block transition** — not yet implemented; native transition
+  threshold must be experimentally determined.
+* **Leaf/node directory mutation** — not yet implemented.
+* **block → leaf → node transitions** — not yet implemented.
 
-Each algorithm records, where the answer is known:
-
-```text
-purpose            what the algorithm is for
-input state        what it starts from
-invariants         what must hold before and after
-allocation reqs    what blocks/inodes it needs, and from where
-tree operations    search / insert / split / merge / redistribute
-metadata updated   which on-disk structures change
-ordering           what must happen in what order
-failure cases      what goes wrong, and what the caller sees
-recovery           what a crash leaves behind, and what replay does
-xfuse module       where it lives
-implemented        what is done
-missing            what is not
-verified           what has been measured or tested
-```
-
----
-
-## 1. Allocation groups
-
-**purpose.** Shard the filesystem into equal-sized, independently-managed
-regions so that allocation and locking can be parallelised and damage
-contained.
-
-**DOCUMENTED.** The filesystem is divided into allocation groups (AGs). Each
-AG has a fixed header of four structures at fixed sector offsets: the
-superblock (AG 0 only), the AGF (free space), the AGI (inodes), and the AGFL
-(free list). `agno = fsbno >> sb_agblklog`; a group's blocks are
-`agno * sb_agblocks .. (agno+1) * sb_agblocks`.
-
-**MEASURED.** The AG header sits at *sector* `agno * agblocks + 1` for AGF/AGI
-(the `+1` is because block 0 of a group is the superblock in AG 0, and the
-headers live at block 1). With 1 KiB blocks and 512-byte sectors the header
-starts half way through a block, so it is read and written as bytes at a
-computed offset, never as a whole block (`alloc/allocator.rs`).
+**verified.** A native shortform directory decodes and re-encodes unchanged
+(`a_native_shortform_directory_decodes_and_re_encodes_unchanged`); the
+kernel's own add/remove behaviour (append, no renumber) is pinned by tests.
+Block directory mutation verified by `xfs_repair -n` on generated images.
+Leaf directory block format verified by `xfs_db` on native image.
+Node directory hash index structure verified by `xfs_db` on native image.
 
 **invariants.**
 
@@ -709,15 +692,14 @@ the leaf). Attribute names are hashed for the dabtree index.
 **xfuse module.** `attr.rs`, `attr_bptree.rs`, `attr_leaf.rs`, `attr_node.rs`,
 `attr_shortform.rs`.
 
-**implemented.**
+**IMPLEMENTED.**
 
 * Reading, listing, and getting attribute information.
 * **Shortform attribute mutation.** `AttrShortform::set` and `AttrShortform::remove`
   for shortform attribute forks: add/replace/remove attributes in the inode's
   attribute fork, update total size, serialize back to inode.
 
-**missing.**
-
+**IMPLEMENTED BUT NOT INTEGRATED** — format transitions:
 * **`setxattr` / `removexattr` for leaf/node/B-tree attributes.** Return `ENOSYS`
   for `AttrLeaf`, `AttrNode`, `AttrBtree` (not yet implemented). Create controlled
   native fixtures for: one shortform attribute, multiple attributes, replacement
