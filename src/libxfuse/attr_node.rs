@@ -169,4 +169,36 @@ impl Attr for AttrNode {
         leaf.get(buf_reader.by_ref(), hash, |block, _| self.map_dblock(block))
             .map(Vec::from)
     }
+
+    fn serialize(&mut self, _super_block: &Sb) -> Result<Vec<u8>, i32> {
+        // For now, node serialization is not fully implemented
+        // Return error indicating unsupported operation
+        Err(libc::ENOSYS)
+    }
+
+    fn set<R>(
+        &mut self,
+        _buf_reader: &mut R,
+        _super_block: &Sb,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: u32,
+    ) -> Result<u32, libc::c_int>
+    where
+        R: BufRead + Reader + Seek,
+    {
+        Err(libc::ENOSYS)
+    }
+
+    fn remove<R>(
+        &mut self,
+        _buf_reader: &mut R,
+        _super_block: &Sb,
+        _name: &OsStr,
+    ) -> Result<u32, libc::c_int>
+    where
+        R: BufRead + Reader + Seek,
+    {
+        Err(libc::ENOSYS)
+    }
 }

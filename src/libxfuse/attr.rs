@@ -361,6 +361,35 @@ pub trait Attr {
     ) -> Result<Vec<u8>, libc::c_int>
     where
         R: BufRead + Reader + Seek;
+
+    /// Set an attribute value. Returns the new total size of the attribute fork.
+    #[allow(dead_code)]
+    fn set<R>(
+        &mut self,
+        buf_reader: &mut R,
+        super_block: &Sb,
+        name: &OsStr,
+        value: &[u8],
+        flags: u32,
+    ) -> Result<u32, libc::c_int>
+    where
+        R: BufRead + Reader + Seek;
+
+    /// Remove an attribute. Returns the new total size of the attribute fork.
+    #[allow(dead_code)]
+    fn remove<R>(
+        &mut self,
+        buf_reader: &mut R,
+        super_block: &Sb,
+        name: &OsStr,
+    ) -> Result<u32, libc::c_int>
+    where
+        R: BufRead + Reader + Seek;
+
+    /// Serialize the attribute fork into the inode's attribute area.
+    /// Returns the bytes to write to the inode's attribute fork.
+    #[allow(dead_code)]
+    fn serialize(&mut self, super_block: &Sb) -> Result<Vec<u8>, libc::c_int>;
 }
 
 /// Open an attribute block, whose type may be unknown until its contents are examined.

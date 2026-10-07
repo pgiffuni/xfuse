@@ -44,7 +44,7 @@ use fuser::{
     ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, FUSE_ROOT_ID,
 };
 use libc::{
-    mode_t, ERANGE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
+    ERANGE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
 };
 use tracing::{debug, warn};
 
@@ -1183,7 +1183,8 @@ impl Volume {
             .get_mut(&ino)
             .ok_or_else(|| no_entry(b"an inode the kernel has not looked up"))?;
 
-        if oi.dinode.di_core.di_mode as mode_t & S_IFMT != S_IFREG {
+        #[allow(clippy::unnecessary_cast)]
+        if oi.dinode.di_core.di_mode as u32 & S_IFMT as u32 != S_IFREG as u32 {
             return Err(FsError::invalid(
                 libc::EBADF,
                 "only regular files can be written to",
@@ -1411,6 +1412,7 @@ impl Filesystem for Volume {
         reply.attr(&ttl, &attr)
     }
 
+    #[allow(clippy::unnecessary_cast)]
     fn create(
         &mut self,
         _req: &Request<'_>,
@@ -1656,7 +1658,8 @@ impl Filesystem for Volume {
 
         // Check it's a regular file (not a directory)
         let mode = child_raw.mode();
-        if (mode as u32 & S_IFMT) == S_IFDIR {
+        #[allow(clippy::unnecessary_cast)]
+        if (mode as u32 & S_IFMT as u32) == S_IFDIR as u32 {
             reply.error(libc::EISDIR);
             return;
         }
@@ -1832,6 +1835,7 @@ impl Filesystem for Volume {
         reply.ok();
     }
 
+    #[allow(clippy::unnecessary_cast)]
     fn mkdir(
         &mut self,
         _req: &Request<'_>,
@@ -2064,7 +2068,8 @@ impl Filesystem for Volume {
 
         // Check it's a directory
         let mode = child_raw.mode();
-        if (mode as u32 & S_IFMT) != S_IFDIR {
+        #[allow(clippy::unnecessary_cast)]
+        if (mode as u32 & S_IFMT as u32) != S_IFDIR as u32 {
             reply.error(libc::ENOTDIR);
             return;
         }
@@ -2459,7 +2464,8 @@ impl Filesystem for Volume {
 
         // Check it's not a directory (can't hardlink directories)
         let mode = target_raw.mode();
-        if (mode as u32 & S_IFMT) == S_IFDIR {
+        #[allow(clippy::unnecessary_cast)]
+        if (mode as u32 & S_IFMT as u32) == S_IFDIR as u32 {
             tx.abort();
             reply.error(libc::EPERM);
             return;
@@ -2507,15 +2513,41 @@ impl Filesystem for Volume {
         }
 
         // 3. Add directory entry
-        let ftype = match (mode as u32) & S_IFMT {
-            S_IFREG => XFS_DIR3_FT_REG_FILE,
-            S_IFDIR => XFS_DIR3_FT_DIR,
-            S_IFLNK => XFS_DIR3_FT_SYMLINK,
-            S_IFCHR => XFS_DIR3_FT_CHRDEV,
-            S_IFBLK => XFS_DIR3_FT_BLKDEV,
-            S_IFIFO => XFS_DIR3_FT_FIFO,
-            S_IFSOCK => XFS_DIR3_FT_SOCK,
-            _ => XFS_DIR3_FT_UNKNOWN,
+        // On FreeBSD, S_IF* constants are u16; we need u32 for bitwise operations.
+        #[allow(clippy::unnecessary_cast)]
+        const S_IFMT_U32: u32 = S_IFMT as u32;
+        #[allow(clippy::unnecessary_cast)]
+        const S_IFREG_U32: u32 = S_IFREG as u32;
+        #[allow(clippy::unnecessary_cast)]
+        const S_IFDIR_U32: u32 = S_IFDIR as u32;
+        #[allow(clippy::unnecessary_cast)]
+        const S_IFLNK_U32: u32 = S_IFLNK as u32;
+        #[allow(clippy::unnecessary_cast)]
+        const S_IFCHR_U32: u32 = S_IFCHR as u32;
+        #[allow(clippy::unnecessary_cast)]
+        const S_IFBLK_U32: u32 = S_IFBLK as u32;
+        #[allow(clippy::unnecessary_cast)]
+        const S_IFIFO_U32: u32 = S_IFIFO as u32;
+        #[allow(clippy::unnecessary_cast)]
+        const S_IFSOCK_U32: u32 = S_IFSOCK as u32;
+
+        let file_type = (mode as u32) & S_IFMT_U32;
+        let ftype = if file_type == S_IFREG_U32 {
+            XFS_DIR3_FT_REG_FILE
+        } else if file_type == S_IFDIR_U32 {
+            XFS_DIR3_FT_DIR
+        } else if file_type == S_IFLNK_U32 {
+            XFS_DIR3_FT_SYMLINK
+        } else if file_type == S_IFCHR_U32 {
+            XFS_DIR3_FT_CHRDEV
+        } else if file_type == S_IFBLK_U32 {
+            XFS_DIR3_FT_BLKDEV
+        } else if file_type == S_IFIFO_U32 {
+            XFS_DIR3_FT_FIFO
+        } else if file_type == S_IFSOCK_U32 {
+            XFS_DIR3_FT_SOCK
+        } else {
+            XFS_DIR3_FT_UNKNOWN
         };
         let first_offset = if dir.entries.is_empty() {
             dir.header_len() as u16
@@ -2572,6 +2604,7 @@ impl Filesystem for Volume {
         reply.entry(&ttl, &attr, 0);
     }
 
+    #[allow(clippy::unnecessary_cast)]
     fn symlink(
         &mut self,
         _req: &Request<'_>,
@@ -2605,7 +2638,7 @@ impl Filesystem for Volume {
 
         // 1. Allocate an inode for the symlink
         let agno = self.alloc_group_for_new_inode(parent_ino);
-        let symlink_mode = (S_IFLNK as u16) | 0o777; // symlinks typically have 777 permissions
+        let symlink_mode = (S_IFLNK | 0o777) as u16; // symlinks typically have 777 permissions
         let uid = self.current_uid();
         let gid = self.current_gid();
 

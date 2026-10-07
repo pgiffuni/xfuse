@@ -760,6 +760,38 @@ impl RawDinode {
         Ok(())
     }
 
+    /// Write a **local** attribute fork: its bytes, which for this format *are* its
+    /// contents and its size.
+    ///
+    /// It refuses, rather than truncating, if the data does not fit: a shortform
+    /// attribute fork that outgrows its inode is the transition this project has not
+    /// built, and quietly writing a prefix of it would produce an attribute fork that
+    /// `xfs_repair` accepts and that has silently lost entries.
+    pub fn set_attr_bytes(&mut self, data: &[u8]) -> FsResult<()> {
+        if self.format() != 1 {
+            return Err(FsError::unsupported(format!(
+                "writing literal attribute data into a fork in format {}",
+                self.format()
+            )));
+        }
+        let start = self.attribute_fork_offset().unwrap_or(self.bytes.len());
+        let limit = self.bytes.len();
+        if data.len() > limit.saturating_sub(start) {
+            return Err(FsError::fork_full(format!(
+                "a {} byte inode has {} bytes of local attr fork and this needs {}",
+                self.bytes.len(),
+                limit.saturating_sub(start),
+                data.len()
+            )));
+        }
+        for b in &mut self.bytes[start..limit] {
+            *b = 0;
+        }
+        self.bytes[start..start + data.len()].copy_from_slice(data);
+        // Note: we don't update size here as attribute fork size is tracked separately
+        Ok(())
+    }
+
     pub fn set_core_extents(&mut self, extents: &[BmbtRec]) -> FsResult<()> {
         if self.format() != 2 {
             return Err(FsError::unsupported(format!(
