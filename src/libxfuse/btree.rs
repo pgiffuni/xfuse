@@ -509,6 +509,66 @@ impl BmbtInteriorBlock {
 
         Some((new_node, separator_key))
     }
+
+    /// Remove a key-pointer pair from this intermediate node by key.
+    /// Returns true if removal caused the node to fall below minimum occupancy.
+    #[allow(dead_code)]
+    pub fn remove_key_ptr(
+        &mut self,
+        key: BmbtKey,
+        sb_blocksize: usize,
+        has_crc: bool,
+    ) -> Result<bool, i32> {
+        let min = Self::min_children(sb_blocksize, has_crc);
+        let idx = self.keys.partition_point(|k| k.br_startoff < key.br_startoff);
+        if idx >= self.keys.len() || self.keys[idx].br_startoff != key.br_startoff {
+            return Err(libc::ENOENT);
+        }
+        self.keys.remove(idx);
+        self.ptrs.remove(idx);
+        // Return true if we need to merge/redistribute
+        Ok(self.keys.len() < min)
+    }
+
+    /// Merge this node with another node (right sibling).
+    #[allow(dead_code)]
+    pub fn merge_with(&mut self, other: BmbtInteriorBlock) {
+        self.keys.extend(other.keys);
+        self.ptrs.extend(other.ptrs);
+    }
+
+    /// Redistribute key-pointer pairs with a sibling to maintain minimum occupancy.
+    #[allow(dead_code)]
+    pub fn redistribute_with(&mut self, other: &mut BmbtInteriorBlock, _sb_blocksize: usize, _has_crc: bool) -> bool {
+        let total = self.keys.len() + other.keys.len();
+        let min = Self::min_children(0, false);
+        if total < 2 * min {
+            // Can't redistribute while maintaining minimum
+            return false;
+        }
+        // Combine and split evenly
+        let mut all_keys = self.keys.clone();
+        all_keys.append(&mut other.keys);
+        let mut all_ptrs = self.ptrs.clone();
+        all_ptrs.append(&mut other.ptrs);
+        // Re-sort by key
+        let combined: Vec<_> = all_keys.into_iter().zip(all_ptrs).collect();
+        let mut combined_sorted = combined;
+        combined_sorted.sort_by_key(|(k, _)| k.br_startoff);
+        let mid = combined_sorted.len() / 2;
+        let (new_self_keys, new_self_ptrs): (Vec<_>, Vec<_>) = combined_sorted[..mid].iter().cloned().unzip();
+        let (new_other_keys, new_other_ptrs): (Vec<_>, Vec<_>) = combined_sorted[mid..].iter().cloned().unzip();
+        self.keys = new_self_keys;
+        self.ptrs = new_self_ptrs;
+        other.keys = new_other_keys;
+        other.ptrs = new_other_ptrs;
+        true
+    }
+
+    /// The minimum number of children this node can have (when not root).
+    pub const fn min_children(sb_blocksize: usize, has_crc: bool) -> usize {
+        Self::max_children(sb_blocksize, has_crc) / 2
+    }
 }
 
 /// Write the header both node writers share.
@@ -769,6 +829,53 @@ impl BmbtLeafBlock {
         BmbtKey {
             br_startoff: self.records[0].startoff(),
         }
+    }
+
+    /// Remove a record from this leaf by startoff, returning true if removed.
+    /// If the leaf falls below minimum occupancy, returns Ok(true) to indicate
+    /// that merge/redistribution is needed.
+    #[allow(dead_code)]
+    pub fn remove_record(
+        &mut self,
+        startoff: XfsFileoff,
+        sb_blocksize: usize,
+        has_crc: bool,
+    ) -> Result<bool, i32> {
+        let min = Self::min_records(sb_blocksize, has_crc);
+        let idx = self.records.partition_point(|r| r.startoff() < startoff);
+        if idx >= self.records.len() || self.records[idx].startoff() != startoff {
+            return Err(libc::ENOENT);
+        }
+        self.records.remove(idx);
+        // Return true if we need to merge/redistribute
+        Ok(self.records.len() < min)
+    }
+
+    /// Merge this leaf with another leaf (right sibling), returning the combined records.
+    /// Used when a leaf is below minimum and can be merged with a sibling.
+    #[allow(dead_code)]
+    pub fn merge_with(&mut self, other: BmbtLeafBlock) {
+        self.records.extend(other.records);
+    }
+
+    /// Redistribute records with a sibling leaf to maintain minimum occupancy.
+    /// Returns true if redistribution was successful.
+    #[allow(dead_code)]
+    pub fn redistribute_with(&mut self, other: &mut BmbtLeafBlock) -> bool {
+        let total = self.records.len() + other.records.len();
+        if total < 2 * Self::min_records(0, false) {
+            // Can't redistribute while maintaining minimum
+            return false;
+        }
+        // Combine and split evenly
+        let mut all = self.records.clone();
+        all.append(&mut other.records);
+        all.sort_by_key(|r| r.startoff());
+        let mid = all.len() / 2;
+        let new_other = all.split_off(mid);
+        self.records = all;
+        other.records = new_other;
+        true
     }
 
     /// This leaf as the bytes of a block of a file system **without** checksums holds.
