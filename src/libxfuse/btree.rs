@@ -53,6 +53,7 @@ use num_traits::{PrimInt, Unsigned};
 use super::{
     bmbt_rec::{BmbtRec, Bmx},
     definitions::{XfsFileoff, XfsFsblock, XfsIno, XFS_BMAP_CRC_MAGIC, XFS_BMAP_MAGIC},
+    sb::Sb,
     utils::{decode, decode_from, Uuid},
     volume::SUPERBLOCK,
 };
@@ -462,6 +463,52 @@ impl BmbtInteriorBlock {
         }
         b
     }
+
+    /// Insert a key-pointer pair into this intermediate node, returning the split result if it overflows.
+    /// Returns None if inserted without splitting, or Some((new_node, separator_key)) if split.
+    #[allow(dead_code)]
+    pub fn insert_key_ptr(
+        &mut self,
+        key: BmbtKey,
+        ptr: XfsBmbtPtr,
+        sb_blocksize: usize,
+        has_crc: bool,
+    ) -> Option<(BmbtInteriorBlock, BmbtKey)> {
+        let max = Self::max_children(sb_blocksize, has_crc);
+        if self.keys.len() < max {
+            // Room for one more - insert in order by key
+            let idx = self
+                .keys
+                .partition_point(|k| k.br_startoff < key.br_startoff);
+            self.keys.insert(idx, key);
+            self.ptrs.insert(idx, ptr);
+            return None;
+        }
+
+        // Node is full - need to split
+        let mut all_keys = self.keys.clone();
+        let mut all_ptrs = self.ptrs.clone();
+        let idx = all_keys.partition_point(|k| k.br_startoff < key.br_startoff);
+        all_keys.insert(idx, key);
+        all_ptrs.insert(idx, ptr);
+
+        // Split in half
+        let mid = all_keys.len() / 2;
+        let separator_key = all_keys[mid].clone();
+        let new_keys = all_keys.split_off(mid);
+        let new_ptrs = all_ptrs.split_off(mid);
+
+        let new_node = BmbtInteriorBlock {
+            level: self.level,
+            keys: new_keys,
+            ptrs: new_ptrs,
+        };
+
+        self.keys = all_keys;
+        self.ptrs = all_ptrs;
+
+        Some((new_node, separator_key))
+    }
 }
 
 /// Write the header both node writers share.
@@ -671,6 +718,57 @@ impl BmbtLeafBlock {
             return None;
         }
         Some(leaves)
+    }
+
+    /// Insert a record into this leaf, returning the split result if the leaf overflows.
+    /// Returns None if inserted without splitting, or Some((new_leaf, separator_key)) if split.
+    #[allow(dead_code)]
+    pub fn insert_record(
+        &mut self,
+        record: BmbtLeafRecord,
+        sb_blocksize: usize,
+        has_crc: bool,
+    ) -> Option<(BmbtLeafBlock, BmbtKey)> {
+        let max = Self::max_records(sb_blocksize, has_crc);
+        if self.records.len() < max {
+            // Room for one more - insert in order by startoff
+            let idx = self
+                .records
+                .partition_point(|r| r.startoff() < record.startoff());
+            self.records.insert(idx, record);
+            return None;
+        }
+
+        // Leaf is full - need to split
+        let mut all_records = self.records.clone();
+        let idx = all_records.partition_point(|r| r.startoff() < record.startoff());
+        all_records.insert(idx, record);
+
+        // Split in half - first half stays, second half goes to new leaf
+        let mid = all_records.len() / 2;
+        let new_leaf_records = all_records.split_off(mid);
+
+        // The separator key is the first record of the new leaf
+        let separator_key = BmbtKey {
+            br_startoff: new_leaf_records[0].startoff(),
+        };
+
+        let new_leaf = BmbtLeafBlock {
+            level: self.level,
+            records: new_leaf_records,
+        };
+
+        self.records = all_records;
+
+        Some((new_leaf, separator_key))
+    }
+
+    /// The separator key for this leaf (first record's startoff).
+    #[allow(dead_code)]
+    pub fn separator_key(&self) -> BmbtKey {
+        BmbtKey {
+            br_startoff: self.records[0].startoff(),
+        }
     }
 
     /// This leaf as the bytes of a block of a file system **without** checksums holds.
@@ -904,6 +1002,50 @@ impl BtreeRoot {
         }
         Ok((Bmx::new(&out), nodes))
     }
+
+    /// Insert an extent record into the BMBT, growing the tree as necessary.
+    /// This is used when extending a file's data fork.
+    #[allow(dead_code)]
+    pub fn insert_extent<R>(
+        &mut self,
+        _buf_reader: &mut R,
+        extent: BmbtRec,
+        sb: &Sb,
+    ) -> Result<(), i32>
+    where
+        R: bincode_next::de::read::Reader + BufRead + Seek,
+    {
+        // For a root that is a leaf (bb_level == 0), we need to convert it to a tree
+        if self.bmdr.bb_level == 0 {
+            // The root is currently a leaf - we need to create a new leaf block
+            // and make the root point to it. This is a significant change.
+            return Err(libc::ENOSYS);
+        }
+
+        // For a multi-level tree, descend to the leaf level
+        let record = BmbtLeafRecord::from_extent(&extent);
+        let record_startoff = record.startoff();
+
+        // Traverse down to find the leaf where this record belongs
+        let _path: Vec<(u16, usize)> = Vec::new(); // (level, index_in_keys)
+        let _current_ptr_idx = self
+            .keys
+            .partition_point(|k| k.br_startoff < record_startoff);
+
+        // We need to traverse down to find the leaf where this record belongs
+        let _sb_clone = *sb; // We'll need this for block allocation
+
+        // This is complex - we need to:
+        // 1. Traverse to the leaf
+        // 2. Insert into leaf
+        // 3. Handle leaf split -> propagate to parent
+        // 4. Handle parent split -> propagate up
+        // 5. Handle root growth
+
+        // For now, this is a placeholder - the full implementation requires
+        // block allocation from the free space trees, which requires a transaction
+        Err(libc::ENOSYS)
+    }
 }
 
 #[derive(Debug)]
@@ -1032,6 +1174,13 @@ impl BtreePriv for BtreeRoot {
 
 impl Btree for BtreeRoot {}
 
+/// Child node in a BMBT tree - either a leaf or an intermediate node.
+#[allow(dead_code)]
+enum BtreeChild {
+    Leaf(BmbtLeafBlock),
+    Intermediate(BtreeIntermediate),
+}
+
 /// An intermediate Btree.
 #[derive(Debug)]
 struct BtreeIntermediate {
@@ -1061,6 +1210,72 @@ impl BtreePriv for BtreeIntermediate {
 }
 
 impl Btree for BtreeIntermediate {}
+
+impl BtreeIntermediate {
+    /// Insert an extent record into this intermediate node's subtree.
+    /// Returns Ok(()) on success, or Err if the subtree needs to be split and the
+    /// separator key needs to be propagated up.
+    #[allow(dead_code)]
+    pub fn insert_extent<R>(
+        &mut self,
+        buf_reader: &mut R,
+        extent: BmbtRec,
+        _sb: &Sb,
+    ) -> Result<Option<(BmbtKey, XfsBmbtPtr)>, i32>
+    where
+        R: bincode_next::de::read::Reader + BufRead + Seek,
+    {
+        // Traverse down to find the appropriate child
+        let record = BmbtLeafRecord::from_extent(&extent);
+        let record_startoff = record.startoff();
+        let child_idx = self
+            .keys
+            .partition_point(|k| k.br_startoff < record_startoff);
+
+        // Recursively insert into the child
+        let child_ptr = self.ptrs[child_idx];
+        let offset = super::volume::try_superblock()
+            .ok_or(libc::ENODEV)?
+            .fsb_to_offset(child_ptr);
+
+        buf_reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+
+        let _child = if self.level() == 1 {
+            // Child is a leaf
+            let mut bytes = vec![
+                0u8;
+                super::volume::try_superblock()
+                    .ok_or(libc::ENODEV)?
+                    .sb_blocksize as usize
+            ];
+            buf_reader
+                .read_exact(&mut bytes)
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            BtreeChild::Leaf(
+                BmbtLeafBlock::from_bytes(&bytes).map_err(|_| crate::libxfuse::EUCLEAN)?,
+            )
+        } else {
+            // Child is an intermediate node
+            let mut bytes = vec![
+                0u8;
+                super::volume::try_superblock()
+                    .ok_or(libc::ENODEV)?
+                    .sb_blocksize as usize
+            ];
+            buf_reader
+                .read_exact(&mut bytes)
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            let child: BtreeIntermediate =
+                decode_from(buf_reader.by_ref()).map_err(|_| libc::EDESTADDRREQ)?;
+            BtreeChild::Intermediate(child)
+        };
+
+        // For now, this is a placeholder
+        Err(libc::ENOSYS)
+    }
+}
 
 impl<Ctx> Decode<Ctx> for BtreeIntermediate {
     fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, DecodeError> {

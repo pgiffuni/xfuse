@@ -43,9 +43,7 @@ use fuser::{
     Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, FUSE_ROOT_ID,
 };
-use libc::{
-    ERANGE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
-};
+use libc::{ERANGE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK};
 use tracing::{debug, warn};
 
 use super::{

@@ -160,7 +160,11 @@ impl Attr for AttrShortform {
         let namelen = name_bytes.len() as u8;
 
         // Check if attribute already exists
-        if let Some(idx) = self.list.iter().position(|e| e.nameval[0..e.namelen as usize] == *name_bytes) {
+        if let Some(idx) = self
+            .list
+            .iter()
+            .position(|e| e.nameval[0..e.namelen as usize] == *name_bytes)
+        {
             // Replace existing attribute
             let entry = &mut self.list[idx];
             let old_namelen = entry.namelen as usize;
@@ -182,7 +186,9 @@ impl Attr for AttrShortform {
                 nameval: [name_bytes, value].concat(),
             };
             let _new_total = name_bytes.len() + value.len();
-            self.total_size += get_namespace_size_from_flags(flags as u8) + u32::from(namelen) + value.len() as u32;
+            self.total_size += get_namespace_size_from_flags(flags as u8)
+                + u32::from(namelen)
+                + value.len() as u32;
             self.list.push(new_entry);
         }
 
@@ -200,13 +206,19 @@ impl Attr for AttrShortform {
     {
         let name_bytes = name.as_bytes();
 
-        if let Some(idx) = self.list.iter().position(|e| e.nameval[0..e.namelen as usize] == *name_bytes) {
+        if let Some(idx) = self
+            .list
+            .iter()
+            .position(|e| e.nameval[0..e.namelen as usize] == *name_bytes)
+        {
             let entry = self.list[idx].clone();
             let namelen = entry.namelen as usize;
             let valuelen = entry.nameval.len() - namelen;
 
             self.list.remove(idx);
-            self.total_size -= get_namespace_size_from_flags(entry.flags) + u32::from(entry.namelen) + valuelen as u32;
+            self.total_size -= get_namespace_size_from_flags(entry.flags)
+                + u32::from(entry.namelen)
+                + valuelen as u32;
             Ok(self.total_size)
         } else {
             Err(crate::libxfuse::ENOATTR)
@@ -215,11 +227,11 @@ impl Attr for AttrShortform {
 
     fn serialize(&mut self, _super_block: &Sb) -> Result<Vec<u8>, i32> {
         let mut buf = Vec::with_capacity(self.total_size as usize);
-        
+
         // Write header
         buf.extend_from_slice(&self.total_size.to_be_bytes());
         buf.extend_from_slice(&[self.list.len() as u8, 0]); // count + padding
-        
+
         // Write entries
         for entry in &self.list {
             buf.push(entry.namelen);
@@ -228,7 +240,7 @@ impl Attr for AttrShortform {
             buf.push(entry.flags);
             buf.extend_from_slice(&entry.nameval);
         }
-        
+
         Ok(buf)
     }
 }
