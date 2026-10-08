@@ -45,15 +45,25 @@ use super::dir3::{
 ///
 /// This is just like the `Uuid` from the `uuid` crate, except that it
 /// serializes as a fixed-size array instead of a slice
-// The Uuid crate serializes to a slice, and its maintainers have ruled out ever
-// serializing to a fixed-size array instead.
-// See Also [Uuid #557](https://github.com/uuid-rs/uuid/issues/557)
+/// The Uuid crate serializes to a slice, and its maintainers have ruled out ever
+/// serializing to a fixed-size array instead.
+/// See Also [Uuid #557](https://github.com/uuid-rs/uuid/issues/557)
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct Uuid(uuid::Uuid);
 
 impl Uuid {
+    #[allow(dead_code)]
+    pub const fn new(u: uuid::Uuid) -> Self {
+        Self(u)
+    }
+
     pub const fn from_u128(x: u128) -> Self {
         Self(uuid::Uuid::from_u128(x))
+    }
+
+    #[allow(dead_code)]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(uuid::Uuid::from_bytes(bytes))
     }
 
     /// The identifier's 16 bytes, in the order they are stored on an image.
@@ -68,6 +78,12 @@ impl<Ctx> bincode_next::Decode<Ctx> for Uuid {
     }
 }
 impl_borrow_decode!(Uuid);
+
+impl bincode_next::Encode for Uuid {
+    fn encode<E: bincode_next::enc::Encoder>(&self, encoder: &mut E) -> Result<(), bincode_next::error::EncodeError> {
+        self.0.as_bytes().encode(encoder)
+    }
+}
 
 pub enum FileKind {
     Type(u8),

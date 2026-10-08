@@ -58,8 +58,11 @@ pub const XFS_RMAP_CRC_MAGIC: u32 = 0x524d4233; // Reverse Mapping B+tree
 pub const XFS_RTRMAP_CRC_MAGIC: u32 = 0x4d415052; // Real-Time Reverse Mapping B+tree
 pub const XFS_REFC_CRC_MAGIC: u32 = 0x52334643; // Reference Count B+tree
 pub const XFS_MD_MAGIC: u32 = 0x5846534d; // Metadata Dumps
+pub const BNULL_PTR: u32 = 0xffffffff; // Null block pointer
 
 pub type XfsIno = u64; // absolute inode number
+pub type XfsDir2DataOff = u16;
+pub type XfsDir2Dataptr = u32;
 pub type XfsOff = i64; // file offset
 pub type XfsDaddr = i64; // disk address (sectors)
 pub type XfsAgnumber = u32; // AG number

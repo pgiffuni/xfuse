@@ -1,3 +1,4 @@
+#![allow(unused_imports)]
 /*
  * BSD 2-Clause License
  *

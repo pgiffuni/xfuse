@@ -99,7 +99,7 @@ pub(super) fn try_superblock() -> Option<&'static Sb> {
 }
 
 /// The decode-time answer to "there is no image in this process".
-pub(super) const NO_IMAGE: &str = "no image has been opened in this process";
+pub const NO_IMAGE: &str = "no image has been opened in this process";
 
 #[derive(Debug)]
 struct OpenInode {

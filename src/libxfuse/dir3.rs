@@ -35,6 +35,7 @@ use bincode_next::{
     de::{read::Reader, Decoder},
     error::DecodeError,
     Decode,
+    Encode,
 };
 use fuser::FileType;
 use libc::c_int;
@@ -48,12 +49,8 @@ use super::{
     utils::{decode, Uuid},
 };
 
-type XfsDir2DataOff = u16;
-/// Block address of a directory entry, in eight byte units.
-pub type XfsDir2Dataptr = u32;
-
 #[allow(dead_code)]
-mod constants {
+pub mod constants {
     pub const XFS_DIR2_DATA_FD_COUNT: usize = 3;
 
     pub const XFS_DIR3_FT_UNKNOWN: u8 = 0;
@@ -67,48 +64,50 @@ mod constants {
     pub const XFS_DIR3_FT_WHT: u8 = 8;
 }
 pub use constants::*;
-
-#[derive(Debug, Decode)]
+pub use super::definitions::{XfsIno};
+pub use super::definitions::XfsDir2DataOff;
+pub use super::definitions::XfsDir2Dataptr;
+#[allow(unused_imports)]
+pub use super::dir3_block::Dir2BlockTail;
+#[derive(Debug, Decode, Encode, Default)]
 pub struct Dir3BlkHdr {
     pub magic: u32,
-    _crc: u32,
-    _blkno: u64,
-    _lsn: u64,
-    _uuid: Uuid,
-    _owner: u64,
+    pub crc: u32,
+    pub blkno: u64,
+    pub lsn: u64,
+    pub uuid: Uuid,
+    pub owner: u64,
 }
 
 impl Dir3BlkHdr {
     pub const SIZE: u64 = 48;
 }
 
-#[derive(Debug, Decode, Clone, Copy)]
-struct Dir2DataFree {
-    _offset: XfsDir2DataOff,
-    _length: XfsDir2DataOff,
+#[derive(Debug, Decode, Encode, Default, Clone, Copy)]
+pub struct Dir2DataFree {
+    pub offset: XfsDir2DataOff,
+    pub length: XfsDir2DataOff,
 }
-
 impl Dir2DataFree {
     pub const SIZE: u64 = 4;
 }
 
-#[derive(Debug, Decode)]
+#[derive(Debug, Decode, Encode)]
 pub struct Dir2DataHdr {
     pub magic: u32,
-    _best_free: [Dir2DataFree; constants::XFS_DIR2_DATA_FD_COUNT],
+    pub best_free: [Dir2DataFree; constants::XFS_DIR2_DATA_FD_COUNT],
 }
-
 impl Dir2DataHdr {
     pub const SIZE: u64 = 4 + constants::XFS_DIR2_DATA_FD_COUNT as u64 * Dir2DataFree::SIZE;
 }
 
-#[derive(Debug, Decode)]
+#[derive(Debug, Decode, Encode, Default)]
 pub struct Dir3DataHdr {
     pub hdr: Dir3BlkHdr,
-    _best_free: [Dir2DataFree; constants::XFS_DIR2_DATA_FD_COUNT],
-    _pad: u32,
+    pub best_free: [Dir2DataFree; constants::XFS_DIR2_DATA_FD_COUNT],
+    pub pad: u32,
 }
-
+ 
 impl Dir3DataHdr {
     pub const SIZE: u64 =
         Dir3BlkHdr::SIZE + constants::XFS_DIR2_DATA_FD_COUNT as u64 * Dir2DataFree::SIZE + 4;
@@ -178,7 +177,7 @@ impl<Ctx> Decode<Ctx> for Dir2DataEntry {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Encode)]
 pub struct Dir2DataUnused {
     pub freetag: u16,
     pub length: XfsDir2DataOff,
@@ -199,7 +198,7 @@ impl<Ctx> Decode<Ctx> for Dir2DataUnused {
     }
 }
 
-#[derive(Clone, Copy, Debug, Decode, Default)]
+#[derive(Clone, Copy, Debug, Decode, Encode, Default)]
 pub struct Dir2LeafEntry {
     pub hashval: XfsDahash,
     pub address: XfsDir2Dataptr,
