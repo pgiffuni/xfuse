@@ -26,7 +26,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use bincode_next::{de::Decoder, error::DecodeError, Decode};
+use bincode_next::{de::Decoder, error::DecodeError, Decode, Encode};
 
 use super::definitions::*;
 
@@ -229,5 +229,20 @@ mod tests {
         ]);
 
         assert_eq!(bmx.map_dblock(6), Some(41));
+    }
+}
+
+/// Encode a BmbtRec as a u128 with the same layout as decode.
+#[allow(clippy::items_after_test_module)]
+impl Encode for BmbtRec {
+    fn encode<E: bincode_next::enc::Encoder>(&self, encoder: &mut E) -> Result<(), bincode_next::error::EncodeError> {
+        let mut br: u128 = 0;
+        br |= (self.br_blockcount as u128) & ((1 << 21) - 1);
+        br |= ((self.br_startblock as u128) & ((1 << 52) - 1)) << 21;
+        br |= ((self.br_startoff as u128) & ((1 << 54) - 1)) << (21 + 52);
+        if self.br_flag {
+            br |= 1u128 << (21 + 52 + 54);
+        }
+        br.encode(encoder)
     }
 }

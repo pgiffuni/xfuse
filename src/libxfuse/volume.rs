@@ -3556,7 +3556,7 @@ impl Filesystem for Volume {
                             br_startoff: fblock,
                             br_startblock: fsblock,
                             br_blockcount: 1,
-                            br_flag: false,
+                            br_flag: true, // Mark as unwritten (delayed allocation)
                         };
                         
                         // Insert into btree
@@ -3660,7 +3660,7 @@ impl Filesystem for Volume {
                     br_startoff: fblock,
                     br_startblock: fsblock,
                     br_blockcount: 1,
-                    br_flag: false,
+                    br_flag: true, // Mark as unwritten (delayed allocation)
                 };
                 
                 // Simple coalescing: if last extent is adjacent, extend it

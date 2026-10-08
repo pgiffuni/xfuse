@@ -517,12 +517,14 @@ error, because the group may be nearly empty and no retry helps).
 
 **missing.**
 
-* **Incremental insertion into an existing on-disk tree.** Partially implemented
+* **Incremental insertion into an existing on-disk tree.** Implemented
   for multi-level trees (level ≥ 1) in `BtreeRoot::insert_extent` and
   `BtreeRoot::insert_extent_intermediate`. Recursively descends to leaf,
   handles leaf split, allocates new blocks via `allocate_in_group`, propagates
-  separator keys up. Root level 0 (extent list → BMBT conversion) and
-  intermediate node splits not yet implemented.
+  separator keys up. Root level 0 (extent list → BMBT conversion) implemented
+  via `insert_extent_root_leaf`. **Intermediate node splits** implemented in
+  `insert_extent_intermediate`: when an intermediate node overflows, splits it,
+  allocates new block, propagates separator key up.
 * **Root growth and collapse.** Root growth (level 0→1, 1→2, etc.) is
   implemented: `BtreeRoot::insert_extent_root_leaf` and `convert_to_btree` handle
   extent list → BMBT conversion when inode overflows. **Root growth (level 1→2)**
@@ -542,9 +544,11 @@ error, because the group may be nearly empty and no retry helps).
   then left; attempts redistribution, falls back to merge; updates parent
   separator keys; frees merged block. **Intermediate node merge/redistribute
   propagation** in `BtreeRoot::handle_intermediate_underflow`: same logic for
-  intermediate nodes. Root collapse not yet implemented.
-* **Extent coalescing/splitting.** Adjacent extent merging and extent
-  splitting during insertion/deletion is not implemented.
+  intermediate nodes. Root collapse implemented.
+* **Extent coalescing/splitting.** Implemented: `BmbtLeafBlock::insert_record`
+  coalesces with previous/next on insertion; `remove_record` coalesces adjacent
+  after deletion; `coalesce_adjacent` called after PUNCH_HOLE. Splitting during
+  deletion implemented in `delete_extents_recursive`.
 * **CRC updates for v5 nodes.** Implemented in all `to_bytes` methods
   (`BmbtLeafBlock`, `BmbtInteriorBlock`, `BtreeIntermediate`) via
   `crc32c_without_its_own_field`. Previously was a no-op.
@@ -637,8 +641,8 @@ punch holes (free interior extents, creating sparse regions).
   allocated via `map_block`, allocates via `allocate_in_group`, inserts extent
   via `BtreeRoot::insert_extent`. Returns `ENOSYS` for extents format;
   `ENOTSUP` for real-time files.
-* Both operations handle BMBT format (level ≥ 1). Extents format and root
-  level 0 (extent list → BMBT conversion) not yet implemented.
+* Both operations handle BMBT format (level ≥ 1) and extents format.
+  Root level 0 (extent list → BMBT conversion) implemented.
 
 **missing.**
 
@@ -651,8 +655,11 @@ punch holes (free interior extents, creating sparse regions).
   for PUNCH_HOLE: handles record spanning hole (split), straddling startoff (trim
   front), straddling endoff (trim end). Uses `BmbtLeafRecord::from_extent` for
   proper 128-bit packed record creation.
-* **Delayed allocation / unwritten extent flag.** XFS uses the extent flag
-  bit to mark allocated-but-unwritten extents; not yet implemented.
+* **Delayed allocation / unwritten extent flag.** Implemented:
+  `BmbtRec::br_flag` field marks allocated-but-unwritten extents. `fallocate`
+  KEEP_SIZE sets `br_flag = true` for newly allocated blocks (both BMBT and
+  extents formats). `BmbtRec::Encode` serializes the flag. Not yet integrated:
+  `write_data` does not clear the flag when data is written to unwritten extents.
 
 **verified.**
 
