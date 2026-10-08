@@ -601,28 +601,29 @@ punch holes (free interior extents, creating sparse regions).
 * **`truncate` (grow).** Extends `di_size` without allocating blocks; the
   new region reads as zeroes.
 * **Hole detection.** `write_data` refuses to write into a hole; the caller
-  must use `fallocate` first (not yet implemented).
+  must use `fallocate` first (now implemented for PUNCH_HOLE/KEEP_SIZE).
+
+**implemented.**
+
+* **`fallocate` (FALLOC_FL_PUNCH_HOLE).** `Volume::fallocate` in `volume.rs:3269`
+  punches holes in BMBT-formatted files: reads inode/btree root before
+  transaction, calls `BtreeRoot::delete_extents_in_range` to locate and remove
+  overlapping leaf records, frees blocks via `free_in_group`, updates inode
+  (`di_nblocks`, `di_mtime`, `di_ctime`) in transaction. Returns `ENOSYS` for
+  extents format; `ENOTSUP` for real-time files.
+* **`fallocate` (FALLOC_FL_KEEP_SIZE).** Preallocates blocks for a range
+  without changing file size: for each file block in range, checks if already
+  allocated via `map_block`, allocates via `allocate_in_group`, inserts extent
+  via `BtreeRoot::insert_extent`. Returns `ENOSYS` for extents format;
+  `ENOTSUP` for real-time files.
+* Both operations handle BMBT format (level ≥ 1). Extents format and root
+  level 0 (extent list → BMBT conversion) not yet implemented.
 
 **missing.**
 
-* **`fallocate` (FALLOC_FL_KEEP_SIZE).** Preallocate blocks for a range
-  without changing file size. Requires allocating blocks via
-  `allocate_new_chunk`, inserting extents into the fork (possibly triggering
-  BMBT insertion/split), and marking them as unwritten.
-* **`fallocate` (FALLOC_FL_PUNCH_HOLE).** Free blocks in a range, creating
-  a hole. Requires locating the affected extents, splitting if partial,
-  freeing the middle portion, and coalescing adjacent extents.
-* **Incremental BMBT insertion.** Implemented for multi-level trees (level ≥ 1)
-  in `BtreeRoot::insert_extent` and `BtreeRoot::insert_extent_intermediate`.
-  Recursively descends to leaf, handles leaf split, allocates new blocks via
-  `allocate_in_group`, propagates separator keys up. Root level 0 (extent list
-  → BMBT conversion) and intermediate node splits not yet implemented.
-* **Incremental BMBT deletion.** Implemented in `BtreeRoot::delete_extents_in_range`
-  and `BtreeRoot::delete_extents_intermediate`. Locates overlapping leaves,
-  removes fully-contained records, frees blocks via `free_in_group`. Partial
-  record splitting, merge/redistribution propagation, and root collapse not yet
-  implemented.
+* **`fallocate` (FALLOC_FL_KEEP_SIZE) for extents format.** Not yet implemented.
 * **Extent coalescing.** Adjacent extent merging after insertion/deletion.
+* **Partial record splitting.** When punch hole range cuts through an extent.
 * **Delayed allocation / unwritten extent flag.** XFS uses the extent flag
   bit to mark allocated-but-unwritten extents; not yet implemented.
 
