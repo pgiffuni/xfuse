@@ -529,7 +529,9 @@ error, because the group may be nearly empty and no retry helps).
   implemented in `BtreeRoot::check_root_collapse`: when level 1 root has one child
   that is a leaf and all records fit in inode, moves records back to inode and
   frees the leaf block. Called after deletions in `delete_extents_in_range`.
-  Root collapse (level 2→1) not yet implemented.
+  **Root collapse (level 2→1)** implemented: when level 2 root has one intermediate
+  child with one leaf child, moves leaf records up to intermediate (now leaf),
+  frees leaf block, updates root to level 1. Called after deletions.
 * **Full delete algorithm with merge/redistribution propagation.** Implemented:
   `BtreeRoot::delete_extents_in_range` and `BtreeRoot::delete_extents_intermediate`
   locate overlapping leaves and remove records. **Leaf-level merge/redistribute
@@ -567,6 +569,10 @@ error, because the group may be nearly empty and no retry helps).
 * **Root collapse (level 1→0).** Implemented in `BtreeRoot::check_root_collapse`:
   called after deletions; when level 1 root has one leaf child fitting in inode,
   moves records back and frees leaf block.
+* **Root collapse (level 2→1).** Implemented in `BtreeRoot::check_root_collapse`:
+  called after deletions; when level 2 root has one intermediate child with
+  one leaf child, moves leaf records up to intermediate, frees leaf block,
+  updates root to level 1.
 
 ---
 

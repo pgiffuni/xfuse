@@ -1871,8 +1871,8 @@ impl BtreeRoot {
         Ok(freed_blocks)
     }
     
-    /// Check if the BMBT root can be collapsed to an extent list (level 1 → level 0).
-    /// This happens when the root has only one child and that child is a leaf.
+    /// Check if the BMBT root can be collapsed (level 2→1 or 1→0).
+    /// This happens when the root has only one child and that child can be collapsed.
     #[allow(dead_code)]
     fn check_root_collapse<R>(
         &mut self,
@@ -1883,7 +1883,79 @@ impl BtreeRoot {
     where
         R: bincode_next::de::read::Reader + BufRead + Seek,
     {
-        // Root collapse: level 1 root with one child that is a leaf
+        // Root collapse level 2→1: level 2 root with one child that is an intermediate node
+        if self.bmdr.bb_level == 2 && self.keys.len() == 1 && self.ptrs.len() == 1 {
+            let child_ptr = self.ptrs[0];
+            let offset = sb.fsb_to_offset(child_ptr);
+            
+            buf_reader
+                .seek(SeekFrom::Start(offset))
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            
+            let mut child_bytes = vec![0u8; sb.sb_blocksize as usize];
+            buf_reader
+                .read_exact(&mut child_bytes)
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            
+            // Verify it's an intermediate node (level 1)
+            let mut intermediate = BtreeIntermediate::from_bytes(&child_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+            if intermediate.level() == 1 && intermediate.keys.len() == 1 && intermediate.ptrs.len() == 1 {
+                // The intermediate has one child - check if it's a leaf
+                let leaf_ptr = intermediate.ptrs[0];
+                let leaf_offset = sb.fsb_to_offset(leaf_ptr);
+                
+                buf_reader
+                    .seek(SeekFrom::Start(leaf_offset))
+                    .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+                
+                let mut leaf_bytes = vec![0u8; sb.sb_blocksize as usize];
+                buf_reader
+                    .read_exact(&mut leaf_bytes)
+                    .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+                
+                let leaf = BmbtLeafBlock::from_bytes(&leaf_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+                if leaf.level == 0 {
+                    // Check if leaf records fit in intermediate node
+                    let max_keys = BmbtInteriorBlock::max_children(sb.sb_blocksize as usize, sb.has_crc());
+                    if leaf.records.len() <= max_keys {
+                        // Collapse: move leaf records to intermediate node
+                        let new_keys: Vec<BmbtKey> = leaf.records.iter().map(|r| BmbtKey { br_startoff: r.startoff() }).collect();
+                        let new_ptrs: Vec<XfsFsblock> = leaf.records.iter().map(|r| r.startblock()).collect();
+                        
+                        // Update intermediate node
+                        intermediate.hdr.bb_level = 0;
+                        intermediate.hdr.bb_numrecs = leaf.records.len() as u16;
+                        intermediate.keys = new_keys;
+                        intermediate.ptrs = new_ptrs;
+                        
+                        // Write updated intermediate (now leaf)
+                        let new_hdr = BtreeLblockHdr {
+                            blkno: child_ptr,
+                            lsn: 0,
+                            leftsib: BMBT_NULL_PTR,
+                            rightsib: BMBT_NULL_PTR,
+                            owner: 0,
+                            uuid: sb.sb_uuid.as_image_bytes(),
+                        };
+                        tx.write_bytes(sb.fsb_to_offset(child_ptr), &intermediate.to_bytes(&new_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
+                        
+                        // Free the leaf block
+                        let agno = (leaf_ptr >> sb.sb_agblklog) as u32;
+                        let mask = u64::from(1u32 << sb.sb_agblklog) - 1;
+                        let start = (leaf_ptr & mask) as u32;
+                        crate::libxfuse::alloc::allocator::free_in_group(tx, sb, agno, crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 }).map_err(|e| e.errno())?;
+                        
+                        // Update root to level 1 (now points to leaf)
+                        self.bmdr.bb_level = 1;
+                        self.bmdr.bb_numrecs = 1;
+                        self.keys = vec![BmbtKey { br_startoff: intermediate.keys[0].br_startoff }];
+                        self.ptrs = vec![child_ptr];
+                    }
+                }
+            }
+        }
+        
+        // Root collapse level 1→0: level 1 root with one child that is a leaf
         if self.bmdr.bb_level == 1 && self.keys.len() == 1 && self.ptrs.len() == 1 {
             let child_ptr = self.ptrs[0];
             let offset = sb.fsb_to_offset(child_ptr);
