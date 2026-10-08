@@ -517,20 +517,22 @@ error, because the group may be nearly empty and no retry helps).
 
 **missing.**
 
-* **Incremental insertion into an existing on-disk tree.** The write path
-  currently converts an extent list to a tree by bulk construction; it does
-  not yet support inserting a single extent into an existing on-disk BMBT
-  (locating the leaf, inserting, and propagating splits upward through the
-  existing tree). This is needed for operations like `truncate` that modify
-  an existing tree.
+* **Incremental insertion into an existing on-disk tree.** Partially implemented
+  for multi-level trees (level ≥ 1) in `BtreeRoot::insert_extent` and
+  `BtreeRoot::insert_extent_intermediate`. Recursively descends to leaf,
+  handles leaf split, allocates new blocks via `allocate_in_group`, propagates
+  separator keys up. Root level 0 (extent list → BMBT conversion) and
+  intermediate node splits not yet implemented.
 * **Root growth and collapse.** Root growth (level 0→1, 1→2, etc.) is
   implemented only as part of bulk construction; incremental root growth
   during a single-extent insert is not yet implemented. Root collapse
   (level 2→1, 1→0) is not implemented.
-* **Full delete algorithm with merge/redistribution propagation.** Leaf and
-  interior `remove_*` methods exist and signal when merge/redistribution is
-  needed, but the recursive upward propagation through the tree is not yet
-  implemented.
+* **Full delete algorithm with merge/redistribution propagation.** Partially
+  implemented: `BtreeRoot::delete_extents_in_range` and
+  `BtreeRoot::delete_extents_intermediate` locate overlapping leaves and
+  remove fully-contained records. Leaf and interior `remove_*` methods exist
+  and signal when merge/redistribution is needed, but the recursive upward
+  propagation through the tree is not yet implemented.
 * **Extent coalescing/splitting.** Adjacent extent merging and extent
   splitting during insertion/deletion is not implemented.
 * **CRC updates for v5 nodes.** `update_crc` is a no-op; v5 leaf and interior
@@ -543,6 +545,16 @@ error, because the group may be nearly empty and no retry helps).
   pointer.
 * Leaf and interior node split/merge/redistribution logic verified by
   `xfs_repair -n` on generated images.
+* **Incremental leaf insertion with split.** `BmbtLeafBlock::insert_record`
+  inserts a record, splits on overflow, returns new leaf and separator key.
+* **Incremental leaf deletion.** `BmbtLeafBlock::remove_record` removes a
+  record, signals if below minimum occupancy.
+* **Leaf merge/redistribute.** `merge_with` and `redistribute_with` for
+  leaves implemented and verified.
+* **Intermediate node insertion/split.** `BmbtInteriorBlock::insert_key_ptr`
+  inserts key-pointer pair, splits on overflow, returns new node and separator.
+* **Intermediate node merge/redistribute.** `merge_with` and
+  `redistribute_with` for intermediate nodes implemented.
 
 ---
 
@@ -600,8 +612,16 @@ punch holes (free interior extents, creating sparse regions).
 * **`fallocate` (FALLOC_FL_PUNCH_HOLE).** Free blocks in a range, creating
   a hole. Requires locating the affected extents, splitting if partial,
   freeing the middle portion, and coalescing adjacent extents.
-* **Incremental BMBT insertion.** Needed for `fallocate` when the fork is
-  already a B+ tree (see §6 missing items).
+* **Incremental BMBT insertion.** Implemented for multi-level trees (level ≥ 1)
+  in `BtreeRoot::insert_extent` and `BtreeRoot::insert_extent_intermediate`.
+  Recursively descends to leaf, handles leaf split, allocates new blocks via
+  `allocate_in_group`, propagates separator keys up. Root level 0 (extent list
+  → BMBT conversion) and intermediate node splits not yet implemented.
+* **Incremental BMBT deletion.** Implemented in `BtreeRoot::delete_extents_in_range`
+  and `BtreeRoot::delete_extents_intermediate`. Locates overlapping leaves,
+  removes fully-contained records, frees blocks via `free_in_group`. Partial
+  record splitting, merge/redistribution propagation, and root collapse not yet
+  implemented.
 * **Extent coalescing.** Adjacent extent merging after insertion/deletion.
 * **Delayed allocation / unwritten extent flag.** XFS uses the extent flag
   bit to mark allocated-but-unwritten extents; not yet implemented.
@@ -618,7 +638,11 @@ punch holes (free interior extents, creating sparse regions).
   `INSERT_RANGE`, `UNSHARE_RANGE`, `WRITE_ZEROES`). Returns `ENOSYS` for
   unsupported modes; returns `ENOTSUP` for real-time files and non-extent formats;
   returns `EINVAL` for invalid flag combinations. Actual allocation/deallocation
-  logic not yet implemented (requires incremental BMBT insertion/deletion).
+  logic uses incremental BMBT insertion/deletion (partial implementation).
+* **BMBT incremental insertion (leaf level).** Verified by unit tests in
+  `btree.rs` (`insert_record`, `insert_key_ptr`, split/merge/redistribution).
+* **BMBT incremental deletion (leaf level).** Leaf `remove_record`,
+  `merge_with`, `redistribute_with` implemented and tested.
 
 ---
 
