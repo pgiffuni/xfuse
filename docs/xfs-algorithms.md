@@ -524,9 +524,12 @@ error, because the group may be nearly empty and no retry helps).
   separator keys up. Root level 0 (extent list → BMBT conversion) and
   intermediate node splits not yet implemented.
 * **Root growth and collapse.** Root growth (level 0→1, 1→2, etc.) is
-  implemented only as part of bulk construction; incremental root growth
-  during a single-extent insert is not yet implemented. Root collapse
-  (level 2→1, 1→0) is not implemented.
+  implemented: `BtreeRoot::insert_extent_root_leaf` and `convert_to_btree` handle
+  extent list → BMBT conversion when inode overflows. **Root collapse (level 1→0)**
+  implemented in `BtreeRoot::check_root_collapse`: when level 1 root has one child
+  that is a leaf and all records fit in inode, moves records back to inode and
+  frees the leaf block. Called after deletions in `delete_extents_in_range`.
+  Root collapse (level 2→1) not yet implemented.
 * **Full delete algorithm with merge/redistribution propagation.** Implemented:
   `BtreeRoot::delete_extents_in_range` and `BtreeRoot::delete_extents_intermediate`
   locate overlapping leaves and remove records. **Leaf-level merge/redistribute
@@ -561,6 +564,9 @@ error, because the group may be nearly empty and no retry helps).
 * **Intermediate node merge/redistribute propagation.** Implemented in
   `BtreeRoot::handle_intermediate_underflow`: same sibling selection and
   redistribution/merge logic as leaves, propagates separator key updates up.
+* **Root collapse (level 1→0).** Implemented in `BtreeRoot::check_root_collapse`:
+  called after deletions; when level 1 root has one leaf child fitting in inode,
+  moves records back and frees leaf block.
 
 ---
 

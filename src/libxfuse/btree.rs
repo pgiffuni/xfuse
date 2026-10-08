@@ -1597,7 +1597,12 @@ impl BtreeRoot {
         }
         
         // For multi-level tree, descend and delete
-        self.delete_extents_recursive(buf_reader, startoff, endoff, sb, tx)
+        let freed = self.delete_extents_recursive(buf_reader, startoff, endoff, sb, tx)?;
+        
+        // After deletion, check if root can be collapsed
+        self.check_root_collapse(buf_reader, sb, tx)?;
+        
+        Ok(freed)
     }
     
     /// Recursive deletion for multi-level trees (level >= 1)
@@ -1761,6 +1766,61 @@ impl BtreeRoot {
         }
         
         Ok(freed_blocks)
+    }
+    
+    /// Check if the BMBT root can be collapsed to an extent list (level 1 → level 0).
+    /// This happens when the root has only one child and that child is a leaf.
+    #[allow(dead_code)]
+    fn check_root_collapse<R>(
+        &mut self,
+        buf_reader: &mut R,
+        sb: &Sb,
+        tx: &mut Transaction<'_>,
+    ) -> Result<(), i32>
+    where
+        R: bincode_next::de::read::Reader + BufRead + Seek,
+    {
+        // Root collapse: level 1 root with one child that is a leaf
+        if self.bmdr.bb_level == 1 && self.keys.len() == 1 && self.ptrs.len() == 1 {
+            let child_ptr = self.ptrs[0];
+            let offset = sb.fsb_to_offset(child_ptr);
+            
+            buf_reader
+                .seek(SeekFrom::Start(offset))
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            
+            let mut child_bytes = vec![0u8; sb.sb_blocksize as usize];
+            buf_reader
+                .read_exact(&mut child_bytes)
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            
+            // Verify it's a leaf (level 0)
+            let leaf = BmbtLeafBlock::from_bytes(&child_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+            if leaf.level == 0 {
+                // Check if all records fit in inode
+                let max_extents = self.max_inode_extents(sb);
+                if leaf.records.len() <= max_extents {
+                    // Collapse: move records to inode, free leaf block
+                    let extents: Vec<BmbtRec> = leaf.records.iter().map(|r| r.as_extent()).collect();
+                    
+                    // Write extents to inode
+                    self.write_extents_to_inode(&extents, sb, tx)?;
+                    
+                    // Free the leaf block
+                    let agno = (child_ptr >> sb.sb_agblklog) as u32;
+                    let mask = u64::from(1u32 << sb.sb_agblklog) - 1;
+                    let start = (child_ptr & mask) as u32;
+                    crate::libxfuse::alloc::allocator::free_in_group(tx, sb, agno, crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 }).map_err(|e| e.errno())?;
+                    
+                    // Update root to level 0
+                    self.bmdr.bb_level = 0;
+                    self.bmdr.bb_numrecs = 0;
+                    self.keys.clear();
+                    self.ptrs.clear();
+                }
+            }
+        }
+        Ok(())
     }
     
     /// Handle leaf underflow after deletion by trying to redistribute or merge with sibling.
