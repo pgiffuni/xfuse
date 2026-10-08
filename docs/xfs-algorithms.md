@@ -634,7 +634,10 @@ punch holes (free interior extents, creating sparse regions).
 **missing.**
 
 * **`fallocate` (FALLOC_FL_KEEP_SIZE) for extents format.** Not yet implemented.
-* **Extent coalescing.** Adjacent extent merging after insertion/deletion.
+* **Extent coalescing.** Implemented: `BmbtLeafBlock::insert_record` coalesces with
+  previous/next records on insertion; `remove_record` coalesces adjacent records
+  after deletion; `coalesce_adjacent` called after PUNCH_HOLE modifications to
+  merge contiguous extents. Checks both file offset and filesystem block adjacency.
 * **Partial record splitting.** Implemented in `BtreeRoot::delete_extents_recursive`
   for PUNCH_HOLE: handles record spanning hole (split), straddling startoff (trim
   front), straddling endoff (trim end). Uses `BmbtLeafRecord::from_extent` for
@@ -659,6 +662,12 @@ punch holes (free interior extents, creating sparse regions).
   `btree.rs` (`insert_record`, `insert_key_ptr`, split/merge/redistribution).
 * **BMBT incremental deletion (leaf level).** Leaf `remove_record`,
   `merge_with`, `redistribute_with` implemented and tested.
+* **Extent coalescing on insertion.** `BmbtLeafBlock::insert_record` merges
+  with previous/next records if contiguous in both file offset and block address.
+* **Extent coalescing on deletion.** `BmbtLeafBlock::remove_record` checks
+  if adjacent records become contiguous after removal.
+* **Extent coalescing after PUNCH_HOLE.** `BmbtLeafBlock::coalesce_adjacent`
+  called after modifications, merges all contiguous pairs.
 
 ---
 

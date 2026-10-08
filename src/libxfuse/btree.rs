@@ -798,6 +798,47 @@ impl BmbtLeafBlock {
             let idx = self
                 .records
                 .partition_point(|r| r.startoff() < record.startoff());
+            
+            // Check for coalescing with adjacent records before inserting
+            // Coalesce with previous record if adjacent
+            if idx > 0 {
+                let prev = &self.records[idx - 1];
+                let prev_end = prev.startoff() + prev.blockcount();
+                let prev_end_block = prev.startblock() + prev.blockcount();
+                
+                if prev_end == record.startoff() && prev_end_block == record.startblock() && prev.extent_flag() == record.extent_flag() {
+                    // Coalesce: extend previous record
+                    self.records[idx - 1] = BmbtLeafRecord::from_extent(&BmbtRec {
+                        br_startoff: prev.startoff(),
+                        br_startblock: prev.startblock(),
+                        br_blockcount: prev.blockcount() + record.blockcount(),
+                        br_flag: prev.extent_flag(),
+                    });
+                    return None;
+                }
+            }
+            
+            // Coalesce with next record if adjacent
+            if idx < self.records.len() {
+                let next = &self.records[idx];
+                let record_end = record.startoff() + record.blockcount();
+                let record_end_block = record.startblock() + record.blockcount();
+                
+                if record_end == next.startoff() && record_end_block == next.startblock() && record.extent_flag() == next.extent_flag() {
+                    // Coalesce: extend new record to include next
+                    let new_record = BmbtLeafRecord::from_extent(&BmbtRec {
+                        br_startoff: record.startoff(),
+                        br_startblock: record.startblock(),
+                        br_blockcount: record.blockcount() + next.blockcount(),
+                        br_flag: record.extent_flag(),
+                    });
+                    self.records.remove(idx);
+                    self.records.insert(idx, new_record);
+                    return None;
+                }
+            }
+            
+            // No coalescing possible, insert normally
             self.records.insert(idx, record);
             return None;
         }
@@ -849,6 +890,30 @@ impl BmbtLeafBlock {
         if idx >= self.records.len() || self.records[idx].startoff() != startoff {
             return Err(libc::ENOENT);
         }
+        
+        // Check if adjacent records can be coalesced after removal
+        // If we have a record before and after the removed one, check if they're now adjacent
+        if idx > 0 && idx < self.records.len() - 1 {
+            let prev = &self.records[idx - 1];
+            let next = &self.records[idx + 1];
+            let prev_end = prev.startoff() + prev.blockcount();
+            let prev_end_block = prev.startblock() + prev.blockcount();
+            
+            if prev_end == next.startoff() && prev_end_block == next.startblock() && prev.extent_flag() == next.extent_flag() {
+                // Coalesce prev and next
+                let merged = BmbtLeafRecord::from_extent(&BmbtRec {
+                    br_startoff: prev.startoff(),
+                    br_startblock: prev.startblock(),
+                    br_blockcount: prev.blockcount() + next.blockcount(),
+                    br_flag: prev.extent_flag(),
+                });
+                self.records.remove(idx); // Remove the target record
+                self.records[idx - 1] = merged; // Replace prev with merged
+                self.records.remove(idx); // Remove next (now at idx after first removal)
+                return Ok(self.records.len() < min);
+            }
+        }
+        
         self.records.remove(idx);
         // Return true if we need to merge/redistribute
         Ok(self.records.len() < min)
@@ -877,10 +942,45 @@ impl BmbtLeafBlock {
         let mid = all.len() / 2;
         let new_other = all.split_off(mid);
         self.records = all;
-        other.records = new_other;
+other.records = new_other;
         true
     }
-
+    
+    /// Coalesce adjacent extents in this leaf.
+    /// Merges records that are contiguous in both file offset and filesystem block.
+    #[allow(dead_code)]
+    pub fn coalesce_adjacent(&mut self) {
+        if self.records.len() < 2 {
+            return;
+        }
+        
+        let mut i = 0;
+        while i + 1 < self.records.len() {
+            let current = &self.records[i];
+            let next = &self.records[i + 1];
+            
+            let current_end = current.startoff() + current.blockcount();
+            let current_end_block = current.startblock() + current.blockcount();
+            
+            if current_end == next.startoff() 
+                && current_end_block == next.startblock() 
+                && current.extent_flag() == next.extent_flag() {
+                // Coalesce current and next
+                let merged = BmbtLeafRecord::from_extent(&BmbtRec {
+                    br_startoff: current.startoff(),
+                    br_startblock: current.startblock(),
+                    br_blockcount: current.blockcount() + next.blockcount(),
+                    br_flag: current.extent_flag(),
+                });
+                self.records[i] = merged;
+                self.records.remove(i + 1);
+                // Don't increment i - check if we can merge further
+            } else {
+                i += 1;
+            }
+        }
+    }
+    
     /// This leaf as the bytes of a block of a file system **without** checksums holds.
     /// This leaf as the bytes a block of a file system **without** checksums holds.
     ///
@@ -1734,6 +1834,9 @@ impl BtreeRoot {
                 if leaf.records.len() < min {
                     need_merge = true;
                 }
+                
+                // Coalesce adjacent extents after modifications
+                leaf.coalesce_adjacent();
                 
                 // Write leaf back
                 let hdr = BtreeLblockHdr {
