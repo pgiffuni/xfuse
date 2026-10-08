@@ -359,7 +359,7 @@ impl BmbtLeafRecord {
 }
 
 /// A b-map leaf block: the header, and the extents it holds.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BmbtLeafBlock {
     pub level: u16,
     pub records: Vec<BmbtLeafRecord>,
@@ -1607,8 +1607,8 @@ impl BtreeRoot {
                 tx.write_bytes(offset, &leaf_bytes).map_err(|e| e.errno())?;
                 
                 if need_merge {
-                    // Need to merge with sibling or redistribute
-                    // For now, just return the freed blocks
+                    // Try to merge/redistribute with sibling
+                    self.handle_leaf_underflow(child_idx, child_ptr, &leaf, sb, tx, buf_reader)?;
                 }
             } else {
                 // Child is an intermediate node - recurse
@@ -1625,6 +1625,162 @@ impl BtreeRoot {
         }
         
         Ok(freed_blocks)
+    }
+    
+    /// Handle leaf underflow after deletion by trying to redistribute or merge with sibling.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    fn handle_leaf_underflow<R>(
+        &mut self,
+        child_idx: usize,
+        child_ptr: XfsFsblock,
+        leaf: &BmbtLeafBlock,
+        sb: &Sb,
+        tx: &mut Transaction<'_>,
+        buf_reader: &mut R,
+    ) -> Result<(), i32>
+    where
+        R: bincode_next::de::read::Reader + BufRead + Seek,
+    {
+        // Try right sibling first
+        if child_idx + 1 < self.ptrs.len() {
+            let right_ptr = self.ptrs[child_idx + 1];
+            let right_offset = sb.fsb_to_offset(right_ptr);
+            
+            buf_reader.seek(SeekFrom::Start(right_offset)).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            let mut right_bytes = vec![0u8; sb.sb_blocksize as usize];
+            buf_reader.read_exact(&mut right_bytes).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            
+            let mut right_leaf = BmbtLeafBlock::from_bytes(&right_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+            
+            // Try redistribute
+            let mut leaf_mut = leaf.clone();
+            if leaf_mut.redistribute_with(&mut right_leaf) {
+                // Write both leaves back
+                let left_hdr = BtreeLblockHdr {
+                    blkno: child_ptr,
+                    lsn: 0,
+                    leftsib: BMBT_NULL_PTR,
+                    rightsib: BMBT_NULL_PTR,
+                    owner: 0,
+                    uuid: sb.sb_uuid.as_image_bytes(),
+                };
+                let right_hdr = BtreeLblockHdr {
+                    blkno: right_ptr,
+                    lsn: 0,
+                    leftsib: BMBT_NULL_PTR,
+                    rightsib: BMBT_NULL_PTR,
+                    owner: 0,
+                    uuid: sb.sb_uuid.as_image_bytes(),
+                };
+                tx.write_bytes(sb.fsb_to_offset(child_ptr), &leaf_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
+                tx.write_bytes(right_offset, &right_leaf.to_bytes(&right_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
+                
+                // Update separator key in parent
+                let new_separator = BmbtKey { br_startoff: right_leaf.records[0].startoff() };
+                self.keys[child_idx + 1] = new_separator;
+                return Ok(());
+            }
+            
+            // Redistribute failed, try merge (merge right into left)
+            leaf_mut.merge_with(right_leaf);
+            
+            // Write merged leaf
+            let left_hdr = BtreeLblockHdr {
+                blkno: child_ptr,
+                lsn: 0,
+                leftsib: BMBT_NULL_PTR,
+                rightsib: BMBT_NULL_PTR,
+                owner: 0,
+                uuid: sb.sb_uuid.as_image_bytes(),
+            };
+            tx.write_bytes(sb.fsb_to_offset(child_ptr), &leaf_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
+            
+            // Remove the right sibling from parent
+            self.keys.remove(child_idx + 1);
+            self.ptrs.remove(child_idx + 1);
+            self.bmdr.bb_numrecs = self.keys.len() as u16;
+            
+            // Free the right sibling block
+            let agno = (right_ptr >> sb.sb_agblklog) as u32;
+            let mask = u64::from(1u32 << sb.sb_agblklog) - 1;
+            let start = (right_ptr & mask) as u32;
+            crate::libxfuse::alloc::allocator::free_in_group(tx, sb, agno, crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 }).map_err(|e| e.errno())?;
+            
+            return Ok(());
+        }
+        
+        // Try left sibling
+        if child_idx > 0 {
+            let left_ptr = self.ptrs[child_idx - 1];
+            let left_offset = sb.fsb_to_offset(left_ptr);
+            
+            buf_reader.seek(SeekFrom::Start(left_offset)).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            let mut left_bytes = vec![0u8; sb.sb_blocksize as usize];
+            buf_reader.read_exact(&mut left_bytes).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            
+            let left_leaf = BmbtLeafBlock::from_bytes(&left_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+            
+            // Try redistribute
+            let mut left_leaf_mut = left_leaf.clone();
+            let mut leaf_mut = leaf.clone();
+            if left_leaf_mut.redistribute_with(&mut leaf_mut) {
+                // Write both leaves back
+                let left_hdr = BtreeLblockHdr {
+                    blkno: left_ptr,
+                    lsn: 0,
+                    leftsib: BMBT_NULL_PTR,
+                    rightsib: BMBT_NULL_PTR,
+                    owner: 0,
+                    uuid: sb.sb_uuid.as_image_bytes(),
+                };
+                let right_hdr = BtreeLblockHdr {
+                    blkno: child_ptr,
+                    lsn: 0,
+                    leftsib: BMBT_NULL_PTR,
+                    rightsib: BMBT_NULL_PTR,
+                    owner: 0,
+                    uuid: sb.sb_uuid.as_image_bytes(),
+                };
+                tx.write_bytes(left_offset, &left_leaf_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
+                tx.write_bytes(sb.fsb_to_offset(child_ptr), &leaf_mut.to_bytes(&right_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
+                
+                // Update separator key in parent
+                let new_separator = BmbtKey { br_startoff: leaf_mut.records[0].startoff() };
+                self.keys[child_idx] = new_separator;
+                return Ok(());
+            }
+            
+            // Redistribute failed, try merge (merge current into left)
+            left_leaf_mut.merge_with(leaf_mut);
+            
+            // Write merged leaf
+            let left_hdr = BtreeLblockHdr {
+                blkno: left_ptr,
+                lsn: 0,
+                leftsib: BMBT_NULL_PTR,
+                rightsib: BMBT_NULL_PTR,
+                owner: 0,
+                uuid: sb.sb_uuid.as_image_bytes(),
+            };
+            tx.write_bytes(left_offset, &left_leaf_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
+            
+            // Remove current leaf from parent
+            self.keys.remove(child_idx);
+            self.ptrs.remove(child_idx);
+            self.bmdr.bb_numrecs = self.keys.len() as u16;
+            
+            // Free the current leaf block
+            let agno = (child_ptr >> sb.sb_agblklog) as u32;
+            let mask = u64::from(1u32 << sb.sb_agblklog) - 1;
+            let start = (child_ptr & mask) as u32;
+            crate::libxfuse::alloc::allocator::free_in_group(tx, sb, agno, crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 }).map_err(|e| e.errno())?;
+            
+            return Ok(());
+        }
+        
+        // No siblings to merge with - just leave as is
+        Ok(())
     }
     
     #[allow(dead_code)]

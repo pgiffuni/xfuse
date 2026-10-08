@@ -531,12 +531,16 @@ error, because the group may be nearly empty and no retry helps).
   implemented: `BtreeRoot::delete_extents_in_range` and
   `BtreeRoot::delete_extents_intermediate` locate overlapping leaves and
   remove fully-contained records. Leaf and interior `remove_*` methods exist
-  and signal when merge/redistribution is needed, but the recursive upward
-  propagation through the tree is not yet implemented.
+  and signal when merge/redistribution is needed. **Leaf-level merge/redistribute
+  propagation is now implemented** in `BtreeRoot::handle_leaf_underflow`: tries
+  right sibling first, then left sibling; attempts redistribution, falls back
+  to merge; updates parent separator keys; frees merged block. Intermediate
+  node merge/redistribution propagation and root collapse not yet implemented.
 * **Extent coalescing/splitting.** Adjacent extent merging and extent
   splitting during insertion/deletion is not implemented.
-* **CRC updates for v5 nodes.** `update_crc` is a no-op; v5 leaf and interior
-  nodes are written without updating their CRC field.
+* **CRC updates for v5 nodes.** Implemented in all `to_bytes` methods
+  (`BmbtLeafBlock`, `BmbtInteriorBlock`, `BtreeIntermediate`) via
+  `crc32c_without_its_own_field`. Previously was a no-op.
 
 **verified.**
 
@@ -623,7 +627,10 @@ punch holes (free interior extents, creating sparse regions).
 
 * **`fallocate` (FALLOC_FL_KEEP_SIZE) for extents format.** Not yet implemented.
 * **Extent coalescing.** Adjacent extent merging after insertion/deletion.
-* **Partial record splitting.** When punch hole range cuts through an extent.
+* **Partial record splitting.** Implemented in `BtreeRoot::delete_extents_recursive`
+  for PUNCH_HOLE: handles record spanning hole (split), straddling startoff (trim
+  front), straddling endoff (trim end). Uses `BmbtLeafRecord::from_extent` for
+  proper 128-bit packed record creation.
 * **Delayed allocation / unwritten extent flag.** XFS uses the extent flag
   bit to mark allocated-but-unwritten extents; not yet implemented.
 
