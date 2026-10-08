@@ -101,7 +101,7 @@ use super::{
 /// This is a table of the format rather than a set of constants that the code
 /// happens to use, so entries that no caller needs today are still part of it.
 #[allow(dead_code)]
-mod offset {
+pub mod offset {
     pub const MAGIC: usize = 0;
     pub const MODE: usize = 2;
     pub const VERSION: usize = 4;
@@ -317,6 +317,11 @@ impl RawDinode {
     /// The inode's bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// The inode's bytes, mutable.
+    pub fn as_mut_bytes(&mut self) -> &mut [u8] {
+        &mut self.bytes
     }
 
     /// Consume the inode and take its bytes.
@@ -1125,7 +1130,7 @@ impl RawDinode {
                     .map_err(|e| FsError::corrupt(format!("a data fork root pointer: {e:?}")))?,
             );
         }
-        Ok(BtreeRoot::new(bmdr, keys, ptrs))
+        Ok(BtreeRoot::new(bmdr, keys, ptrs, None))
     }
 
     /// The padding between a data fork root's keys and its pointers.
@@ -1363,7 +1368,7 @@ impl RawDinode {
 ///
 /// A record packs the offset within the file, the starting block, the number of
 /// blocks, and the "not written yet" flag into one 128-bit number, big-endian.
-const EXTENT_REC_SIZE: usize = 16;
+pub const EXTENT_REC_SIZE: usize = 16;
 
 /// Decode one extent record.
 ///
@@ -1394,7 +1399,7 @@ fn decode_extent(bytes: &[u8], nrext64: bool) -> Option<BmbtRec> {
 
 /// Encode one extent record, in the narrow form.
 #[allow(dead_code)] // Used as soon as a file's extents are changed.
-fn encode_extent(bytes: &mut [u8], rec: &BmbtRec) {
+pub fn encode_extent(bytes: &mut [u8], rec: &BmbtRec) {
     assert!(bytes.len() >= EXTENT_REC_SIZE);
     debug_assert!(rec.br_blockcount < (1 << 21));
     // The record is one 128-bit number: the block count in the low bits, then

@@ -34,6 +34,7 @@ use std::{
 use bincode_next::{de::read::Reader, error::DecodeError};
 
 use super::block_device::{Access, BlockDevice};
+use super::btree::DeviceReader;
 
 /// A forward-only, seekable window onto a [`BlockDevice`].
 ///
@@ -235,6 +236,12 @@ impl Reader for BlockReader {
 
     fn consume(&mut self, n: usize) {
         <Self as std::io::BufRead>::consume(self, n);
+    }
+}
+
+impl DeviceReader for BlockReader {
+    fn device(&self) -> Arc<BlockDevice> {
+        BlockReader::device(self)
     }
 }
 

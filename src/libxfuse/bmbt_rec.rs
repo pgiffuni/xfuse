@@ -129,14 +129,15 @@ impl Bmx {
         let dblock = offset >> sb.sb_blocklog;
         // Filter out unwritten extents for lseek purposes (they read as zeroes)
         let written_extents: Vec<&BmbtRec> = self.0.iter().filter(|e| !e.br_flag).collect();
-        
+
         match written_extents.partition_point(|entry| entry.br_startoff <= dblock) {
             0 => {
                 // A hole at the beginning of the file
                 if whence == libc::SEEK_HOLE {
                     Ok(offset)
                 } else {
-                    written_extents.first()
+                    written_extents
+                        .first()
                         .map(|b| b.br_startoff << sb.sb_blocklog)
                         .ok_or(libc::ENXIO)
                 }

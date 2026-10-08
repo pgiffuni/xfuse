@@ -52,14 +52,23 @@ use num_traits::{PrimInt, Unsigned};
 
 use super::{
     alloc::allocator::allocate_in_group,
+    block_device::BlockDevice,
     bmbt_rec::{BmbtRec, Bmx},
     definitions::{XfsFileoff, XfsFsblock, XfsIno, XFS_BMAP_CRC_MAGIC, XFS_BMAP_MAGIC},
     error::FsError,
+    inode::{encode_extent, offset, RawDinode, EXTENT_REC_SIZE},
     sb::Sb,
     transaction::Transaction,
     utils::{decode, decode_from, Uuid},
     volume::SUPERBLOCK,
 };
+use byteorder::{BigEndian, ByteOrder};
+use std::sync::Arc;
+
+/// Trait for readers that can provide access to the underlying block device.
+pub trait DeviceReader: bincode_next::de::read::Reader + BufRead + Seek {
+    fn device(&self) -> Arc<BlockDevice>;
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct BtreeBlockHdr<T: PrimInt + Unsigned> {
@@ -1117,7 +1126,8 @@ pub trait Btree: BtreePriv {
                             .map_err(|e| e.raw_os_error().unwrap())?;
                         let bti: BtreeIntermediate =
                             decode_from(buf_reader.by_ref()).map_err(|_| libc::EDESTADDRREQ)?;
-                        ve.insert(bti).map_block(buf_reader, logical_block, filter_unwritten)
+                        ve.insert(bti)
+                            .map_block(buf_reader, logical_block, filter_unwritten)
                     }
                     Entry::Occupied(oe) => {
                         let v: &BtreeIntermediate = oe.get();
@@ -1248,16 +1258,13 @@ impl BtreeRoot {
     /// Insert an extent record into the BMBT, growing the tree as necessary.
     /// This is used when extending a file's data fork.
     #[allow(dead_code)]
-    pub fn insert_extent<R>(
+    pub fn insert_extent<R: DeviceReader>(
         &mut self,
         buf_reader: &mut R,
         extent: BmbtRec,
         sb: &Sb,
         tx: &mut Transaction<'_>,
-    ) -> Result<(), i32>
-    where
-        R: bincode_next::de::read::Reader + BufRead + Seek,
-    {
+    ) -> Result<(), i32> {
         let record = BmbtLeafRecord::from_extent(&extent);
 
         // Handle root level 0 (root is a leaf in the inode)
@@ -1271,16 +1278,13 @@ impl BtreeRoot {
 
     /// Insert when root is a leaf (level 0). Convert to a tree with level 1 root.
     #[allow(dead_code)]
-    fn insert_extent_root_leaf<R>(
+    fn insert_extent_root_leaf<R: DeviceReader>(
         &mut self,
         buf_reader: &mut R,
         record: BmbtLeafRecord,
         sb: &Sb,
         tx: &mut Transaction<'_>,
-    ) -> Result<(), i32>
-    where
-        R: bincode_next::de::read::Reader + BufRead + Seek,
-    {
+    ) -> Result<(), i32> {
         // The root is currently a leaf (records in the inode).
         // This case requires converting the inode from extent list format to BMBT format.
         // We need to:
@@ -1290,7 +1294,8 @@ impl BtreeRoot {
         // 4. Update the inode's root to point to the new leaf (level 1)
 
         // Get current extents from the inode
-        let extents = self.all_extents_from_inode(sb)?;
+        let device = buf_reader.device();
+        let extents = self.all_extents_from_inode(device, sb)?;
         if extents.is_empty() {
             // No extents yet - just insert the new record
             return self.insert_extent_root_leaf_empty(buf_reader, record, sb, tx);
@@ -1354,13 +1359,57 @@ impl BtreeRoot {
     /// Write extents directly to inode (extent list format)
     fn write_extents_to_inode(
         &mut self,
-        _extents: &[BmbtRec],
-        _sb: &Sb,
-        _tx: &mut Transaction<'_>,
+        extents: &[BmbtRec],
+        sb: &Sb,
+        tx: &mut Transaction<'_>,
     ) -> Result<(), i32> {
-        // This would write the extent list back to the inode
-        // For now, return ENOSYS as this requires inode-level coordination
-        Err(libc::ENOSYS)
+        // Get the inode number from the bmdr owner
+        let ino = self.owner.ok_or(libc::ENOTSUP)?;
+        let inode_offset = sb.inode_offset(ino);
+        let inode_size = sb.inode_size();
+
+        // Read the inode
+        let inode_bytes = tx
+            .read_bytes(inode_offset, inode_size)
+            .map_err(|e| e.errno())?;
+
+        // Parse the inode
+        let mut raw_inode =
+            RawDinode::from_bytes(inode_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+
+        // Set format to 2 (extent list)
+        raw_inode.set_format(2);
+
+        // Write bmdr header (bb_level=0, bb_numrecs=extents.len())
+        let start = raw_inode.literal_area_offset();
+        let is_nrext64 = raw_inode.nrext64();
+        let bytes = raw_inode.as_mut_bytes();
+        bytes[start..start + 2].copy_from_slice(&0u16.to_be_bytes()); // bb_level = 0
+        bytes[start + 2..start + 4].copy_from_slice(&(extents.len() as u16).to_be_bytes()); // bb_numrecs
+
+        // Write extents
+        let extent_start = start + BmdrBlock::SIZE;
+        for (i, extent) in extents.iter().enumerate() {
+            let at = extent_start + i * EXTENT_REC_SIZE;
+            encode_extent(&mut bytes[at..at + EXTENT_REC_SIZE], extent);
+        }
+
+        // Update nextents count
+        let count = extents.len() as u64;
+        if is_nrext64 {
+            BigEndian::write_u64(&mut bytes[offset::NEXTENTS..], count);
+        } else {
+            BigEndian::write_u32(&mut bytes[offset::NEXTENTS32..], count as u32);
+        }
+
+        // Finalize the inode (update CRC, etc.)
+        raw_inode.finalise();
+
+        // Write the inode back
+        tx.write_bytes(inode_offset, raw_inode.as_bytes())
+            .map_err(|e| e.errno())?;
+
+        Ok(())
     }
 
     /// Convert from extent list format to BMBT format
@@ -1413,29 +1462,39 @@ impl BtreeRoot {
     }
 
     /// Get all extents from the inode's root (for level 0)
-    fn all_extents_from_inode(&self, _sb: &Sb) -> Result<Vec<BmbtRec>, i32> {
-        // For level 0 root, the keys ARE the extent records
-        // but they're stored in the inode's literal area
-        // This is a simplified implementation
-        // The key's startoff is the extent's startoff
-        // But we don't have the full extent data in the key
-        // This would need to read from the inode's extent list
-        // For now, return empty
-        Ok(Vec::<BmbtRec>::new())
+    fn all_extents_from_inode(
+        &self,
+        device: Arc<BlockDevice>,
+        sb: &Sb,
+    ) -> Result<Vec<BmbtRec>, i32> {
+        // For level 0 root, the extents are stored in the inode's literal area
+        // We need to read the inode and extract the extents
+        let ino = self.owner.ok_or(libc::ENOTSUP)?;
+        let inode_offset = sb.inode_offset(ino);
+        let inode_size = sb.inode_size();
+
+        // Read the inode using the provided device
+        let mut inode_bytes = vec![0u8; inode_size];
+        device
+            .read_at(&mut inode_bytes, inode_offset)
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+
+        // Parse the inode
+        let raw_inode = RawDinode::from_bytes(inode_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+
+        // Get the extents from the inode
+        raw_inode.core_extents().ok_or(libc::ENOTSUP)
     }
 
     /// Recursive insertion for multi-level trees (level >= 1)
     #[allow(dead_code)]
-    fn insert_extent_recursive<R>(
+    fn insert_extent_recursive<R: DeviceReader>(
         &mut self,
         buf_reader: &mut R,
         record: BmbtLeafRecord,
         sb: &Sb,
         tx: &mut Transaction<'_>,
-    ) -> Result<(), i32>
-    where
-        R: bincode_next::de::read::Reader + BufRead + Seek,
-    {
+    ) -> Result<(), i32> {
         let record_startoff = record.startoff();
 
         // Find the child index
@@ -1634,17 +1693,14 @@ impl BtreeRoot {
     }
 
     #[allow(dead_code)]
-    fn insert_extent_intermediate<R>(
+    fn insert_extent_intermediate<R: DeviceReader>(
         &self,
         intermediate: &mut BtreeIntermediate,
         buf_reader: &mut R,
         record: BmbtLeafRecord,
         sb: &Sb,
         tx: &mut Transaction<'_>,
-    ) -> Result<Option<(BmbtInteriorBlock, BmbtKey, XfsFsblock)>, i32>
-    where
-        R: bincode_next::de::read::Reader + BufRead + Seek,
-    {
+    ) -> Result<Option<(BmbtInteriorBlock, BmbtKey, XfsFsblock)>, i32> {
         let record_startoff = record.startoff();
 
         // Find the child index
@@ -2741,6 +2797,8 @@ pub struct BtreeRoot {
     pub bmdr: BmdrBlock,
     pub keys: Vec<BmbtKey>,
     pub ptrs: Vec<XfsBmdrPtr>,
+    /// The inode number that owns this b-tree root (only set for the actual root)
+    pub owner: Option<XfsIno>,
     /// A cache of the object's extents, indexed by block number
     blocks: RefCell<BtreeBlockCache>,
 }
@@ -2810,14 +2868,25 @@ impl BtreeRoot {
         }
     }
 
-    pub fn new(bmdr: BmdrBlock, keys: Vec<BmbtKey>, ptrs: Vec<XfsBmdrPtr>) -> Self {
+    pub fn new(
+        bmdr: BmdrBlock,
+        keys: Vec<BmbtKey>,
+        ptrs: Vec<XfsBmdrPtr>,
+        owner: Option<XfsIno>,
+    ) -> Self {
         let blocks = RefCell::new(BtreeBlockCache::new(bmdr.bb_level));
         Self {
             bmdr,
             keys,
             ptrs,
+            owner,
             blocks,
         }
+    }
+
+    /// Set the owner (inode number) for this B-tree root.
+    pub fn set_owner(&mut self, owner: XfsIno) {
+        self.owner = Some(owner);
     }
 }
 
@@ -3121,10 +3190,20 @@ impl BtreeLeaf {
     /// Return its starting position as an FSblock, and its length in file system block units.
     /// If a hole's length extends to EoF, return None for length.
     /// If `filter_unwritten` is true, unwritten extents (br_flag=true) are treated as holes.
-    pub fn get_extent(&self, dblock: XfsFileoff, filter_unwritten: bool) -> (Option<XfsFsblock>, Option<u64>) {
+    pub fn get_extent(
+        &self,
+        dblock: XfsFileoff,
+        filter_unwritten: bool,
+    ) -> (Option<XfsFsblock>, Option<u64>) {
         if filter_unwritten {
             // Filter out unwritten extents for lseek purposes
-            let written_extents: Vec<BmbtRec> = self.bmx.extents().iter().filter(|e| !e.br_flag).cloned().collect();
+            let written_extents: Vec<BmbtRec> = self
+                .bmx
+                .extents()
+                .iter()
+                .filter(|e| !e.br_flag)
+                .cloned()
+                .collect();
             let bmx = Bmx::from(written_extents);
             bmx.get_extent(dblock)
         } else {

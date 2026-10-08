@@ -157,14 +157,21 @@ impl ExtentMap {
             ExtentMap::Core { extents, .. } => {
                 if filter_unwritten {
                     // Filter out unwritten extents for reading
-                    let written_extents: Vec<BmbtRec> = extents.extents().iter().filter(|e| !e.br_flag).cloned().collect();
+                    let written_extents: Vec<BmbtRec> = extents
+                        .extents()
+                        .iter()
+                        .filter(|e| !e.br_flag)
+                        .cloned()
+                        .collect();
                     let bmx = Bmx::from(written_extents);
                     bmx.get_extent(block)
                 } else {
                     extents.get_extent(block)
                 }
             }
-            ExtentMap::Btree { btree, .. } => btree.map_block(buf_reader.by_ref(), block, filter_unwritten)?,
+            ExtentMap::Btree { btree, .. } => {
+                btree.map_block(buf_reader.by_ref(), block, filter_unwritten)?
+            }
         };
         let file_blocks = (self.size().max(0) as u64).div_ceil(sb.sb_blocksize as u64);
         // A run that reaches the end of the file has no extent to be bounded
@@ -269,8 +276,14 @@ mod t {
         super::super::volume::SUPERBLOCK.get_or_init(|| sb);
         let sb = super::super::volume::SUPERBLOCK.get().unwrap();
         let bs = sb.sb_blocklog;
-        assert_eq!(m.lseek(&mut no_device(), 2 << bs, libc::SEEK_DATA), Err(libc::ENXIO));
-        assert_eq!(m.lseek(&mut no_device(), 2 << bs, libc::SEEK_HOLE), Ok(2 << bs));
+        assert_eq!(
+            m.lseek(&mut no_device(), 2 << bs, libc::SEEK_DATA),
+            Err(libc::ENXIO)
+        );
+        assert_eq!(
+            m.lseek(&mut no_device(), 2 << bs, libc::SEEK_HOLE),
+            Ok(2 << bs)
+        );
     }
 
     /// Growing a file must not invent an extent; it only lengthens the hole at

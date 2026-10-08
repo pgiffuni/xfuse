@@ -315,7 +315,7 @@ impl Dinode {
             self.file = Some(match &self.di_u {
                 DiU::Bmx(bmx) => ExtentMap::from_core(Bmx::new(bmx), self.di_core.di_size),
                 DiU::Bmbt((bmdr, keys, pointers)) => ExtentMap::from_btree(
-                    BtreeRoot::new(bmdr.clone(), keys.clone(), pointers.clone()),
+                    BtreeRoot::new(bmdr.clone(), keys.clone(), pointers.clone(), None),
                     self.di_core.di_size,
                 ),
                 _ => return Err(libc::ENXIO),
@@ -359,7 +359,8 @@ impl Dinode {
                     }
                 }
                 Some(DiA::Abmbt((bmdr, keys, pointers))) => {
-                    let btree_root = BtreeRoot::new(bmdr.clone(), keys.clone(), pointers.clone());
+                    let btree_root =
+                        BtreeRoot::new(bmdr.clone(), keys.clone(), pointers.clone(), None);
                     Some(Attributes::Btree(AttrBtree::new(
                         buf_reader.by_ref(),
                         superblock,
@@ -402,7 +403,8 @@ impl Dinode {
 
         let file_metadata = self.get_file()?;
         while size > 0 {
-            let (blk, blocks) = file_metadata.lookup(buf_reader.by_ref(), sb, logical_block, true)?;
+            let (blk, blocks) =
+                file_metadata.lookup(buf_reader.by_ref(), sb, logical_block, true)?;
             let z = usize::try_from(min(
                 u64::try_from(size).unwrap(),
                 (blocks << sb.sb_blocklog) - block_offset,

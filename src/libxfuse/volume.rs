@@ -498,7 +498,8 @@ impl Volume {
             if probe.format() != 3 {
                 None
             } else {
-                let root = probe.data_btree_root()?;
+                let mut root = probe.data_btree_root()?;
+                root.set_owner(xfs_ino);
                 let (bmx, blocks) = root.all_extents(self.device.by_ref())?;
                 let ptr = *root.ptrs.first().ok_or_else(|| {
                     FsError::corrupt("a data fork's b-tree root points at nothing")
@@ -726,6 +727,7 @@ impl Volume {
                 // what tells a reader which: 1 for leaves straight under the fork,
                 // 2 for leaves under an interior block.
                 let mut root = raw.data_btree_root()?;
+                root.set_owner(xfs_ino);
                 if leaves.len() <= 2 {
                     root.ptrs = leaf_fsb.clone();
                     root.keys = leaves
@@ -1105,7 +1107,8 @@ impl Volume {
             if probe.format() == 2 {
                 None
             } else {
-                let root = probe.data_btree_root()?;
+                let mut root = probe.data_btree_root()?;
+                root.set_owner(xfs_ino);
                 let (bmx, nodes) = root.all_extents(self.device.by_ref())?;
                 Some((bmx.extents().to_vec(), nodes))
             }
@@ -3373,7 +3376,10 @@ impl Filesystem for Volume {
                 // Get the BtreeRoot from the inode
                 let btree_root_result = raw_inode.data_btree_root();
                 let mut btree_root = match btree_root_result {
-                    Ok(root) => root,
+                    Ok(mut root) => {
+                        root.set_owner(xfs_ino);
+                        root
+                    }
                     Err(e) => {
                         reply.error(e.errno());
                         return;
@@ -3532,7 +3538,10 @@ impl Filesystem for Volume {
 
             let btree_root_result = raw_inode.data_btree_root();
             let mut btree_root = match btree_root_result {
-                Ok(root) => root,
+                Ok(mut root) => {
+                    root.set_owner(xfs_ino);
+                    root
+                }
                 Err(e) => {
                     reply.error(e.errno());
                     return;

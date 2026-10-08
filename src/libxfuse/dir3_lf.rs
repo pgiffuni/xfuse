@@ -322,7 +322,7 @@ impl Dir2Lf {
     }
 
     pub fn from_btree(bmbt: BmdrBlock, keys: Vec<BmbtKey>, pointers: Vec<XfsBmbtPtr>) -> Self {
-        let root = BtreeRoot::new(bmbt, keys, pointers);
+        let root = BtreeRoot::new(bmbt, keys, pointers, None);
         let dfork = Dfork::Btree(root);
         let blocks = Default::default();
         Dir2Lf { dfork, blocks }
