@@ -613,6 +613,12 @@ punch holes (free interior extents, creating sparse regions).
 * `truncate` grow verified by write tests.
 * Hole refusal in `write_data` verified by test `write_to_directory_is_refused` (wrong type)
   and the fact that holes cannot be written to without allocation.
+* **`fallocate` FUSE handler stub.** `Volume::fallocate` in `volume.rs:3269` handles
+  mode flags (`KEEP_SIZE`, `PUNCH_HOLE`, `ZERO_RANGE`, `COLLAPSE_RANGE`,
+  `INSERT_RANGE`, `UNSHARE_RANGE`, `WRITE_ZEROES`). Returns `ENOSYS` for
+  unsupported modes; returns `ENOTSUP` for real-time files and non-extent formats;
+  returns `EINVAL` for invalid flag combinations. Actual allocation/deallocation
+  logic not yet implemented (requires incremental BMBT insertion/deletion).
 
 ---
 

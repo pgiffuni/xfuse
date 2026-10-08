@@ -44,6 +44,14 @@ use fuser::{
     ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, FUSE_ROOT_ID,
 };
 use libc::{ERANGE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK};
+// fallocate(2) mode flags (from linux/falloc.h)
+const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
+const FALLOC_FL_PUNCH_HOLE: i32 = 0x02;
+const FALLOC_FL_COLLAPSE_RANGE: i32 = 0x08;
+const FALLOC_FL_ZERO_RANGE: i32 = 0x10;
+const FALLOC_FL_INSERT_RANGE: i32 = 0x20;
+const FALLOC_FL_UNSHARE_RANGE: i32 = 0x40;
+const FALLOC_FL_WRITE_ZEROES: i32 = 0x80;
 use tracing::{debug, warn};
 
 use super::{
@@ -3255,6 +3263,103 @@ impl Filesystem for Volume {
                 }
             }
         }
+    }
+
+    fn fallocate(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        length: i64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        if !self.writable {
+            reply.error(libc::EROFS);
+            return;
+        }
+
+        if offset < 0 || length < 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
+        let offset = offset as u64;
+        let length = length as u64;
+        if length == 0 {
+            reply.ok();
+            return;
+        }
+
+        let oi = match self.open_files.get_mut(&ino) {
+            Some(oi) => oi,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let dinode = &oi.dinode;
+        let format = dinode.di_core.di_format;
+        if !matches!(format, XfsDinodeFmt::Extents | XfsDinodeFmt::Btree) {
+            reply.error(libc::ENOTSUP);
+            return;
+        }
+
+        if dinode.is_realtime() {
+            reply.error(libc::ENOTSUP);
+            return;
+        }
+
+        // Handle mutually exclusive modes
+        let keep_size = (mode & FALLOC_FL_KEEP_SIZE) != 0;
+        let punch_hole = (mode & FALLOC_FL_PUNCH_HOLE) != 0;
+        let zero_range = (mode & FALLOC_FL_ZERO_RANGE) != 0;
+        let collapse_range = (mode & FALLOC_FL_COLLAPSE_RANGE) != 0;
+        let insert_range = (mode & FALLOC_FL_INSERT_RANGE) != 0;
+        let unshare_range = (mode & FALLOC_FL_UNSHARE_RANGE) != 0;
+        let write_zeroes = (mode & FALLOC_FL_WRITE_ZEROES) != 0;
+
+        // Only KEEP_SIZE and PUNCH_HOLE are implemented
+        if collapse_range || insert_range || unshare_range || write_zeroes {
+            reply.error(libc::ENOTSUP);
+            return;
+        }
+
+        // ZERO_RANGE requires KEEP_SIZE
+        if zero_range && !keep_size {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
+        // PUNCH_HOLE cannot be combined with other modes
+        if punch_hole && (keep_size || zero_range) {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
+        let _end = offset.saturating_add(length);
+
+        let sb = self.sb;
+        let _blocksize = u64::from(sb.sb_blocksize);
+        let _inode_size = sb.inode_size();
+        let xfs_ino = dinode.di_core.di_ino;
+        let _inode_offset = sb.inode_offset(xfs_ino);
+
+        if punch_hole {
+            // Punch hole: free blocks in [offset, end)
+            // This requires finding and removing extents in that range
+            // For now, return ENOSYS as it needs BMBT incremental deletion
+            reply.error(libc::ENOSYS);
+            return;
+        }
+
+        // KEEP_SIZE (with or without ZERO_RANGE): allocate blocks for [offset, end)
+        // without changing file size
+        // This requires allocating new blocks and inserting extents
+        // For now, return ENOSYS as it needs BMBT incremental insertion
+        reply.error(libc::ENOSYS);
     }
 
     fn setxattr(
