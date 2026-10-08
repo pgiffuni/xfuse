@@ -3758,7 +3758,7 @@ pub(crate) mod t {
         let (start, len) = root
             .get_file()
             .expect("the root's mapping is in its inode")
-            .lookup(reader.by_ref(), &sb, 0)
+            .lookup(reader.by_ref(), &sb, 0, false)
             .expect("the root's first block is mapped");
         let start = start.expect("the root's first block is not a hole");
         eprintln!(

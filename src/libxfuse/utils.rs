@@ -80,7 +80,10 @@ impl<Ctx> bincode_next::Decode<Ctx> for Uuid {
 impl_borrow_decode!(Uuid);
 
 impl bincode_next::Encode for Uuid {
-    fn encode<E: bincode_next::enc::Encoder>(&self, encoder: &mut E) -> Result<(), bincode_next::error::EncodeError> {
+    fn encode<E: bincode_next::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> Result<(), bincode_next::error::EncodeError> {
         self.0.as_bytes().encode(encoder)
     }
 }

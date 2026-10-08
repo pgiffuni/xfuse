@@ -112,7 +112,8 @@ impl AttrBtree {
     where
         R: bincode_next::de::read::Reader + BufRead + Seek,
     {
-        let fsblk = btree.map_block(buf_reader.by_ref(), 0).unwrap().0.unwrap();
+        let (fsblk, _len) = btree.map_block(buf_reader.by_ref(), 0, false).unwrap();
+        let fsblk = fsblk.unwrap();
         buf_reader
             .seek(SeekFrom::Start(sb.fsb_to_offset(fsblk)))
             .unwrap();
@@ -136,9 +137,8 @@ impl AttrBtree {
         logical_block: XfsDablk,
     ) -> Result<XfsFsblock, i32> {
         self.btree
-            .map_block(buf_reader, logical_block.into())?
-            .0
-            .ok_or(crate::libxfuse::ENOATTR)
+            .map_block(buf_reader, logical_block.into(), false)
+            .map(|(fsblk, _len)| fsblk.ok_or(crate::libxfuse::ENOATTR))?
     }
 
     /// Read the AttrLeafblock located at the given directory block number

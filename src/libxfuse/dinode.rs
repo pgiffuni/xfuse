@@ -402,7 +402,7 @@ impl Dinode {
 
         let file_metadata = self.get_file()?;
         while size > 0 {
-            let (blk, blocks) = file_metadata.lookup(buf_reader.by_ref(), sb, logical_block)?;
+            let (blk, blocks) = file_metadata.lookup(buf_reader.by_ref(), sb, logical_block, true)?;
             let z = usize::try_from(min(
                 u64::try_from(size).unwrap(),
                 (blocks << sb.sb_blocklog) - block_offset,

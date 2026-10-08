@@ -51,14 +51,14 @@ use bincode_next::{
 use num_traits::{PrimInt, Unsigned};
 
 use super::{
+    alloc::allocator::allocate_in_group,
     bmbt_rec::{BmbtRec, Bmx},
     definitions::{XfsFileoff, XfsFsblock, XfsIno, XFS_BMAP_CRC_MAGIC, XFS_BMAP_MAGIC},
     error::FsError,
     sb::Sb,
+    transaction::Transaction,
     utils::{decode, decode_from, Uuid},
     volume::SUPERBLOCK,
-    alloc::allocator::allocate_in_group,
-    transaction::Transaction,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -523,7 +523,9 @@ impl BmbtInteriorBlock {
         has_crc: bool,
     ) -> Result<bool, i32> {
         let min = Self::min_children(sb_blocksize, has_crc);
-        let idx = self.keys.partition_point(|k| k.br_startoff < key.br_startoff);
+        let idx = self
+            .keys
+            .partition_point(|k| k.br_startoff < key.br_startoff);
         if idx >= self.keys.len() || self.keys[idx].br_startoff != key.br_startoff {
             return Err(libc::ENOENT);
         }
@@ -542,7 +544,12 @@ impl BmbtInteriorBlock {
 
     /// Redistribute key-pointer pairs with a sibling to maintain minimum occupancy.
     #[allow(dead_code)]
-    pub fn redistribute_with(&mut self, other: &mut BmbtInteriorBlock, _sb_blocksize: usize, _has_crc: bool) -> bool {
+    pub fn redistribute_with(
+        &mut self,
+        other: &mut BmbtInteriorBlock,
+        _sb_blocksize: usize,
+        _has_crc: bool,
+    ) -> bool {
         let total = self.keys.len() + other.keys.len();
         let min = Self::min_children(0, false);
         if total < 2 * min {
@@ -559,8 +566,10 @@ impl BmbtInteriorBlock {
         let mut combined_sorted = combined;
         combined_sorted.sort_by_key(|(k, _)| k.br_startoff);
         let mid = combined_sorted.len() / 2;
-        let (new_self_keys, new_self_ptrs): (Vec<_>, Vec<_>) = combined_sorted[..mid].iter().cloned().unzip();
-        let (new_other_keys, new_other_ptrs): (Vec<_>, Vec<_>) = combined_sorted[mid..].iter().cloned().unzip();
+        let (new_self_keys, new_self_ptrs): (Vec<_>, Vec<_>) =
+            combined_sorted[..mid].iter().cloned().unzip();
+        let (new_other_keys, new_other_ptrs): (Vec<_>, Vec<_>) =
+            combined_sorted[mid..].iter().cloned().unzip();
         self.keys = new_self_keys;
         self.ptrs = new_self_ptrs;
         other.keys = new_other_keys;
@@ -798,15 +807,18 @@ impl BmbtLeafBlock {
             let idx = self
                 .records
                 .partition_point(|r| r.startoff() < record.startoff());
-            
+
             // Check for coalescing with adjacent records before inserting
             // Coalesce with previous record if adjacent
             if idx > 0 {
                 let prev = &self.records[idx - 1];
                 let prev_end = prev.startoff() + prev.blockcount();
                 let prev_end_block = prev.startblock() + prev.blockcount();
-                
-                if prev_end == record.startoff() && prev_end_block == record.startblock() && prev.extent_flag() == record.extent_flag() {
+
+                if prev_end == record.startoff()
+                    && prev_end_block == record.startblock()
+                    && prev.extent_flag() == record.extent_flag()
+                {
                     // Coalesce: extend previous record
                     self.records[idx - 1] = BmbtLeafRecord::from_extent(&BmbtRec {
                         br_startoff: prev.startoff(),
@@ -817,14 +829,17 @@ impl BmbtLeafBlock {
                     return None;
                 }
             }
-            
+
             // Coalesce with next record if adjacent
             if idx < self.records.len() {
                 let next = &self.records[idx];
                 let record_end = record.startoff() + record.blockcount();
                 let record_end_block = record.startblock() + record.blockcount();
-                
-                if record_end == next.startoff() && record_end_block == next.startblock() && record.extent_flag() == next.extent_flag() {
+
+                if record_end == next.startoff()
+                    && record_end_block == next.startblock()
+                    && record.extent_flag() == next.extent_flag()
+                {
                     // Coalesce: extend new record to include next
                     let new_record = BmbtLeafRecord::from_extent(&BmbtRec {
                         br_startoff: record.startoff(),
@@ -837,7 +852,7 @@ impl BmbtLeafBlock {
                     return None;
                 }
             }
-            
+
             // No coalescing possible, insert normally
             self.records.insert(idx, record);
             return None;
@@ -890,7 +905,7 @@ impl BmbtLeafBlock {
         if idx >= self.records.len() || self.records[idx].startoff() != startoff {
             return Err(libc::ENOENT);
         }
-        
+
         // Check if adjacent records can be coalesced after removal
         // If we have a record before and after the removed one, check if they're now adjacent
         if idx > 0 && idx < self.records.len() - 1 {
@@ -898,8 +913,11 @@ impl BmbtLeafBlock {
             let next = &self.records[idx + 1];
             let prev_end = prev.startoff() + prev.blockcount();
             let prev_end_block = prev.startblock() + prev.blockcount();
-            
-            if prev_end == next.startoff() && prev_end_block == next.startblock() && prev.extent_flag() == next.extent_flag() {
+
+            if prev_end == next.startoff()
+                && prev_end_block == next.startblock()
+                && prev.extent_flag() == next.extent_flag()
+            {
                 // Coalesce prev and next
                 let merged = BmbtLeafRecord::from_extent(&BmbtRec {
                     br_startoff: prev.startoff(),
@@ -913,7 +931,7 @@ impl BmbtLeafBlock {
                 return Ok(self.records.len() < min);
             }
         }
-        
+
         self.records.remove(idx);
         // Return true if we need to merge/redistribute
         Ok(self.records.len() < min)
@@ -942,10 +960,10 @@ impl BmbtLeafBlock {
         let mid = all.len() / 2;
         let new_other = all.split_off(mid);
         self.records = all;
-other.records = new_other;
+        other.records = new_other;
         true
     }
-    
+
     /// Coalesce adjacent extents in this leaf.
     /// Merges records that are contiguous in both file offset and filesystem block.
     #[allow(dead_code)]
@@ -953,18 +971,19 @@ other.records = new_other;
         if self.records.len() < 2 {
             return;
         }
-        
+
         let mut i = 0;
         while i + 1 < self.records.len() {
             let current = &self.records[i];
             let next = &self.records[i + 1];
-            
+
             let current_end = current.startoff() + current.blockcount();
             let current_end_block = current.startblock() + current.blockcount();
-            
-            if current_end == next.startoff() 
-                && current_end_block == next.startblock() 
-                && current.extent_flag() == next.extent_flag() {
+
+            if current_end == next.startoff()
+                && current_end_block == next.startblock()
+                && current.extent_flag() == next.extent_flag()
+            {
                 // Coalesce current and next
                 let merged = BmbtLeafRecord::from_extent(&BmbtRec {
                     br_startoff: current.startoff(),
@@ -980,7 +999,7 @@ other.records = new_other;
             }
         }
     }
-    
+
     /// This leaf as the bytes of a block of a file system **without** checksums holds.
     /// This leaf as the bytes a block of a file system **without** checksums holds.
     ///
@@ -1067,10 +1086,12 @@ pub trait Btree: BtreePriv {
     /// Return the extent, if any, that contains the given block within the file.
     /// Return its starting position as an FSblock, and its length in file system block units.
     /// If a hole's length extents to EoF, return None for length.
+    /// If `filter_unwritten` is true, unwritten extents (br_flag=true) are treated as holes.
     fn map_block<R: bincode_next::de::read::Reader + BufRead + Seek>(
         &self,
         buf_reader: &mut R,
         logical_block: XfsFileoff,
+        filter_unwritten: bool,
     ) -> Result<(Option<XfsFsblock>, Option<u64>), i32> {
         let super_block = super::volume::try_superblock().ok_or(libc::ENODEV)?;
         let pp = self
@@ -1096,11 +1117,11 @@ pub trait Btree: BtreePriv {
                             .map_err(|e| e.raw_os_error().unwrap())?;
                         let bti: BtreeIntermediate =
                             decode_from(buf_reader.by_ref()).map_err(|_| libc::EDESTADDRREQ)?;
-                        ve.insert(bti).map_block(buf_reader, logical_block)
+                        ve.insert(bti).map_block(buf_reader, logical_block, filter_unwritten)
                     }
                     Entry::Occupied(oe) => {
                         let v: &BtreeIntermediate = oe.get();
-                        v.map_block(buf_reader, logical_block)
+                        v.map_block(buf_reader, logical_block, filter_unwritten)
                     }
                 }
             }
@@ -1122,11 +1143,11 @@ pub trait Btree: BtreePriv {
                             .map_err(|e| e.raw_os_error().unwrap())?;
                         let btl =
                             BtreeLeaf::from_bytes(&bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
-                        Ok(ve.insert(btl).get_extent(logical_block))
+                        Ok(ve.insert(btl).get_extent(logical_block, filter_unwritten))
                     }
                     Entry::Occupied(oe) => {
                         let v: &BtreeLeaf = oe.get();
-                        Ok(v.get_extent(logical_block))
+                        Ok(v.get_extent(logical_block, filter_unwritten))
                     }
                 }
             }
@@ -1212,8 +1233,7 @@ impl BtreeRoot {
         }
         Ok((Bmx::new(&out), nodes))
     }
-
-    }
+}
 
 /// Result of inserting into a child node: either no split, or a new node with separator key.
 #[allow(dead_code)]
@@ -1239,16 +1259,16 @@ impl BtreeRoot {
         R: bincode_next::de::read::Reader + BufRead + Seek,
     {
         let record = BmbtLeafRecord::from_extent(&extent);
-        
+
         // Handle root level 0 (root is a leaf in the inode)
         if self.bmdr.bb_level == 0 {
             return self.insert_extent_root_leaf(buf_reader, record, sb, tx);
         }
-        
+
         // For multi-level tree, descend and insert
         self.insert_extent_recursive(buf_reader, record, sb, tx)
     }
-    
+
     /// Insert when root is a leaf (level 0). Convert to a tree with level 1 root.
     #[allow(dead_code)]
     fn insert_extent_root_leaf<R>(
@@ -1268,32 +1288,32 @@ impl BtreeRoot {
         // 2. Allocate a new leaf block
         // 3. Write extents to the leaf block
         // 4. Update the inode's root to point to the new leaf (level 1)
-        
+
         // Get current extents from the inode
         let extents = self.all_extents_from_inode(sb)?;
         if extents.is_empty() {
             // No extents yet - just insert the new record
             return self.insert_extent_root_leaf_empty(buf_reader, record, sb, tx);
         }
-        
+
         // Insert the new record into the extent list first
         let mut all_extents = extents;
         let new_extent = BmbtLeafRecord::as_extent(&record);
         // Find insertion point
         let insert_idx = all_extents.partition_point(|e| e.br_startoff < new_extent.br_startoff);
         all_extents.insert(insert_idx, new_extent);
-        
+
         // Check if all extents fit in inode
         let max_inode_extents = self.max_inode_extents(sb);
         if all_extents.len() <= max_inode_extents {
             // Still fits in inode - write back to inode
             return self.write_extents_to_inode(&all_extents, sb, tx);
         }
-        
+
         // Need to convert to BMBT: allocate leaf block, write extents, update root
         self.convert_to_btree(buf_reader, &all_extents, sb, tx)
     }
-    
+
     /// Insert when root is empty (level 0, no extents)
     #[allow(dead_code)]
     fn insert_extent_root_leaf_empty<R>(
@@ -1310,13 +1330,13 @@ impl BtreeRoot {
         let extents = vec![record.as_extent()];
         self.write_extents_to_inode(&extents, sb, tx)
     }
-    
+
     /// Maximum number of extents that fit in an inode's data fork
     fn max_inode_extents(&self, sb: &Sb) -> usize {
         let fork_size = self.inode_fork_size(sb);
         fork_size / BMBT_RECORD_LEN
     }
-    
+
     /// Size of the inode's data fork in bytes
     fn inode_fork_size(&self, sb: &Sb) -> usize {
         // The data fork starts after the inode core and attribute fork
@@ -1330,20 +1350,19 @@ impl BtreeRoot {
         };
         inode_size.saturating_sub(core_size + attr_fork_size)
     }
-    
+
     /// Write extents directly to inode (extent list format)
     fn write_extents_to_inode(
         &mut self,
         _extents: &[BmbtRec],
         _sb: &Sb,
         _tx: &mut Transaction<'_>,
-    ) -> Result<(), i32>
-    {
+    ) -> Result<(), i32> {
         // This would write the extent list back to the inode
         // For now, return ENOSYS as this requires inode-level coordination
         Err(libc::ENOSYS)
     }
-    
+
     /// Convert from extent list format to BMBT format
     fn convert_to_btree<R>(
         &mut self,
@@ -1360,13 +1379,13 @@ impl BtreeRoot {
         let run_opt = allocate_in_group(tx, sb, agno, 1).map_err(|e| e.errno())?;
         let run = run_opt.ok_or(libc::ENOSPC)?;
         let leaf_block = (agno as u64 * sb.sb_agblocks as u64) + run.start as u64;
-        
+
         // Create leaf block with all extents
         let leaf = BmbtLeafBlock {
             level: 0,
             records: extents.iter().map(BmbtLeafRecord::from_extent).collect(),
         };
-        
+
         // Write leaf block
         let leaf_hdr = BtreeLblockHdr {
             blkno: leaf_block,
@@ -1377,19 +1396,22 @@ impl BtreeRoot {
             uuid: sb.sb_uuid.as_image_bytes(),
         };
         let leaf_bytes = leaf.to_bytes(&leaf_hdr, sb.sb_blocksize as usize);
-        tx.write_bytes(sb.fsb_to_offset(leaf_block), &leaf_bytes).map_err(|e| e.errno())?;
-        
+        tx.write_bytes(sb.fsb_to_offset(leaf_block), &leaf_bytes)
+            .map_err(|e| e.errno())?;
+
         // Update root to point to leaf (level 1)
         self.bmdr.bb_level = 1;
         self.bmdr.bb_numrecs = 1;
-        self.keys = vec![BmbtKey { br_startoff: leaf.records[0].startoff() }];
+        self.keys = vec![BmbtKey {
+            br_startoff: leaf.records[0].startoff(),
+        }];
         self.ptrs = vec![leaf_block];
-        
+
         // Note: The inode itself needs to be updated with the new root
         // This requires coordination with the inode write path
         Ok(())
     }
-    
+
     /// Get all extents from the inode's root (for level 0)
     fn all_extents_from_inode(&self, _sb: &Sb) -> Result<Vec<BmbtRec>, i32> {
         // For level 0 root, the keys ARE the extent records
@@ -1401,7 +1423,7 @@ impl BtreeRoot {
         // For now, return empty
         Ok(Vec::<BmbtRec>::new())
     }
-    
+
     /// Recursive insertion for multi-level trees (level >= 1)
     #[allow(dead_code)]
     fn insert_extent_recursive<R>(
@@ -1415,29 +1437,32 @@ impl BtreeRoot {
         R: bincode_next::de::read::Reader + BufRead + Seek,
     {
         let record_startoff = record.startoff();
-        
+
         // Find the child index
-        let child_idx = self.keys.partition_point(|k| k.br_startoff < record_startoff);
-        
+        let child_idx = self
+            .keys
+            .partition_point(|k| k.br_startoff < record_startoff);
+
         // Read the child block
         let child_ptr = self.ptrs[child_idx];
         let offset = sb.fsb_to_offset(child_ptr);
-        
+
         buf_reader
             .seek(SeekFrom::Start(offset))
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-        
+
         let mut child_bytes = vec![0u8; sb.sb_blocksize as usize];
         buf_reader
             .read_exact(&mut child_bytes)
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-        
+
         // Determine if child is leaf or intermediate
         let child_level = self.bmdr.bb_level - 1;
-        
+
         let result = if child_level == 0 {
             // Child is a leaf
-            let mut leaf = BmbtLeafBlock::from_bytes(&child_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+            let mut leaf =
+                BmbtLeafBlock::from_bytes(&child_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
             match leaf.insert_record(record, sb.sb_blocksize as usize, sb.has_crc()) {
                 None => InsertResult::NoSplit,
                 Some((new_leaf, separator_key)) => {
@@ -1452,14 +1477,13 @@ impl BtreeRoot {
                     };
                     let leaf_bytes = leaf.to_bytes(&hdr, sb.sb_blocksize as usize);
                     tx.write_bytes(offset, &leaf_bytes).map_err(|e| e.errno())?;
-                    
+
                     // Allocate a new block for the split leaf
                     let agno = (child_ptr >> sb.sb_agblklog) as u32;
-                    let run_opt = allocate_in_group(tx, sb, agno, 1)
-                        .map_err(|e| e.errno())?;
+                    let run_opt = allocate_in_group(tx, sb, agno, 1).map_err(|e| e.errno())?;
                     let run = run_opt.ok_or(libc::ENOSPC)?;
                     let new_block = run.start as XfsFsblock;
-                    
+
                     // Write the new leaf
                     let new_hdr = BtreeLblockHdr {
                         blkno: new_block,
@@ -1470,23 +1494,27 @@ impl BtreeRoot {
                         uuid: sb.sb_uuid.as_image_bytes(),
                     };
                     let new_leaf_bytes = new_leaf.to_bytes(&new_hdr, sb.sb_blocksize as usize);
-                    tx.write_bytes(sb.fsb_to_offset(new_block), &new_leaf_bytes).map_err(|e| e.errno())?;
-                    
+                    tx.write_bytes(sb.fsb_to_offset(new_block), &new_leaf_bytes)
+                        .map_err(|e| e.errno())?;
+
                     // Update sibling pointers if needed (simplified for now)
-                    
+
                     InsertResult::SplitLeaf(new_leaf, separator_key, new_block)
                 }
             }
         } else {
             // Child is an intermediate node
-            let mut intermediate: BtreeIntermediate = decode_from(buf_reader.by_ref()).map_err(|_| libc::EDESTADDRREQ)?;
+            let mut intermediate: BtreeIntermediate =
+                decode_from(buf_reader.by_ref()).map_err(|_| libc::EDESTADDRREQ)?;
             // Recursively insert into intermediate
             match self.insert_extent_intermediate(&mut intermediate, buf_reader, record, sb, tx)? {
                 None => InsertResult::NoSplit,
-                Some((new_node, separator_key, new_block)) => InsertResult::SplitIntermediate(new_node, separator_key, new_block),
+                Some((new_node, separator_key, new_block)) => {
+                    InsertResult::SplitIntermediate(new_node, separator_key, new_block)
+                }
             }
         };
-        
+
         // Handle split result
         match result {
             InsertResult::NoSplit => Ok(()),
@@ -1509,7 +1537,7 @@ impl BtreeRoot {
             }
         }
     }
-    
+
     #[allow(dead_code)]
     fn insert_key_ptr_at(&mut self, idx: usize, key: BmbtKey, ptr: XfsBmbtPtr) {
         if idx <= self.keys.len() {
@@ -1518,35 +1546,31 @@ impl BtreeRoot {
             self.bmdr.bb_numrecs = self.keys.len() as u16;
         }
     }
-    
+
     /// Handle root split when level 1 root overflows (root growth 1→2).
     /// Allocates a new root block, moves current root to a child, creates new root.
     #[allow(dead_code)]
-    fn handle_root_split(
-        &mut self,
-        sb: &Sb,
-        tx: &mut Transaction<'_>,
-    ) -> Result<(), i32> {
+    fn handle_root_split(&mut self, sb: &Sb, tx: &mut Transaction<'_>) -> Result<(), i32> {
         // Check if root (level 1) is full
         let max = BmbtInteriorBlock::max_children(sb.sb_blocksize as usize, sb.has_crc());
         if self.keys.len() <= max {
             return Ok(());
         }
-        
+
         // Root is full - need to split and grow to level 2
         // 1. Allocate new block for the old root (now a child)
         let agno = 0; // TODO: choose AG intelligently
         let run_opt = allocate_in_group(tx, sb, agno, 1).map_err(|e| e.errno())?;
         let run = run_opt.ok_or(libc::ENOSPC)?;
         let old_root_block = (agno as u64 * sb.sb_agblocks as u64) + run.start as u64;
-        
+
         // 2. Create intermediate node from current root (now level 1)
         let old_root_intermediate = BmbtInteriorBlock {
             level: 1,
             keys: self.keys.clone(),
             ptrs: self.ptrs.clone(),
         };
-        
+
         // 3. Write old root to new block
         let old_root_hdr = BtreeLblockHdr {
             blkno: old_root_block,
@@ -1556,30 +1580,32 @@ impl BtreeRoot {
             owner: 0,
             uuid: sb.sb_uuid.as_image_bytes(),
         };
-        let old_root_bytes = old_root_intermediate.to_bytes(&old_root_hdr, sb.sb_blocksize as usize);
-        tx.write_bytes(sb.fsb_to_offset(old_root_block), &old_root_bytes).map_err(|e| e.errno())?;
-        
+        let old_root_bytes =
+            old_root_intermediate.to_bytes(&old_root_hdr, sb.sb_blocksize as usize);
+        tx.write_bytes(sb.fsb_to_offset(old_root_block), &old_root_bytes)
+            .map_err(|e| e.errno())?;
+
         // 4. Split the keys/ptrs for new root (level 2)
         let mid = self.keys.len() / 2;
         let new_separator = self.keys[mid].clone();
-        
+
         let left_keys = self.keys[..mid].to_vec();
         let left_ptrs = self.ptrs[..mid].to_vec();
         let right_keys = self.keys[mid..].to_vec();
         let right_ptrs = self.ptrs[mid..].to_vec();
-        
+
         // 5. Allocate block for new right sibling
         let run_opt2 = allocate_in_group(tx, sb, agno, 1).map_err(|e| e.errno())?;
         let run2 = run_opt2.ok_or(libc::ENOSPC)?;
         let right_block = (agno as u64 * sb.sb_agblocks as u64) + run2.start as u64;
-        
+
         // 6. Create right sibling intermediate node
         let right_sibling = BmbtInteriorBlock {
             level: 1,
             keys: right_keys,
             ptrs: right_ptrs,
         };
-        
+
         let right_hdr = BtreeLblockHdr {
             blkno: right_block,
             lsn: 0,
@@ -1589,8 +1615,9 @@ impl BtreeRoot {
             uuid: sb.sb_uuid.as_image_bytes(),
         };
         let right_bytes = right_sibling.to_bytes(&right_hdr, sb.sb_blocksize as usize);
-        tx.write_bytes(sb.fsb_to_offset(right_block), &right_bytes).map_err(|e| e.errno())?;
-        
+        tx.write_bytes(sb.fsb_to_offset(right_block), &right_bytes)
+            .map_err(|e| e.errno())?;
+
         // 7. Update root to level 2 with left keys and pointers to old root and right sibling
         self.bmdr.bb_level = 2;
         self.keys = left_keys;
@@ -1598,14 +1625,14 @@ impl BtreeRoot {
         self.keys.push(new_separator);
         self.ptrs.push(right_block);
         self.bmdr.bb_numrecs = self.keys.len() as u16;
-        
+
         // 8. Update left sibling (old root) rightsib pointer
         // Note: This would require updating the old root block's rightsib
         // For now, we'll skip this as it's a sibling pointer optimization
-        
+
         Ok(())
     }
-    
+
     #[allow(dead_code)]
     fn insert_extent_intermediate<R>(
         &self,
@@ -1619,29 +1646,32 @@ impl BtreeRoot {
         R: bincode_next::de::read::Reader + BufRead + Seek,
     {
         let record_startoff = record.startoff();
-        
+
         // Find the child index
-        let child_idx = intermediate.keys.partition_point(|k| k.br_startoff < record_startoff);
-        
+        let child_idx = intermediate
+            .keys
+            .partition_point(|k| k.br_startoff < record_startoff);
+
         // Read the child block
         let child_ptr = intermediate.ptrs[child_idx];
         let offset = sb.fsb_to_offset(child_ptr);
-        
+
         buf_reader
             .seek(SeekFrom::Start(offset))
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-        
+
         let mut child_bytes = vec![0u8; sb.sb_blocksize as usize];
         buf_reader
             .read_exact(&mut child_bytes)
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-        
+
         // Determine if child is leaf or intermediate
         let child_level = intermediate.level() - 1;
-        
+
         let result = if child_level == 0 {
             // Child is a leaf
-            let mut leaf = BmbtLeafBlock::from_bytes(&child_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+            let mut leaf =
+                BmbtLeafBlock::from_bytes(&child_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
             match leaf.insert_record(record, sb.sb_blocksize as usize, sb.has_crc()) {
                 None => InsertResult::NoSplit,
                 Some((new_leaf, separator_key)) => {
@@ -1656,14 +1686,13 @@ impl BtreeRoot {
                     };
                     let leaf_bytes = leaf.to_bytes(&hdr, sb.sb_blocksize as usize);
                     tx.write_bytes(offset, &leaf_bytes).map_err(|e| e.errno())?;
-                    
+
                     // Allocate a new block for the split leaf
                     let agno = (child_ptr >> sb.sb_agblklog) as u32;
-                    let run_opt = allocate_in_group(tx, sb, agno, 1)
-                        .map_err(|e| e.errno())?;
+                    let run_opt = allocate_in_group(tx, sb, agno, 1).map_err(|e| e.errno())?;
                     let run = run_opt.ok_or(libc::ENOSPC)?;
                     let new_block = run.start as XfsFsblock;
-                    
+
                     // Write the new leaf
                     let new_hdr = BtreeLblockHdr {
                         blkno: new_block,
@@ -1674,20 +1703,30 @@ impl BtreeRoot {
                         uuid: sb.sb_uuid.as_image_bytes(),
                     };
                     let new_leaf_bytes = new_leaf.to_bytes(&new_hdr, sb.sb_blocksize as usize);
-                    tx.write_bytes(sb.fsb_to_offset(new_block), &new_leaf_bytes).map_err(|e| e.errno())?;
-                    
+                    tx.write_bytes(sb.fsb_to_offset(new_block), &new_leaf_bytes)
+                        .map_err(|e| e.errno())?;
+
                     InsertResult::SplitLeaf(new_leaf, separator_key, new_block)
                 }
             }
         } else {
             // Child is an intermediate node - recurse deeper
-            let mut child_intermediate: BtreeIntermediate = decode_from(buf_reader.by_ref()).map_err(|_| libc::EDESTADDRREQ)?;
-            match self.insert_extent_intermediate(&mut child_intermediate, buf_reader, record, sb, tx)? {
+            let mut child_intermediate: BtreeIntermediate =
+                decode_from(buf_reader.by_ref()).map_err(|_| libc::EDESTADDRREQ)?;
+            match self.insert_extent_intermediate(
+                &mut child_intermediate,
+                buf_reader,
+                record,
+                sb,
+                tx,
+            )? {
                 None => InsertResult::NoSplit,
-                Some((new_node, separator_key, new_block)) => InsertResult::SplitIntermediate(new_node, separator_key, new_block),
+                Some((new_node, separator_key, new_block)) => {
+                    InsertResult::SplitIntermediate(new_node, separator_key, new_block)
+                }
             }
         };
-        
+
         // Handle split result
         match result {
             InsertResult::NoSplit => Ok(None),
@@ -1717,12 +1756,12 @@ impl BtreeRoot {
                     let idx = child_idx + 1;
                     all_keys.insert(idx, separator_key);
                     all_ptrs.insert(idx, new_block);
-                    
+
                     let mid = all_keys.len() / 2;
                     let new_separator = all_keys[mid].clone();
                     let new_keys = all_keys.split_off(mid);
                     let new_ptrs = all_ptrs.split_off(mid);
-                    
+
                     let new_node = BmbtInteriorBlock {
                         level: intermediate.level(),
                         keys: new_keys,
@@ -1730,14 +1769,13 @@ impl BtreeRoot {
                     };
                     intermediate.keys = all_keys;
                     intermediate.ptrs = all_ptrs;
-                    
+
                     // Allocate block for new intermediate node
                     let agno = (offset >> sb.sb_agblklog) as u32;
-                    let run_opt = allocate_in_group(tx, sb, agno, 1)
-                        .map_err(|e| e.errno())?;
+                    let run_opt = allocate_in_group(tx, sb, agno, 1).map_err(|e| e.errno())?;
                     let run = run_opt.ok_or(libc::ENOSPC)?;
                     let new_block = run.start as XfsFsblock;
-                    
+
                     // Write the modified intermediate node
                     let hdr = BtreeLblockHdr {
                         blkno: offset,
@@ -1749,7 +1787,7 @@ impl BtreeRoot {
                     };
                     let node_bytes = intermediate.to_bytes(&hdr, sb.sb_blocksize as usize);
                     tx.write_bytes(offset, &node_bytes).map_err(|e| e.errno())?;
-                    
+
                     // Write the new intermediate node
                     let new_hdr = BtreeLblockHdr {
                         blkno: new_block,
@@ -1760,8 +1798,9 @@ impl BtreeRoot {
                         uuid: sb.sb_uuid.as_image_bytes(),
                     };
                     let new_node_bytes = new_node.to_bytes(&new_hdr, sb.sb_blocksize as usize);
-                    tx.write_bytes(sb.fsb_to_offset(new_block), &new_node_bytes).map_err(|e| e.errno())?;
-                    
+                    tx.write_bytes(sb.fsb_to_offset(new_block), &new_node_bytes)
+                        .map_err(|e| e.errno())?;
+
                     Ok(Some((new_node, new_separator, new_block)))
                 }
             }
@@ -1771,7 +1810,7 @@ impl BtreeRoot {
             }
         }
     }
-    
+
     /// Delete extents in a range [startoff, endoff) from the BMBT.
     /// Used for PUNCH_HOLE and truncate.
     #[allow(dead_code)]
@@ -1790,16 +1829,16 @@ impl BtreeRoot {
         if self.bmdr.bb_level == 0 {
             return Err(libc::ENOSYS);
         }
-        
+
         // For multi-level tree, descend and delete
         let freed = self.delete_extents_recursive(buf_reader, startoff, endoff, sb, tx)?;
-        
+
         // After deletion, check if root can be collapsed
         self.check_root_collapse(buf_reader, sb, tx)?;
-        
+
         Ok(freed)
     }
-    
+
     /// Recursive deletion for multi-level trees (level >= 1)
     #[allow(dead_code)]
     fn delete_extents_recursive<R>(
@@ -1814,7 +1853,7 @@ impl BtreeRoot {
         R: bincode_next::de::read::Reader + BufRead + Seek,
     {
         let mut freed_blocks = Vec::new();
-        
+
         // Find all child indices that overlap with [startoff, endoff)
         let mut affected_children = Vec::new();
         for (idx, key) in self.keys.iter().enumerate() {
@@ -1830,26 +1869,27 @@ impl BtreeRoot {
                 }
             }
         }
-        
+
         for &child_idx in &affected_children {
             let child_ptr = self.ptrs[child_idx];
             let offset = sb.fsb_to_offset(child_ptr);
-            
+
             buf_reader
                 .seek(SeekFrom::Start(offset))
                 .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-            
+
             let mut child_bytes = vec![0u8; sb.sb_blocksize as usize];
             buf_reader
                 .read_exact(&mut child_bytes)
                 .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-            
+
             let child_level = self.bmdr.bb_level - 1;
-            
+
             if child_level == 0 {
                 // Child is a leaf
-                let mut leaf = BmbtLeafBlock::from_bytes(&child_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
-                
+                let mut leaf = BmbtLeafBlock::from_bytes(&child_bytes)
+                    .map_err(|_| crate::libxfuse::EUCLEAN)?;
+
                 // Find and remove records in range
                 let mut records_to_remove = Vec::new();
                 for (idx, record) in leaf.records.iter().enumerate() {
@@ -1860,7 +1900,7 @@ impl BtreeRoot {
                         records_to_remove.push(idx);
                     }
                 }
-                
+
                 // For now, handle partial overlaps by splitting records
                 // A full implementation would also handle merge/redistribute
                 let mut need_merge = false;
@@ -1868,7 +1908,7 @@ impl BtreeRoot {
                     let record = leaf.records[idx];
                     let rec_start = record.startoff();
                     let rec_end = rec_start + record.blockcount();
-                    
+
                     if rec_start >= startoff && rec_end <= endoff {
                         // Record fully in range - remove it
                         leaf.records.remove(idx);
@@ -1888,11 +1928,16 @@ impl BtreeRoot {
                             br_flag: record.extent_flag(),
                         };
                         leaf.records.remove(idx);
-                        leaf.records.insert(idx, BmbtLeafRecord::from_extent(&left_extent));
-                        leaf.records.insert(idx + 1, BmbtLeafRecord::from_extent(&right_extent));
-                        
+                        leaf.records
+                            .insert(idx, BmbtLeafRecord::from_extent(&left_extent));
+                        leaf.records
+                            .insert(idx + 1, BmbtLeafRecord::from_extent(&right_extent));
+
                         let freed_len = endoff - startoff;
-                        freed_blocks.push((record.startblock() + (startoff - rec_start), freed_len as u32));
+                        freed_blocks.push((
+                            record.startblock() + (startoff - rec_start),
+                            freed_len as u32,
+                        ));
                     } else if rec_start < startoff && rec_end > startoff {
                         // Straddles startoff - trim front
                         let kept_blocks = startoff - rec_start;
@@ -1903,8 +1948,9 @@ impl BtreeRoot {
                             br_flag: record.extent_flag(),
                         };
                         leaf.records.remove(idx);
-                        leaf.records.insert(idx, BmbtLeafRecord::from_extent(&trimmed_extent));
-                        
+                        leaf.records
+                            .insert(idx, BmbtLeafRecord::from_extent(&trimmed_extent));
+
                         let freed_len = rec_end - startoff;
                         freed_blocks.push((record.startblock() + kept_blocks, freed_len as u32));
                     } else if rec_start < endoff && rec_end > endoff {
@@ -1917,22 +1963,23 @@ impl BtreeRoot {
                             br_flag: record.extent_flag(),
                         };
                         leaf.records.remove(idx);
-                        leaf.records.insert(idx, BmbtLeafRecord::from_extent(&trimmed_extent));
-                        
+                        leaf.records
+                            .insert(idx, BmbtLeafRecord::from_extent(&trimmed_extent));
+
                         let freed_len = rec_end - endoff;
                         freed_blocks.push((record.startblock() + kept_blocks, freed_len as u32));
                     }
                     // Fully inside case already handled above
                 }
-                
+
                 let min = BmbtLeafBlock::min_records(sb.sb_blocksize as usize, sb.has_crc());
                 if leaf.records.len() < min {
                     need_merge = true;
                 }
-                
+
                 // Coalesce adjacent extents after modifications
                 leaf.coalesce_adjacent();
-                
+
                 // Write leaf back
                 let hdr = BtreeLblockHdr {
                     blkno: child_ptr,
@@ -1944,28 +1991,44 @@ impl BtreeRoot {
                 };
                 let leaf_bytes = leaf.to_bytes(&hdr, sb.sb_blocksize as usize);
                 tx.write_bytes(offset, &leaf_bytes).map_err(|e| e.errno())?;
-                
+
                 if need_merge {
                     // Try to merge/redistribute with sibling
                     self.handle_leaf_underflow(child_idx, child_ptr, &leaf, sb, tx, buf_reader)?;
                 }
             } else {
                 // Child is an intermediate node - recurse
-                let mut intermediate: BtreeIntermediate = decode_from(buf_reader.by_ref()).map_err(|_| libc::EDESTADDRREQ)?;
-                let child_freed = self.delete_extents_intermediate(&mut intermediate, buf_reader, startoff, endoff, sb, tx, child_ptr)?;
+                let mut intermediate: BtreeIntermediate =
+                    decode_from(buf_reader.by_ref()).map_err(|_| libc::EDESTADDRREQ)?;
+                let child_freed = self.delete_extents_intermediate(
+                    &mut intermediate,
+                    buf_reader,
+                    startoff,
+                    endoff,
+                    sb,
+                    tx,
+                    child_ptr,
+                )?;
                 freed_blocks.extend(child_freed);
-                
+
                 // Check if intermediate needs merge/redistribute
                 let min = BmbtInteriorBlock::min_children(sb.sb_blocksize as usize, sb.has_crc());
                 if intermediate.keys.len() < min {
-                    self.handle_intermediate_underflow(child_idx, child_ptr, &intermediate, sb, tx, buf_reader)?;
+                    self.handle_intermediate_underflow(
+                        child_idx,
+                        child_ptr,
+                        &intermediate,
+                        sb,
+                        tx,
+                        buf_reader,
+                    )?;
                 }
             }
         }
-        
+
         Ok(freed_blocks)
     }
-    
+
     /// Check if the BMBT root can be collapsed (level 2→1 or 1→0).
     /// This happens when the root has only one child and that child can be collapsed.
     #[allow(dead_code)]
@@ -1982,47 +2045,60 @@ impl BtreeRoot {
         if self.bmdr.bb_level == 2 && self.keys.len() == 1 && self.ptrs.len() == 1 {
             let child_ptr = self.ptrs[0];
             let offset = sb.fsb_to_offset(child_ptr);
-            
+
             buf_reader
                 .seek(SeekFrom::Start(offset))
                 .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-            
+
             let mut child_bytes = vec![0u8; sb.sb_blocksize as usize];
             buf_reader
                 .read_exact(&mut child_bytes)
                 .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-            
+
             // Verify it's an intermediate node (level 1)
-            let mut intermediate = BtreeIntermediate::from_bytes(&child_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
-            if intermediate.level() == 1 && intermediate.keys.len() == 1 && intermediate.ptrs.len() == 1 {
+            let mut intermediate = BtreeIntermediate::from_bytes(&child_bytes)
+                .map_err(|_| crate::libxfuse::EUCLEAN)?;
+            if intermediate.level() == 1
+                && intermediate.keys.len() == 1
+                && intermediate.ptrs.len() == 1
+            {
                 // The intermediate has one child - check if it's a leaf
                 let leaf_ptr = intermediate.ptrs[0];
                 let leaf_offset = sb.fsb_to_offset(leaf_ptr);
-                
+
                 buf_reader
                     .seek(SeekFrom::Start(leaf_offset))
                     .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-                
+
                 let mut leaf_bytes = vec![0u8; sb.sb_blocksize as usize];
                 buf_reader
                     .read_exact(&mut leaf_bytes)
                     .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-                
-                let leaf = BmbtLeafBlock::from_bytes(&leaf_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+
+                let leaf =
+                    BmbtLeafBlock::from_bytes(&leaf_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
                 if leaf.level == 0 {
                     // Check if leaf records fit in intermediate node
-                    let max_keys = BmbtInteriorBlock::max_children(sb.sb_blocksize as usize, sb.has_crc());
+                    let max_keys =
+                        BmbtInteriorBlock::max_children(sb.sb_blocksize as usize, sb.has_crc());
                     if leaf.records.len() <= max_keys {
                         // Collapse: move leaf records to intermediate node
-                        let new_keys: Vec<BmbtKey> = leaf.records.iter().map(|r| BmbtKey { br_startoff: r.startoff() }).collect();
-                        let new_ptrs: Vec<XfsFsblock> = leaf.records.iter().map(|r| r.startblock()).collect();
-                        
+                        let new_keys: Vec<BmbtKey> = leaf
+                            .records
+                            .iter()
+                            .map(|r| BmbtKey {
+                                br_startoff: r.startoff(),
+                            })
+                            .collect();
+                        let new_ptrs: Vec<XfsFsblock> =
+                            leaf.records.iter().map(|r| r.startblock()).collect();
+
                         // Update intermediate node
                         intermediate.hdr.bb_level = 0;
                         intermediate.hdr.bb_numrecs = leaf.records.len() as u16;
                         intermediate.keys = new_keys;
                         intermediate.ptrs = new_ptrs;
-                        
+
                         // Write updated intermediate (now leaf)
                         let new_hdr = BtreeLblockHdr {
                             blkno: child_ptr,
@@ -2032,56 +2108,76 @@ impl BtreeRoot {
                             owner: 0,
                             uuid: sb.sb_uuid.as_image_bytes(),
                         };
-                        tx.write_bytes(sb.fsb_to_offset(child_ptr), &intermediate.to_bytes(&new_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
-                        
+                        tx.write_bytes(
+                            sb.fsb_to_offset(child_ptr),
+                            &intermediate.to_bytes(&new_hdr, sb.sb_blocksize as usize),
+                        )
+                        .map_err(|e| e.errno())?;
+
                         // Free the leaf block
                         let agno = (leaf_ptr >> sb.sb_agblklog) as u32;
                         let mask = u64::from(1u32 << sb.sb_agblklog) - 1;
                         let start = (leaf_ptr & mask) as u32;
-                        crate::libxfuse::alloc::allocator::free_in_group(tx, sb, agno, crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 }).map_err(|e| e.errno())?;
-                        
+                        crate::libxfuse::alloc::allocator::free_in_group(
+                            tx,
+                            sb,
+                            agno,
+                            crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 },
+                        )
+                        .map_err(|e| e.errno())?;
+
                         // Update root to level 1 (now points to leaf)
                         self.bmdr.bb_level = 1;
                         self.bmdr.bb_numrecs = 1;
-                        self.keys = vec![BmbtKey { br_startoff: intermediate.keys[0].br_startoff }];
+                        self.keys = vec![BmbtKey {
+                            br_startoff: intermediate.keys[0].br_startoff,
+                        }];
                         self.ptrs = vec![child_ptr];
                     }
                 }
             }
         }
-        
+
         // Root collapse level 1→0: level 1 root with one child that is a leaf
         if self.bmdr.bb_level == 1 && self.keys.len() == 1 && self.ptrs.len() == 1 {
             let child_ptr = self.ptrs[0];
             let offset = sb.fsb_to_offset(child_ptr);
-            
+
             buf_reader
                 .seek(SeekFrom::Start(offset))
                 .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-            
+
             let mut child_bytes = vec![0u8; sb.sb_blocksize as usize];
             buf_reader
                 .read_exact(&mut child_bytes)
                 .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-            
+
             // Verify it's a leaf (level 0)
-            let leaf = BmbtLeafBlock::from_bytes(&child_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+            let leaf =
+                BmbtLeafBlock::from_bytes(&child_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
             if leaf.level == 0 {
                 // Check if all records fit in inode
                 let max_extents = self.max_inode_extents(sb);
                 if leaf.records.len() <= max_extents {
                     // Collapse: move records to inode, free leaf block
-                    let extents: Vec<BmbtRec> = leaf.records.iter().map(|r| r.as_extent()).collect();
-                    
+                    let extents: Vec<BmbtRec> =
+                        leaf.records.iter().map(|r| r.as_extent()).collect();
+
                     // Write extents to inode
                     self.write_extents_to_inode(&extents, sb, tx)?;
-                    
+
                     // Free the leaf block
                     let agno = (child_ptr >> sb.sb_agblklog) as u32;
                     let mask = u64::from(1u32 << sb.sb_agblklog) - 1;
                     let start = (child_ptr & mask) as u32;
-                    crate::libxfuse::alloc::allocator::free_in_group(tx, sb, agno, crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 }).map_err(|e| e.errno())?;
-                    
+                    crate::libxfuse::alloc::allocator::free_in_group(
+                        tx,
+                        sb,
+                        agno,
+                        crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 },
+                    )
+                    .map_err(|e| e.errno())?;
+
                     // Update root to level 0
                     self.bmdr.bb_level = 0;
                     self.bmdr.bb_numrecs = 0;
@@ -2092,7 +2188,7 @@ impl BtreeRoot {
         }
         Ok(())
     }
-    
+
     /// Handle leaf underflow after deletion by trying to redistribute or merge with sibling.
     #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
@@ -2112,13 +2208,18 @@ impl BtreeRoot {
         if child_idx + 1 < self.ptrs.len() {
             let right_ptr = self.ptrs[child_idx + 1];
             let right_offset = sb.fsb_to_offset(right_ptr);
-            
-            buf_reader.seek(SeekFrom::Start(right_offset)).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+
+            buf_reader
+                .seek(SeekFrom::Start(right_offset))
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
             let mut right_bytes = vec![0u8; sb.sb_blocksize as usize];
-            buf_reader.read_exact(&mut right_bytes).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-            
-            let mut right_leaf = BmbtLeafBlock::from_bytes(&right_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
-            
+            buf_reader
+                .read_exact(&mut right_bytes)
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+
+            let mut right_leaf =
+                BmbtLeafBlock::from_bytes(&right_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+
             // Try redistribute
             let mut leaf_mut = leaf.clone();
             if leaf_mut.redistribute_with(&mut right_leaf) {
@@ -2139,18 +2240,28 @@ impl BtreeRoot {
                     owner: 0,
                     uuid: sb.sb_uuid.as_image_bytes(),
                 };
-                tx.write_bytes(sb.fsb_to_offset(child_ptr), &leaf_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
-                tx.write_bytes(right_offset, &right_leaf.to_bytes(&right_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
-                
+                tx.write_bytes(
+                    sb.fsb_to_offset(child_ptr),
+                    &leaf_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize),
+                )
+                .map_err(|e| e.errno())?;
+                tx.write_bytes(
+                    right_offset,
+                    &right_leaf.to_bytes(&right_hdr, sb.sb_blocksize as usize),
+                )
+                .map_err(|e| e.errno())?;
+
                 // Update separator key in parent
-                let new_separator = BmbtKey { br_startoff: right_leaf.records[0].startoff() };
+                let new_separator = BmbtKey {
+                    br_startoff: right_leaf.records[0].startoff(),
+                };
                 self.keys[child_idx + 1] = new_separator;
                 return Ok(());
             }
-            
+
             // Redistribute failed, try merge (merge right into left)
             leaf_mut.merge_with(right_leaf);
-            
+
             // Write merged leaf
             let left_hdr = BtreeLblockHdr {
                 blkno: child_ptr,
@@ -2160,33 +2271,48 @@ impl BtreeRoot {
                 owner: 0,
                 uuid: sb.sb_uuid.as_image_bytes(),
             };
-            tx.write_bytes(sb.fsb_to_offset(child_ptr), &leaf_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
-            
+            tx.write_bytes(
+                sb.fsb_to_offset(child_ptr),
+                &leaf_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize),
+            )
+            .map_err(|e| e.errno())?;
+
             // Remove the right sibling from parent
             self.keys.remove(child_idx + 1);
             self.ptrs.remove(child_idx + 1);
             self.bmdr.bb_numrecs = self.keys.len() as u16;
-            
+
             // Free the right sibling block
             let agno = (right_ptr >> sb.sb_agblklog) as u32;
             let mask = u64::from(1u32 << sb.sb_agblklog) - 1;
             let start = (right_ptr & mask) as u32;
-            crate::libxfuse::alloc::allocator::free_in_group(tx, sb, agno, crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 }).map_err(|e| e.errno())?;
-            
+            crate::libxfuse::alloc::allocator::free_in_group(
+                tx,
+                sb,
+                agno,
+                crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 },
+            )
+            .map_err(|e| e.errno())?;
+
             return Ok(());
         }
-        
+
         // Try left sibling
         if child_idx > 0 {
             let left_ptr = self.ptrs[child_idx - 1];
             let left_offset = sb.fsb_to_offset(left_ptr);
-            
-            buf_reader.seek(SeekFrom::Start(left_offset)).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+
+            buf_reader
+                .seek(SeekFrom::Start(left_offset))
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
             let mut left_bytes = vec![0u8; sb.sb_blocksize as usize];
-            buf_reader.read_exact(&mut left_bytes).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-            
-            let left_leaf = BmbtLeafBlock::from_bytes(&left_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
-            
+            buf_reader
+                .read_exact(&mut left_bytes)
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+
+            let left_leaf =
+                BmbtLeafBlock::from_bytes(&left_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+
             // Try redistribute
             let mut left_leaf_mut = left_leaf.clone();
             let mut leaf_mut = leaf.clone();
@@ -2208,18 +2334,28 @@ impl BtreeRoot {
                     owner: 0,
                     uuid: sb.sb_uuid.as_image_bytes(),
                 };
-                tx.write_bytes(left_offset, &left_leaf_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
-                tx.write_bytes(sb.fsb_to_offset(child_ptr), &leaf_mut.to_bytes(&right_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
-                
+                tx.write_bytes(
+                    left_offset,
+                    &left_leaf_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize),
+                )
+                .map_err(|e| e.errno())?;
+                tx.write_bytes(
+                    sb.fsb_to_offset(child_ptr),
+                    &leaf_mut.to_bytes(&right_hdr, sb.sb_blocksize as usize),
+                )
+                .map_err(|e| e.errno())?;
+
                 // Update separator key in parent
-                let new_separator = BmbtKey { br_startoff: leaf_mut.records[0].startoff() };
+                let new_separator = BmbtKey {
+                    br_startoff: leaf_mut.records[0].startoff(),
+                };
                 self.keys[child_idx] = new_separator;
                 return Ok(());
             }
-            
+
             // Redistribute failed, try merge (merge current into left)
             left_leaf_mut.merge_with(leaf_mut);
-            
+
             // Write merged leaf
             let left_hdr = BtreeLblockHdr {
                 blkno: left_ptr,
@@ -2229,26 +2365,36 @@ impl BtreeRoot {
                 owner: 0,
                 uuid: sb.sb_uuid.as_image_bytes(),
             };
-            tx.write_bytes(left_offset, &left_leaf_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
-            
+            tx.write_bytes(
+                left_offset,
+                &left_leaf_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize),
+            )
+            .map_err(|e| e.errno())?;
+
             // Remove current leaf from parent
             self.keys.remove(child_idx);
             self.ptrs.remove(child_idx);
             self.bmdr.bb_numrecs = self.keys.len() as u16;
-            
+
             // Free the current leaf block
             let agno = (child_ptr >> sb.sb_agblklog) as u32;
             let mask = u64::from(1u32 << sb.sb_agblklog) - 1;
             let start = (child_ptr & mask) as u32;
-            crate::libxfuse::alloc::allocator::free_in_group(tx, sb, agno, crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 }).map_err(|e| e.errno())?;
-            
+            crate::libxfuse::alloc::allocator::free_in_group(
+                tx,
+                sb,
+                agno,
+                crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 },
+            )
+            .map_err(|e| e.errno())?;
+
             return Ok(());
         }
-        
+
         // No siblings to merge with - just leave as is
         Ok(())
     }
-    
+
     /// Handle intermediate node underflow after deletion by trying to redistribute or merge with sibling.
     #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
@@ -2268,13 +2414,18 @@ impl BtreeRoot {
         if child_idx + 1 < self.ptrs.len() {
             let right_ptr = self.ptrs[child_idx + 1];
             let right_offset = sb.fsb_to_offset(right_ptr);
-            
-            buf_reader.seek(SeekFrom::Start(right_offset)).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+
+            buf_reader
+                .seek(SeekFrom::Start(right_offset))
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
             let mut right_bytes = vec![0u8; sb.sb_blocksize as usize];
-            buf_reader.read_exact(&mut right_bytes).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-            
-            let mut right_intermediate = BtreeIntermediate::from_bytes(&right_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
-            
+            buf_reader
+                .read_exact(&mut right_bytes)
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+
+            let mut right_intermediate = BtreeIntermediate::from_bytes(&right_bytes)
+                .map_err(|_| crate::libxfuse::EUCLEAN)?;
+
             // Try redistribute
             let mut intermediate_mut = intermediate.clone();
             if intermediate_mut.redistribute_with(&mut right_intermediate) {
@@ -2295,18 +2446,28 @@ impl BtreeRoot {
                     owner: 0,
                     uuid: sb.sb_uuid.as_image_bytes(),
                 };
-                tx.write_bytes(sb.fsb_to_offset(child_ptr), &intermediate_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
-                tx.write_bytes(right_offset, &right_intermediate.to_bytes(&right_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
-                
+                tx.write_bytes(
+                    sb.fsb_to_offset(child_ptr),
+                    &intermediate_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize),
+                )
+                .map_err(|e| e.errno())?;
+                tx.write_bytes(
+                    right_offset,
+                    &right_intermediate.to_bytes(&right_hdr, sb.sb_blocksize as usize),
+                )
+                .map_err(|e| e.errno())?;
+
                 // Update separator key in parent
-                let new_separator = BmbtKey { br_startoff: right_intermediate.keys[0].br_startoff };
+                let new_separator = BmbtKey {
+                    br_startoff: right_intermediate.keys[0].br_startoff,
+                };
                 self.keys[child_idx + 1] = new_separator;
                 return Ok(());
             }
-            
+
             // Redistribute failed, try merge (merge right into left)
             intermediate_mut.merge_with(right_intermediate);
-            
+
             // Write merged intermediate
             let left_hdr = BtreeLblockHdr {
                 blkno: child_ptr,
@@ -2316,33 +2477,48 @@ impl BtreeRoot {
                 owner: 0,
                 uuid: sb.sb_uuid.as_image_bytes(),
             };
-            tx.write_bytes(sb.fsb_to_offset(child_ptr), &intermediate_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
-            
+            tx.write_bytes(
+                sb.fsb_to_offset(child_ptr),
+                &intermediate_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize),
+            )
+            .map_err(|e| e.errno())?;
+
             // Remove the right sibling from parent
             self.keys.remove(child_idx + 1);
             self.ptrs.remove(child_idx + 1);
             self.bmdr.bb_numrecs = self.keys.len() as u16;
-            
+
             // Free the right sibling block
             let agno = (right_ptr >> sb.sb_agblklog) as u32;
             let mask = u64::from(1u32 << sb.sb_agblklog) - 1;
             let start = (right_ptr & mask) as u32;
-            crate::libxfuse::alloc::allocator::free_in_group(tx, sb, agno, crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 }).map_err(|e| e.errno())?;
-            
+            crate::libxfuse::alloc::allocator::free_in_group(
+                tx,
+                sb,
+                agno,
+                crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 },
+            )
+            .map_err(|e| e.errno())?;
+
             return Ok(());
         }
-        
+
         // Try left sibling
         if child_idx > 0 {
             let left_ptr = self.ptrs[child_idx - 1];
             let left_offset = sb.fsb_to_offset(left_ptr);
-            
-            buf_reader.seek(SeekFrom::Start(left_offset)).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+
+            buf_reader
+                .seek(SeekFrom::Start(left_offset))
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
             let mut left_bytes = vec![0u8; sb.sb_blocksize as usize];
-            buf_reader.read_exact(&mut left_bytes).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-            
-            let left_intermediate = BtreeIntermediate::from_bytes(&left_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
-            
+            buf_reader
+                .read_exact(&mut left_bytes)
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+
+            let left_intermediate =
+                BtreeIntermediate::from_bytes(&left_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+
             // Try redistribute
             let mut left_intermediate_mut = left_intermediate.clone();
             let mut intermediate_mut = intermediate.clone();
@@ -2364,18 +2540,28 @@ impl BtreeRoot {
                     owner: 0,
                     uuid: sb.sb_uuid.as_image_bytes(),
                 };
-                tx.write_bytes(left_offset, &left_intermediate_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
-                tx.write_bytes(sb.fsb_to_offset(child_ptr), &intermediate_mut.to_bytes(&right_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
-                
+                tx.write_bytes(
+                    left_offset,
+                    &left_intermediate_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize),
+                )
+                .map_err(|e| e.errno())?;
+                tx.write_bytes(
+                    sb.fsb_to_offset(child_ptr),
+                    &intermediate_mut.to_bytes(&right_hdr, sb.sb_blocksize as usize),
+                )
+                .map_err(|e| e.errno())?;
+
                 // Update separator key in parent
-                let new_separator = BmbtKey { br_startoff: intermediate_mut.keys[0].br_startoff };
+                let new_separator = BmbtKey {
+                    br_startoff: intermediate_mut.keys[0].br_startoff,
+                };
                 self.keys[child_idx] = new_separator;
                 return Ok(());
             }
-            
+
             // Redistribute failed, try merge (merge current into left)
             left_intermediate_mut.merge_with(intermediate_mut);
-            
+
             // Write merged intermediate
             let left_hdr = BtreeLblockHdr {
                 blkno: left_ptr,
@@ -2385,26 +2571,36 @@ impl BtreeRoot {
                 owner: 0,
                 uuid: sb.sb_uuid.as_image_bytes(),
             };
-            tx.write_bytes(left_offset, &left_intermediate_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
-            
+            tx.write_bytes(
+                left_offset,
+                &left_intermediate_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize),
+            )
+            .map_err(|e| e.errno())?;
+
             // Remove current intermediate from parent
             self.keys.remove(child_idx);
             self.ptrs.remove(child_idx);
             self.bmdr.bb_numrecs = self.keys.len() as u16;
-            
+
             // Free the current intermediate block
             let agno = (child_ptr >> sb.sb_agblklog) as u32;
             let mask = u64::from(1u32 << sb.sb_agblklog) - 1;
             let start = (child_ptr & mask) as u32;
-            crate::libxfuse::alloc::allocator::free_in_group(tx, sb, agno, crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 }).map_err(|e| e.errno())?;
-            
+            crate::libxfuse::alloc::allocator::free_in_group(
+                tx,
+                sb,
+                agno,
+                crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 },
+            )
+            .map_err(|e| e.errno())?;
+
             return Ok(());
         }
-        
+
         // No siblings to merge with - just leave as is
         Ok(())
     }
-    
+
     #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     fn delete_extents_intermediate<R>(
@@ -2421,7 +2617,7 @@ impl BtreeRoot {
         R: bincode_next::de::read::Reader + BufRead + Seek,
     {
         let mut freed_blocks = Vec::new();
-        
+
         // Find all child indices that overlap with [startoff, endoff)
         let mut affected_children = Vec::new();
         for (idx, key) in intermediate.keys.iter().enumerate() {
@@ -2436,26 +2632,27 @@ impl BtreeRoot {
                 }
             }
         }
-        
+
         for &child_idx in &affected_children {
             let child_ptr = intermediate.ptrs[child_idx];
             let offset = sb.fsb_to_offset(child_ptr);
-            
+
             buf_reader
                 .seek(SeekFrom::Start(offset))
                 .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-            
+
             let mut child_bytes = vec![0u8; sb.sb_blocksize as usize];
             buf_reader
                 .read_exact(&mut child_bytes)
                 .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-            
+
             let child_level = intermediate.level() - 1;
-            
+
             if child_level == 0 {
                 // Child is a leaf
-                let mut leaf = BmbtLeafBlock::from_bytes(&child_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
-                
+                let mut leaf = BmbtLeafBlock::from_bytes(&child_bytes)
+                    .map_err(|_| crate::libxfuse::EUCLEAN)?;
+
                 let mut records_to_remove = Vec::new();
                 for (idx, record) in leaf.records.iter().enumerate() {
                     let rec_start = record.startoff();
@@ -2464,24 +2661,24 @@ impl BtreeRoot {
                         records_to_remove.push(idx);
                     }
                 }
-                
+
                 let mut need_merge = false;
                 for &idx in records_to_remove.iter().rev() {
                     let record = leaf.records[idx];
                     let rec_start = record.startoff();
                     let rec_end = rec_start + record.blockcount();
-                    
+
                     if rec_start >= startoff && rec_end <= endoff {
                         leaf.records.remove(idx);
                         freed_blocks.push((record.startblock(), record.blockcount() as u32));
                     }
                 }
-                
+
                 let min = BmbtLeafBlock::min_records(sb.sb_blocksize as usize, sb.has_crc());
                 if leaf.records.len() < min {
                     need_merge = true;
                 }
-                
+
                 // Write leaf back
                 let hdr = BtreeLblockHdr {
                     blkno: child_ptr,
@@ -2493,18 +2690,27 @@ impl BtreeRoot {
                 };
                 let leaf_bytes = leaf.to_bytes(&hdr, sb.sb_blocksize as usize);
                 tx.write_bytes(offset, &leaf_bytes).map_err(|e| e.errno())?;
-                
+
                 if need_merge {
                     // Need to merge with sibling
                 }
             } else {
                 // Recurse deeper
-                let mut child_intermediate: BtreeIntermediate = decode_from(buf_reader.by_ref()).map_err(|_| libc::EDESTADDRREQ)?;
-                let child_freed = self.delete_extents_intermediate(&mut child_intermediate, buf_reader, startoff, endoff, sb, tx, child_ptr)?;
+                let mut child_intermediate: BtreeIntermediate =
+                    decode_from(buf_reader.by_ref()).map_err(|_| libc::EDESTADDRREQ)?;
+                let child_freed = self.delete_extents_intermediate(
+                    &mut child_intermediate,
+                    buf_reader,
+                    startoff,
+                    endoff,
+                    sb,
+                    tx,
+                    child_ptr,
+                )?;
                 freed_blocks.extend(child_freed);
             }
         }
-        
+
         Ok(freed_blocks)
     }
 }
@@ -2547,7 +2753,7 @@ impl BtreeRoot {
         let sb = super::volume::try_superblock().ok_or(libc::ENODEV)?;
 
         let mut dblock = offset >> sb.sb_blocklog;
-        match self.map_block(buf_reader.by_ref(), dblock)? {
+        match self.map_block(buf_reader.by_ref(), dblock, true)? {
             (None, Some(len)) => {
                 // A hole, followed by data
                 if whence == libc::SEEK_HOLE {
@@ -2556,7 +2762,7 @@ impl BtreeRoot {
                     // It should be impossible to have two hole extents in a row.  But
                     // double-check.
                     debug_assert!(self
-                        .map_block(buf_reader.by_ref(), dblock + len)
+                        .map_block(buf_reader.by_ref(), dblock + len, true)
                         .unwrap()
                         .0
                         .is_some());
@@ -2574,7 +2780,7 @@ impl BtreeRoot {
                     // Scan for the next hole
                     dblock += len;
                     loop {
-                        match self.map_block(buf_reader.by_ref(), dblock)? {
+                        match self.map_block(buf_reader.by_ref(), dblock, true)? {
                             (Some(_fsblock), Some(len)) => {
                                 dblock += len;
                             }
@@ -2700,7 +2906,7 @@ impl BtreeIntermediate {
         b[64..68].copy_from_slice(&crc.to_le_bytes());
         b
     }
-    
+
     /// Deserialize an intermediate node from bytes.
     #[allow(dead_code)]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, FsError> {
@@ -2709,33 +2915,38 @@ impl BtreeIntermediate {
             .with_fixed_int_encoding();
         let reader = bincode_next::de::read::SliceReader::new(bytes);
         let mut decoder = bincode_next::de::DecoderImpl::new(reader, config, ());
-        
-        let hdr = XfsBmbtLblock::decode(&mut decoder).map_err(|e| {
-            FsError::corrupt(format!("intermediate node header: {e:?}"))
-        })?;
-        
+
+        let hdr = XfsBmbtLblock::decode(&mut decoder)
+            .map_err(|e| FsError::corrupt(format!("intermediate node header: {e:?}")))?;
+
         // Check magic
         if hdr.bb_magic != XFS_BMAP_CRC_MAGIC && hdr.bb_magic != XFS_BMAP_MAGIC {
             return Err(FsError::corrupt(format!(
-                "bad intermediate node magic 0x{:x}", hdr.bb_magic
+                "bad intermediate node magic 0x{:x}",
+                hdr.bb_magic
             )));
         }
-        
+
         let has_crc = hdr.bb_magic == XFS_BMAP_CRC_MAGIC;
         let max_children = BmbtInteriorBlock::max_children(bytes.len(), has_crc);
-        
+
         let mut keys = Vec::with_capacity(hdr.bb_numrecs as usize);
         for _ in 0..hdr.bb_numrecs {
-            keys.push(BmbtKey::decode(&mut decoder).map_err(|e| {
-                FsError::corrupt(format!("intermediate node key: {e:?}"))
-            })?);
+            keys.push(
+                BmbtKey::decode(&mut decoder)
+                    .map_err(|e| FsError::corrupt(format!("intermediate node key: {e:?}")))?,
+            );
         }
-        
+
         // Skip padding to pointers
-        let header_len = if has_crc { BMBT_CRC_HEADER_LEN } else { BMBT_HEADER_LEN };
+        let header_len = if has_crc {
+            BMBT_CRC_HEADER_LEN
+        } else {
+            BMBT_HEADER_LEN
+        };
         let keys_end = header_len + max_children * BmbtKey::SIZE;
         let ptrs_start = keys_end;
-        
+
         // We need to seek to the pointers position
         // Since we're using SliceReader, we need to manually skip
         // For simplicity, let's decode the rest manually
@@ -2743,11 +2954,11 @@ impl BtreeIntermediate {
         for i in 0..hdr.bb_numrecs as usize {
             let offset = ptrs_start + i * 8;
             if offset + 8 <= bytes.len() {
-                let ptr = u64::from_be_bytes(bytes[offset..offset+8].try_into().unwrap());
+                let ptr = u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap());
                 ptrs.push(ptr);
             }
         }
-        
+
         Ok(Self {
             hdr,
             keys,
@@ -2755,14 +2966,14 @@ impl BtreeIntermediate {
             blocks: RefCell::new(BtreeBlockCache::new(hdr.bb_level)),
         })
     }
-    
+
     /// Merge this node with another node (right sibling).
     #[allow(dead_code)]
     pub fn merge_with(&mut self, other: BtreeIntermediate) {
         self.keys.extend(other.keys);
         self.ptrs.extend(other.ptrs);
     }
-    
+
     /// Redistribute key-pointer pairs with a sibling to maintain minimum occupancy.
     #[allow(dead_code)]
     pub fn redistribute_with(&mut self, other: &mut BtreeIntermediate) -> bool {
@@ -2781,8 +2992,10 @@ impl BtreeIntermediate {
         let mut combined_sorted = combined;
         combined_sorted.sort_by_key(|(k, _)| k.br_startoff);
         let mid = combined_sorted.len() / 2;
-        let (new_self_keys, new_self_ptrs): (Vec<_>, Vec<_>) = combined_sorted[..mid].iter().cloned().unzip();
-        let (new_other_keys, new_other_ptrs): (Vec<_>, Vec<_>) = combined_sorted[mid..].iter().cloned().unzip();
+        let (new_self_keys, new_self_ptrs): (Vec<_>, Vec<_>) =
+            combined_sorted[..mid].iter().cloned().unzip();
+        let (new_other_keys, new_other_ptrs): (Vec<_>, Vec<_>) =
+            combined_sorted[mid..].iter().cloned().unzip();
         self.keys = new_self_keys;
         self.ptrs = new_self_ptrs;
         other.keys = new_other_keys;
@@ -2907,8 +3120,16 @@ impl BtreeLeaf {
     /// Return the extent, if any, that contains the given block within the file.
     /// Return its starting position as an FSblock, and its length in file system block units.
     /// If a hole's length extends to EoF, return None for length.
-    pub fn get_extent(&self, dblock: XfsFileoff) -> (Option<XfsFsblock>, Option<u64>) {
-        self.bmx.get_extent(dblock)
+    /// If `filter_unwritten` is true, unwritten extents (br_flag=true) are treated as holes.
+    pub fn get_extent(&self, dblock: XfsFileoff, filter_unwritten: bool) -> (Option<XfsFsblock>, Option<u64>) {
+        if filter_unwritten {
+            // Filter out unwritten extents for lseek purposes
+            let written_extents: Vec<BmbtRec> = self.bmx.extents().iter().filter(|e| !e.br_flag).cloned().collect();
+            let bmx = Bmx::from(written_extents);
+            bmx.get_extent(dblock)
+        } else {
+            self.bmx.get_extent(dblock)
+        }
     }
 }
 

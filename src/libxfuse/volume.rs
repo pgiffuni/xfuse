@@ -76,8 +76,8 @@ use crate::libxfuse::{
     alloc::free_space::FreeRun,
     bmbt_rec::BmbtRec,
     btree::{
-        BmbtInteriorBlock, BmbtKey, BmbtLeafBlock, BmbtLeafRecord, BtreeLblockHdr, BMBT_NULL_PTR,
-        Btree,
+        BmbtInteriorBlock, BmbtKey, BmbtLeafBlock, BmbtLeafRecord, Btree, BtreeLblockHdr,
+        BMBT_NULL_PTR,
     },
 };
 
@@ -466,7 +466,7 @@ impl Volume {
                 .get_file()
                 .map_err(FsError::from)?;
             let (Some(fsb), _) = file
-                .lookup(self.device.by_ref(), &sb, write_first)
+                .lookup(self.device.by_ref(), &sb, write_first, false)
                 .map_err(FsError::from)?
             else {
                 return Err(FsError::Corrupt {
@@ -523,7 +523,7 @@ impl Volume {
                 .get_file()
                 .map_err(FsError::from)?;
             let (Some(fsb), _) = file
-                .lookup(self.device.by_ref(), &sb, (size - 1) / blocksize)
+                .lookup(self.device.by_ref(), &sb, (size - 1) / blocksize, false)
                 .map_err(FsError::from)?
             else {
                 return Err(FsError::Corrupt {
@@ -941,20 +941,20 @@ impl Volume {
                  not derivable and has not been measured",
             ));
         }
-        
+
         // Try to add the entry
         let first_offset = if dir.entries.is_empty() {
             dir.header_len() as u16
         } else {
             dir.entries.last().unwrap().offset + SF_OFFSET_STEP
         };
-        
+
         // Try to add the entry to a test copy
         let mut test_dir = dir.clone();
         test_dir.add(name, ftype, child_ino, first_offset)?;
-        
+
         // Check if we need to transition to block directory
-if test_dir.needs_transition(&sb, &raw) {
+        if test_dir.needs_transition(&sb, &raw) {
             // For now, return ENOSYS since full implementation needs block allocation
             // which requires transaction context
             Err(FsError::unsupported(
@@ -1285,7 +1285,7 @@ if test_dir.needs_transition(&sb, &raw) {
                 let within = pos % blocksize;
                 let n = std::cmp::min(blocksize - within, end - pos);
                 let (start, len) = file
-                    .lookup(self.device.by_ref(), &self.sb, dblock)
+                    .lookup(self.device.by_ref(), &self.sb, dblock, false)
                     .map_err(|errno| FsError::invalid(errno, "extent lookup failed"))?;
                 let start = start.ok_or_else(|| {
                     FsError::invalid(
@@ -3360,7 +3360,7 @@ impl Filesystem for Volume {
                 reply.error(e.raw_os_error().unwrap_or(libc::EIO));
                 return;
             }
-            
+
             if dinode.di_core.di_format == XfsDinodeFmt::Btree {
                 let mut raw_inode = match RawDinode::from_bytes(peek) {
                     Ok(ri) => ri,
@@ -3387,7 +3387,13 @@ impl Filesystem for Volume {
                 let mut tx = self.begin();
 
                 // Delete extents in range
-                let freed = match btree_root.delete_extents_in_range(&mut buf_reader, startoff, endoff, &sb, &mut tx) {
+                let freed = match btree_root.delete_extents_in_range(
+                    &mut buf_reader,
+                    startoff,
+                    endoff,
+                    &sb,
+                    &mut tx,
+                ) {
                     Ok(f) => f,
                     Err(e) => {
                         tx.abort();
@@ -3401,7 +3407,12 @@ impl Filesystem for Volume {
                 for (fsb, len) in freed {
                     let ag = (fsb >> sb.sb_agblklog) as u32;
                     let start = (fsb & mask) as u32;
-                    if let Err(e) = crate::libxfuse::alloc::allocator::free_in_group(&mut tx, &sb, ag, crate::libxfuse::alloc::free_space::FreeRun { start, len }) {
+                    if let Err(e) = crate::libxfuse::alloc::allocator::free_in_group(
+                        &mut tx,
+                        &sb,
+                        ag,
+                        crate::libxfuse::alloc::free_space::FreeRun { start, len },
+                    ) {
                         tx.abort();
                         reply.error(e.errno());
                         return;
@@ -3440,7 +3451,7 @@ impl Filesystem for Volume {
                 let extents = match raw_inode.core_extents() {
                     Some(e) => e,
                     None => {
-                        reply.error(crate::libxfuse::ENODATA);
+                        reply.error(crate::libxfuse::ENOATTR);
                         return;
                     }
                 };
@@ -3460,7 +3471,12 @@ impl Filesystem for Volume {
                 for (fsb, len) in &freed {
                     let ag = (*fsb >> sb.sb_agblklog) as u32;
                     let start = (*fsb & mask) as u32;
-                    if let Err(e) = crate::libxfuse::alloc::allocator::free_in_group(&mut tx, &sb, ag, crate::libxfuse::alloc::free_space::FreeRun { start, len: *len }) {
+                    if let Err(e) = crate::libxfuse::alloc::allocator::free_in_group(
+                        &mut tx,
+                        &sb,
+                        ag,
+                        crate::libxfuse::alloc::free_space::FreeRun { start, len: *len },
+                    ) {
                         tx.abort();
                         reply.error(e.errno());
                         return;
@@ -3504,7 +3520,7 @@ impl Filesystem for Volume {
             reply.error(e.raw_os_error().unwrap_or(libc::EIO));
             return;
         }
-        
+
         if dinode.di_core.di_format == XfsDinodeFmt::Btree {
             let mut raw_inode = match RawDinode::from_bytes(peek) {
                 Ok(ri) => ri,
@@ -3529,17 +3545,19 @@ impl Filesystem for Volume {
 
             // Now start transaction and do the allocation
             let mut tx = self.begin();
-            
+
             // Allocate a chunk for each block in the range (simplified)
             for fblock in startoff..endoff {
                 // Check if this block already exists
-                match btree_root.map_block(&mut buf_reader, fblock) {
+                match btree_root.map_block(&mut buf_reader, fblock, false) {
                     Ok((Some(_), _)) => continue, // Block already allocated
                     Ok((None, _)) => {
                         // Need to allocate - use the allocator
                         // For simplicity, allocate in the first AG
                         let agno = 0;
-                        let run = match crate::libxfuse::alloc::allocator::allocate(&mut tx, &sb, agno, 1) {
+                        let run = match crate::libxfuse::alloc::allocator::allocate(
+                            &mut tx, &sb, agno, 1,
+                        ) {
                             Ok(r) => r,
                             Err(e) => {
                                 tx.abort();
@@ -3550,7 +3568,7 @@ impl Filesystem for Volume {
                         // Convert group-relative block to filesystem block: agno * sb_agblocks + agblock
                         let ag_base = u64::from(agno) * u64::from(sb.sb_agblocks);
                         let fsblock = ag_base + run.start as u64;
-                        
+
                         // Create extent record
                         let extent = crate::libxfuse::bmbt_rec::BmbtRec {
                             br_startoff: fblock,
@@ -3558,9 +3576,11 @@ impl Filesystem for Volume {
                             br_blockcount: 1,
                             br_flag: true, // Mark as unwritten (delayed allocation)
                         };
-                        
+
                         // Insert into btree
-                        if let Err(e) = btree_root.insert_extent(&mut buf_reader, extent, &sb, &mut tx) {
+                        if let Err(e) =
+                            btree_root.insert_extent(&mut buf_reader, extent, &sb, &mut tx)
+                        {
                             tx.abort();
                             reply.error(e);
                             return;
@@ -3604,14 +3624,14 @@ impl Filesystem for Volume {
 
             // Get current extents
             let extents = raw_inode.core_extents().unwrap_or_default();
-            
+
             // Start transaction
             let mut tx = self.begin();
 
             // Allocate blocks and build new extent list
             let mut new_extents = Vec::new();
             let mut extents_idx = 0;
-            
+
             for fblock in startoff..endoff {
                 // Find the extent covering this block (if any)
                 while extents_idx < extents.len() {
@@ -3631,16 +3651,16 @@ impl Filesystem for Volume {
                         break;
                     }
                 }
-                
+
                 // Check if we already added an extent covering this block
-                let already_allocated = new_extents.iter().any(|e| {
-                    e.br_startoff <= fblock && fblock < e.br_startoff + e.br_blockcount
-                });
-                
+                let already_allocated = new_extents
+                    .iter()
+                    .any(|e| e.br_startoff <= fblock && fblock < e.br_startoff + e.br_blockcount);
+
                 if already_allocated {
                     continue;
                 }
-                
+
                 // Need to allocate a block for this file block
                 // For simplicity, allocate in AG 0
                 let agno = 0;
@@ -3654,7 +3674,7 @@ impl Filesystem for Volume {
                 };
                 let ag_base = u64::from(agno) * u64::from(sb.sb_agblocks);
                 let fsblock = ag_base + run.start as u64;
-                
+
                 // Create extent record (try to coalesce with previous if adjacent)
                 let extent = crate::libxfuse::bmbt_rec::BmbtRec {
                     br_startoff: fblock,
@@ -3662,11 +3682,12 @@ impl Filesystem for Volume {
                     br_blockcount: 1,
                     br_flag: true, // Mark as unwritten (delayed allocation)
                 };
-                
+
                 // Simple coalescing: if last extent is adjacent, extend it
                 if let Some(last) = new_extents.last_mut() {
                     if last.br_startoff + last.br_blockcount == extent.br_startoff
-                        && last.br_startblock + last.br_blockcount == extent.br_startblock {
+                        && last.br_startblock + last.br_blockcount == extent.br_startblock
+                    {
                         last.br_blockcount += 1;
                     } else {
                         new_extents.push(extent);
@@ -3675,31 +3696,31 @@ impl Filesystem for Volume {
                     new_extents.push(extent);
                 }
             }
-            
+
             // Add any remaining extents
             while extents_idx < extents.len() {
                 new_extents.push(extents[extents_idx]);
                 extents_idx += 1;
             }
-            
+
             // Write new extent list back to inode
             if let Err(e) = raw_inode.set_core_extents(&new_extents) {
                 tx.abort();
                 reply.error(e.errno());
                 return;
             }
-            
+
             // Update inode metadata
             raw_inode.set_mtime(std::time::SystemTime::now());
             raw_inode.set_ctime(std::time::SystemTime::now());
             raw_inode.finalise();
-            
+
             if let Err(e) = tx.write_bytes(inode_offset, raw_inode.as_bytes()) {
                 tx.abort();
                 reply.error(e.errno());
                 return;
             }
-            
+
             if let Err(e) = tx.commit() {
                 reply.error(e.errno());
                 return;

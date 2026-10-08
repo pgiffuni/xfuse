@@ -1045,10 +1045,13 @@ impl RawDinode {
                 let mut left = *e;
                 left.br_blockcount = startoff - e.br_startoff;
                 kept.push(left);
-                
+
                 let freed_len = endoff - startoff;
-                freed.push((e.br_startblock + (startoff - e.br_startoff), freed_len as u32));
-                
+                freed.push((
+                    e.br_startblock + (startoff - e.br_startoff),
+                    freed_len as u32,
+                ));
+
                 let mut right = *e;
                 right.br_startoff = endoff;
                 right.br_startblock = e.br_startblock + (endoff - e.br_startoff);
@@ -1060,7 +1063,7 @@ impl RawDinode {
                 let kept_blocks = startoff - e.br_startoff;
                 trimmed.br_blockcount = kept_blocks;
                 kept.push(trimmed);
-                
+
                 let freed_len = end - startoff;
                 freed.push((e.br_startblock + kept_blocks, freed_len as u32));
             } else if end > endoff {
@@ -1069,7 +1072,7 @@ impl RawDinode {
                 let kept_blocks = endoff - e.br_startoff;
                 trimmed.br_blockcount = kept_blocks;
                 kept.push(trimmed);
-                
+
                 let freed_len = end - endoff;
                 freed.push((e.br_startblock + kept_blocks, freed_len as u32));
             } else {

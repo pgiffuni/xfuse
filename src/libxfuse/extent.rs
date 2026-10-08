@@ -142,18 +142,29 @@ impl ExtentMap {
     /// the block is in a hole — and how many blocks the run is long, counting
     /// from `block` itself.  For a hole that reaches the end of the file, the
     /// length runs to the end of the file.
+    /// If `filter_unwritten` is true, unwritten extents (br_flag=true) are treated as holes.
     pub fn lookup<R>(
         &self,
         buf_reader: &mut R,
         sb: &Sb,
         block: XfsFileoff,
+        filter_unwritten: bool,
     ) -> Result<(Option<XfsFsblock>, u64), i32>
     where
         R: BufRead + Reader + Seek,
     {
         let (start, len) = match self {
-            ExtentMap::Core { extents, .. } => extents.get_extent(block),
-            ExtentMap::Btree { btree, .. } => btree.map_block(buf_reader.by_ref(), block)?,
+            ExtentMap::Core { extents, .. } => {
+                if filter_unwritten {
+                    // Filter out unwritten extents for reading
+                    let written_extents: Vec<BmbtRec> = extents.extents().iter().filter(|e| !e.br_flag).cloned().collect();
+                    let bmx = Bmx::from(written_extents);
+                    bmx.get_extent(block)
+                } else {
+                    extents.get_extent(block)
+                }
+            }
+            ExtentMap::Btree { btree, .. } => btree.map_block(buf_reader.by_ref(), block, filter_unwritten)?,
         };
         let file_blocks = (self.size().max(0) as u64).div_ceil(sb.sb_blocksize as u64);
         // A run that reaches the end of the file has no extent to be bounded
@@ -213,9 +224,9 @@ mod t {
         let m = map(&[(0, 100, 4), (6, 200, 2)], 8 * 512);
         let sb = sb();
         let mut r = no_device();
-        assert_eq!(m.lookup(&mut r, &sb, 0), Ok((Some(100), 4)));
-        assert_eq!(m.lookup(&mut r, &sb, 3), Ok((Some(103), 1)));
-        assert_eq!(m.lookup(&mut r, &sb, 6), Ok((Some(200), 2)));
+        assert_eq!(m.lookup(&mut r, &sb, 0, false), Ok((Some(100), 4)));
+        assert_eq!(m.lookup(&mut r, &sb, 3, false), Ok((Some(103), 1)));
+        assert_eq!(m.lookup(&mut r, &sb, 6, false), Ok((Some(200), 2)));
     }
 
     /// A hole must be reported as a hole, with a length that runs to the next
@@ -226,9 +237,9 @@ mod t {
         let m = map(&[(2, 100, 4), (6, 200, 2)], 8 * 512);
         let sb = sb();
         let mut r = no_device();
-        assert_eq!(m.lookup(&mut r, &sb, 0), Ok((None, 2)));
-        assert_eq!(m.lookup(&mut r, &sb, 1), Ok((None, 1)));
-        assert_eq!(m.lookup(&mut r, &sb, 4), Ok((Some(102), 2)));
+        assert_eq!(m.lookup(&mut r, &sb, 0, false), Ok((None, 2)));
+        assert_eq!(m.lookup(&mut r, &sb, 1, false), Ok((None, 1)));
+        assert_eq!(m.lookup(&mut r, &sb, 4, false), Ok((Some(102), 2)));
     }
 
     /// A hole at the end of the file has no extent after it, so the end of the
@@ -238,19 +249,28 @@ mod t {
         let m = map(&[(0, 100, 4)], 16 * 512);
         let sb = sb();
         let mut r = no_device();
-        assert_eq!(m.lookup(&mut r, &sb, 4), Ok((None, 12)));
+        assert_eq!(m.lookup(&mut r, &sb, 4, false), Ok((None, 12)));
     }
 
-    /// A preallocated but unwritten extent is not data.
+    /// A preallocated but unwritten extent is visible in the extent map
+    /// (so the write path can convert it to written), but lseek still treats
+    /// it as a hole since it reads as zeroes.
     #[test]
-    fn unwritten_extent_is_a_hole() {
+    fn unwritten_extent_is_visible_in_map() {
         let mut prealloc = rec(2, 100, 4);
         prealloc.br_flag = true;
         let bmx = Bmx::from([rec(0, 50, 1), prealloc]);
         let m = ExtentMap::from_core(bmx, 16 * 512);
         let sb = sb();
         let mut r = no_device();
-        assert_eq!(m.lookup(&mut r, &sb, 2), Ok((None, 14)));
+        // Lookup now returns the unwritten extent (not a hole)
+        assert_eq!(m.lookup(&mut r, &sb, 2, false), Ok((Some(100), 4)));
+        // But lseek still treats it as a hole (reads as zeroes)
+        super::super::volume::SUPERBLOCK.get_or_init(|| sb);
+        let sb = super::super::volume::SUPERBLOCK.get().unwrap();
+        let bs = sb.sb_blocklog;
+        assert_eq!(m.lseek(&mut no_device(), 2 << bs, libc::SEEK_DATA), Err(libc::ENXIO));
+        assert_eq!(m.lseek(&mut no_device(), 2 << bs, libc::SEEK_HOLE), Ok(2 << bs));
     }
 
     /// Growing a file must not invent an extent; it only lengthens the hole at
@@ -260,10 +280,10 @@ mod t {
         let mut m = map(&[(0, 100, 4)], 4 * 512);
         let sb = sb();
         let mut r = no_device();
-        assert_eq!(m.lookup(&mut r, &sb, 4), Ok((None, 0)));
+        assert_eq!(m.lookup(&mut r, &sb, 4, false), Ok((None, 0)));
         m.set_size(16 * 512);
         assert_eq!(m.size(), 16 * 512);
-        assert_eq!(m.lookup(&mut r, &sb, 4), Ok((None, 12)));
+        assert_eq!(m.lookup(&mut r, &sb, 4, false), Ok((None, 12)));
         assert_eq!(m.core_extents().unwrap().len(), 1);
     }
 

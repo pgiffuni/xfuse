@@ -71,13 +71,9 @@ impl Bmx {
     where
         I: IntoIterator<Item = &'a BmbtRec>,
     {
-        // Filter out preallocated but unwritten extents.  This makes the lseek implementation much
-        // easier than if we try to consider the br_flag field in the lseek method itself.
-        let bmx = bmx
-            .into_iter()
-            .filter(|rec| !rec.br_flag)
-            .cloned()
-            .collect();
+        // Do not filter out unwritten extents; they should be visible to the
+        // write path so it can convert them to written when data is written.
+        let bmx = bmx.into_iter().cloned().collect();
         Self(bmx)
     }
 
@@ -105,7 +101,8 @@ impl Bmx {
                 let entry = &self.0[i - 1];
                 let skip = dblock - entry.br_startoff;
                 if entry.br_startoff + entry.br_blockcount > dblock {
-                    assert!(!entry.br_flag);
+                    // Return the extent even if it's unwritten (br_flag=true).
+                    // The caller is responsible for handling unwritten extents.
                     (
                         Some(entry.br_startblock + skip),
                         Some(entry.br_blockcount - skip),
@@ -130,27 +127,30 @@ impl Bmx {
         let sb = super::volume::try_superblock().ok_or(libc::ENODEV)?;
 
         let dblock = offset >> sb.sb_blocklog;
-        match self.0.partition_point(|entry| entry.br_startoff <= dblock) {
+        // Filter out unwritten extents for lseek purposes (they read as zeroes)
+        let written_extents: Vec<&BmbtRec> = self.0.iter().filter(|e| !e.br_flag).collect();
+        
+        match written_extents.partition_point(|entry| entry.br_startoff <= dblock) {
             0 => {
                 // A hole at the beginning of the file
                 if whence == libc::SEEK_HOLE {
                     Ok(offset)
                 } else {
-                    self.first()
+                    written_extents.first()
                         .map(|b| b.br_startoff << sb.sb_blocklog)
                         .ok_or(libc::ENXIO)
                 }
             }
             i => {
-                let cur_entry = &self.0[i - 1];
+                let cur_entry = written_extents[i - 1];
                 let br_end = cur_entry.br_startoff + cur_entry.br_blockcount;
                 if dblock < br_end {
                     // In a data region
                     if whence == libc::SEEK_HOLE {
                         // Scan for the next hole
-                        for j in (i - 1)..self.0.len() - 1 {
-                            let before = &self.0[j];
-                            let after = &self.0[j + 1];
+                        for j in (i - 1)..written_extents.len().saturating_sub(1) {
+                            let before = written_extents[j];
+                            let after = written_extents[j + 1];
                             let br_end = before.br_startoff + before.br_blockcount;
                             if after.br_startoff > br_end {
                                 return Ok(br_end << sb.sb_blocklog);
@@ -158,7 +158,7 @@ impl Bmx {
                         }
                         // Reached EOF without finding another hole.  Return the virtual hole at
                         // EOF
-                        let entry = self.0.last().unwrap();
+                        let entry = written_extents.last().unwrap();
                         let br_end = entry.br_startoff + entry.br_blockcount;
                         Ok(br_end << sb.sb_blocklog)
                     } else {
@@ -169,7 +169,7 @@ impl Bmx {
                     if whence == libc::SEEK_HOLE {
                         Ok(offset)
                     } else {
-                        match self.0.get(i) {
+                        match written_extents.get(i) {
                             Some(next_entry) => Ok(next_entry.br_startoff << sb.sb_blocklog),
                             None => Err(libc::ENXIO),
                         }
@@ -192,11 +192,10 @@ impl Bmx {
 }
 
 impl<I: IntoIterator<Item = BmbtRec>> From<I> for Bmx {
-    // The same as Bmx::new, but with an owned iterator
+    // Do not filter out unwritten extents; they should be visible to the
+    // write path so it can convert them to written when data is written.
     fn from(i: I) -> Self {
-        // Filter out preallocated but unwritten extents.  This makes the lseek implementation much
-        // easier than if we try to consider the br_flag field in the lseek method itself.
-        let bmx = i.into_iter().filter(|rec| !rec.br_flag).collect();
+        let bmx = i.into_iter().collect();
         Self(bmx)
     }
 }
@@ -235,7 +234,10 @@ mod tests {
 /// Encode a BmbtRec as a u128 with the same layout as decode.
 #[allow(clippy::items_after_test_module)]
 impl Encode for BmbtRec {
-    fn encode<E: bincode_next::enc::Encoder>(&self, encoder: &mut E) -> Result<(), bincode_next::error::EncodeError> {
+    fn encode<E: bincode_next::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> Result<(), bincode_next::error::EncodeError> {
         let mut br: u128 = 0;
         br |= (self.br_blockcount as u128) & ((1 << 21) - 1);
         br |= ((self.br_startblock as u128) & ((1 << 52) - 1)) << 21;

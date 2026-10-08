@@ -81,7 +81,7 @@ impl Dfork {
         match self {
             Dfork::Bmx(bmx) => bmx.map_dblock(dblock).ok_or(libc::ENOENT),
             Dfork::Btree(root) => root
-                .map_block(buf_reader, dblock.into())?
+                .map_block(buf_reader, dblock.into(), false)?
                 .0
                 .ok_or(libc::ENOENT),
         }

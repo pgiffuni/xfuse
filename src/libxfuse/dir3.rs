@@ -34,8 +34,7 @@ use std::{
 use bincode_next::{
     de::{read::Reader, Decoder},
     error::DecodeError,
-    Decode,
-    Encode,
+    Decode, Encode,
 };
 use fuser::FileType;
 use libc::c_int;
@@ -63,12 +62,12 @@ pub mod constants {
     pub const XFS_DIR3_FT_SYMLINK: u8 = 7;
     pub const XFS_DIR3_FT_WHT: u8 = 8;
 }
-pub use constants::*;
-pub use super::definitions::{XfsIno};
 pub use super::definitions::XfsDir2DataOff;
 pub use super::definitions::XfsDir2Dataptr;
+pub use super::definitions::XfsIno;
 #[allow(unused_imports)]
 pub use super::dir3_block::Dir2BlockTail;
+pub use constants::*;
 #[derive(Debug, Decode, Encode, Default)]
 pub struct Dir3BlkHdr {
     pub magic: u32,
@@ -107,7 +106,7 @@ pub struct Dir3DataHdr {
     pub best_free: [Dir2DataFree; constants::XFS_DIR2_DATA_FD_COUNT],
     pub pad: u32,
 }
- 
+
 impl Dir3DataHdr {
     pub const SIZE: u64 =
         Dir3BlkHdr::SIZE + constants::XFS_DIR2_DATA_FD_COUNT as u64 * Dir2DataFree::SIZE + 4;
