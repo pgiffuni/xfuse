@@ -546,6 +546,76 @@ error, because the group may be nearly empty and no retry helps).
 
 ---
 
+## 6.5. File data operations (truncate, fallocate, hole punching)
+
+**purpose.** Modify a file's extent map: grow (extend with zeroes/holes),
+shrink (free extents), preallocate (reserve space without writing), and
+punch holes (free interior extents, creating sparse regions).
+
+**DOCUMENTED (XFS Algorithms & Data Structures, §13–14).**
+* `truncate` walks the extent map, frees extents past the new size, and
+  updates `di_size`, `di_nblocks`, and the fork's extent list/tree.
+* `fallocate` (FALLOC_FL_KEEP_SIZE) allocates blocks for a range without
+  changing `di_size`; the allocated blocks are written as zeroes or marked as
+  unwritten (delayed allocation). `FALLOC_FL_PUNCH_HOLE` frees blocks in a
+  range, creating a hole.
+* Both operations must handle all fork formats: local (unlikely for data),
+  extents (in inode), and BMBT (B+ tree). The BMBT case requires locating
+  the affected leaves, modifying records, and propagating splits/merges.
+
+**invariants.**
+* A hole is represented by the *absence* of an extent record; there is no
+  explicit "hole extent".
+* `di_nblocks` counts allocated blocks only; it must decrease when extents
+  are freed.
+* An extent freed by `truncate`/`fallocate` returns to the group's free-space
+  trees (BNO/CNT) in the same transaction.
+
+**xfuse module.** `volume.rs` (`truncate`, `write_data`), `inode.rs`
+(`set_core_extents`, `add_extent`, `drop_extents_above`,
+`split_extents_above`, `set_data_extents_from_tree`), `btree.rs`
+(`BmbtLeafBlock`, `BmbtInteriorBlock`).
+
+**implemented.**
+
+* **`truncate` (shrink).** `Volume::truncate` in `volume.rs:1030` handles
+  both extents and BMBT formats. For extents format, it calls
+  `RawDinode::drop_extents_above` to free extents past the new size. For
+  BMBT format, it reads the full extent list via `BtreeRoot::all_extents`,
+  splits at the boundary with `RawDinode::split_extents_above`, writes the
+  survivors back into the inode (converting BMBT → extents if they fit), and
+  frees the original tree blocks via `free_in_group`. Updates `di_size`,
+  `di_nblocks`, `di_mtime`, `di_ctime` in one transaction.
+* **`truncate` (grow).** Extends `di_size` without allocating blocks; the
+  new region reads as zeroes.
+* **Hole detection.** `write_data` refuses to write into a hole; the caller
+  must use `fallocate` first (not yet implemented).
+
+**missing.**
+
+* **`fallocate` (FALLOC_FL_KEEP_SIZE).** Preallocate blocks for a range
+  without changing file size. Requires allocating blocks via
+  `allocate_new_chunk`, inserting extents into the fork (possibly triggering
+  BMBT insertion/split), and marking them as unwritten.
+* **`fallocate` (FALLOC_FL_PUNCH_HOLE).** Free blocks in a range, creating
+  a hole. Requires locating the affected extents, splitting if partial,
+  freeing the middle portion, and coalescing adjacent extents.
+* **Incremental BMBT insertion.** Needed for `fallocate` when the fork is
+  already a B+ tree (see §6 missing items).
+* **Extent coalescing.** Adjacent extent merging after insertion/deletion.
+* **Delayed allocation / unwritten extent flag.** XFS uses the extent flag
+  bit to mark allocated-but-unwritten extents; not yet implemented.
+
+**verified.**
+
+* `truncate` shrink verified by `xfs_repair -n` on generated images (write
+  tests: `a_file_made_shorter_gives_its_blocks_back`, `a_grown_file_leaves_the_image_consistent`).
+* `truncate` grow verified by write tests.
+* Hole refusal in `write_data` verified by test `write_to_directory_is_refused` (wrong type)
+  and the fact that holes cannot be written to without allocation.
+
+---
+
 ## 7. Directories
 
 **purpose.** Map names to inode numbers, supporting the format transitions
@@ -698,6 +768,10 @@ the leaf). Attribute names are hashed for the dabtree index.
 * **Shortform attribute mutation.** `AttrShortform::set` and `AttrShortform::remove`
   for shortform attribute forks: add/replace/remove attributes in the inode's
   attribute fork, update total size, serialize back to inode.
+* **`setxattr` / `removexattr` for shortform attributes.** Integrated with FUSE
+  operations in `volume.rs`: parse namespace prefix (user./trusted./secure.),
+  mutate shortform attribute fork, serialize, write inode via transaction.
+  Return `ENOSYS` for leaf/node/B-tree attribute formats.
 
 **IMPLEMENTED BUT NOT INTEGRATED** — format transitions:
 * **`setxattr` / `removexattr` for leaf/node/B-tree attributes.** Return `ENOSYS`
