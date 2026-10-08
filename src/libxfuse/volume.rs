@@ -3354,14 +3354,15 @@ impl Filesystem for Volume {
 
         if punch_hole {
             // Punch hole: free blocks in [offset, end)
+            // Read the inode first (before transaction)
+            let mut peek = vec![0u8; inode_size];
+            if let Err(e) = self.device.device().read_at(&mut peek, inode_offset) {
+                reply.error(e.raw_os_error().unwrap_or(libc::EIO));
+                return;
+            }
+            
             if dinode.di_core.di_format == XfsDinodeFmt::Btree {
-                // Read the inode to get the btree root (before transaction)
-                let mut peek = vec![0u8; inode_size];
-                if let Err(e) = self.device.device().read_at(&mut peek, inode_offset) {
-                    reply.error(e.raw_os_error().unwrap_or(libc::EIO));
-                    return;
-                }
-let mut raw_inode = match RawDinode::from_bytes(peek) {
+                let mut raw_inode = match RawDinode::from_bytes(peek) {
                     Ok(ri) => ri,
                     Err(e) => {
                         reply.error(e.errno());
@@ -3425,29 +3426,93 @@ let mut raw_inode = match RawDinode::from_bytes(peek) {
                     return;
                 }
                 reply.ok();
-            } else {
-                // Extents format - use existing truncate logic but for a range
-                reply.error(libc::ENOSYS);
-            }
-            return;
-        }
-
-        // KEEP_SIZE (with or without ZERO_RANGE): allocate blocks for [offset, end)
-        // without changing file size
-        if dinode.di_core.di_format == XfsDinodeFmt::Btree {
-            // Read the inode to get the btree root (before transaction)
-            let mut peek = vec![0u8; inode_size];
-            if let Err(e) = self.device.device().read_at(&mut peek, inode_offset) {
-                reply.error(e.raw_os_error().unwrap_or(libc::EIO));
-                return;
-            }
-let mut raw_inode = match RawDinode::from_bytes(peek) {
+            } else if dinode.di_core.di_format == XfsDinodeFmt::Extents {
+                // Extents format: punch hole by modifying extent list in inode
+                let mut raw_inode = match RawDinode::from_bytes(peek) {
                     Ok(ri) => ri,
                     Err(e) => {
                         reply.error(e.errno());
                         return;
                     }
                 };
+
+                // Get current extents
+                let extents = match raw_inode.core_extents() {
+                    Some(e) => e,
+                    None => {
+                        reply.error(libc::ENODATA);
+                        return;
+                    }
+                };
+
+                // Split extents at startoff and endoff
+                let (kept, freed) = RawDinode::split_extents_in_range(&extents, startoff, endoff);
+                if freed.is_empty() {
+                    reply.ok();
+                    return;
+                }
+
+                // Start transaction
+                let mut tx = self.begin();
+
+                // Free the blocks in the allocator
+                let mask = u64::from(1u32 << sb.sb_agblklog) - 1;
+                for (fsb, len) in &freed {
+                    let ag = (*fsb >> sb.sb_agblklog) as u32;
+                    let start = (*fsb & mask) as u32;
+                    if let Err(e) = crate::libxfuse::alloc::allocator::free_in_group(&mut tx, &sb, ag, crate::libxfuse::alloc::free_space::FreeRun { start, len: *len }) {
+                        tx.abort();
+                        reply.error(e.errno());
+                        return;
+                    }
+                }
+
+                // Write kept extents back to inode
+                if let Err(e) = raw_inode.set_core_extents(&kept) {
+                    tx.abort();
+                    reply.error(e.errno());
+                    return;
+                }
+
+                // Update inode metadata
+                raw_inode.set_mtime(std::time::SystemTime::now());
+                raw_inode.set_ctime(std::time::SystemTime::now());
+                raw_inode.finalise();
+
+                if let Err(e) = tx.write_bytes(inode_offset, raw_inode.as_bytes()) {
+                    tx.abort();
+                    reply.error(e.errno());
+                    return;
+                }
+
+                if let Err(e) = tx.commit() {
+                    reply.error(e.errno());
+                    return;
+                }
+                reply.ok();
+            } else {
+                reply.error(libc::ENOTSUP);
+            }
+            return;
+        }
+
+        // KEEP_SIZE (with or without ZERO_RANGE): allocate blocks for [offset, end)
+        // without changing file size
+        // Read the inode first (before transaction)
+        let mut peek = vec![0u8; inode_size];
+        if let Err(e) = self.device.device().read_at(&mut peek, inode_offset) {
+            reply.error(e.raw_os_error().unwrap_or(libc::EIO));
+            return;
+        }
+        
+        if dinode.di_core.di_format == XfsDinodeFmt::Btree {
+            let mut raw_inode = match RawDinode::from_bytes(peek) {
+                Ok(ri) => ri,
+                Err(e) => {
+                    reply.error(e.errno());
+                    return;
+                }
+            };
 
             let btree_root_result = raw_inode.data_btree_root();
             let mut btree_root = match btree_root_result {
@@ -3527,9 +3592,121 @@ let mut raw_inode = match RawDinode::from_bytes(peek) {
                 return;
             }
             reply.ok();
+        } else if dinode.di_core.di_format == XfsDinodeFmt::Extents {
+            // Extents format: allocate blocks by adding to extent list in inode
+            let mut raw_inode = match RawDinode::from_bytes(peek) {
+                Ok(ri) => ri,
+                Err(e) => {
+                    reply.error(e.errno());
+                    return;
+                }
+            };
+
+            // Get current extents
+            let extents = raw_inode.core_extents().unwrap_or_default();
+            
+            // Start transaction
+            let mut tx = self.begin();
+
+            // Allocate blocks and build new extent list
+            let mut new_extents = Vec::new();
+            let mut extents_idx = 0;
+            
+            for fblock in startoff..endoff {
+                // Find the extent covering this block (if any)
+                while extents_idx < extents.len() {
+                    let e = extents[extents_idx];
+                    let end = e.br_startoff + e.br_blockcount;
+                    if end <= fblock {
+                        // This extent is before the block - keep it
+                        new_extents.push(e);
+                        extents_idx += 1;
+                    } else if e.br_startoff <= fblock && fblock < end {
+                        // Block already allocated in this extent - keep extent
+                        new_extents.push(e);
+                        extents_idx += 1;
+                        break;
+                    } else {
+                        // Next extent is after this block
+                        break;
+                    }
+                }
+                
+                // Check if we already added an extent covering this block
+                let already_allocated = new_extents.iter().any(|e| {
+                    e.br_startoff <= fblock && fblock < e.br_startoff + e.br_blockcount
+                });
+                
+                if already_allocated {
+                    continue;
+                }
+                
+                // Need to allocate a block for this file block
+                // For simplicity, allocate in AG 0
+                let agno = 0;
+                let run = match crate::libxfuse::alloc::allocator::allocate(&mut tx, &sb, agno, 1) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tx.abort();
+                        reply.error(e.errno());
+                        return;
+                    }
+                };
+                let ag_base = u64::from(agno) * u64::from(sb.sb_agblocks);
+                let fsblock = ag_base + run.start as u64;
+                
+                // Create extent record (try to coalesce with previous if adjacent)
+                let extent = crate::libxfuse::bmbt_rec::BmbtRec {
+                    br_startoff: fblock,
+                    br_startblock: fsblock,
+                    br_blockcount: 1,
+                    br_flag: false,
+                };
+                
+                // Simple coalescing: if last extent is adjacent, extend it
+                if let Some(last) = new_extents.last_mut() {
+                    if last.br_startoff + last.br_blockcount == extent.br_startoff
+                        && last.br_startblock + last.br_blockcount == extent.br_startblock {
+                        last.br_blockcount += 1;
+                    } else {
+                        new_extents.push(extent);
+                    }
+                } else {
+                    new_extents.push(extent);
+                }
+            }
+            
+            // Add any remaining extents
+            while extents_idx < extents.len() {
+                new_extents.push(extents[extents_idx]);
+                extents_idx += 1;
+            }
+            
+            // Write new extent list back to inode
+            if let Err(e) = raw_inode.set_core_extents(&new_extents) {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+            
+            // Update inode metadata
+            raw_inode.set_mtime(std::time::SystemTime::now());
+            raw_inode.set_ctime(std::time::SystemTime::now());
+            raw_inode.finalise();
+            
+            if let Err(e) = tx.write_bytes(inode_offset, raw_inode.as_bytes()) {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+            
+            if let Err(e) = tx.commit() {
+                reply.error(e.errno());
+                return;
+            }
+            reply.ok();
         } else {
-            // Extents format
-            reply.error(libc::ENOSYS);
+            reply.error(libc::ENOTSUP);
         }
     }
 

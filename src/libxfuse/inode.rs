@@ -1011,6 +1011,75 @@ impl RawDinode {
         (kept, freed)
     }
 
+    /// Which of a file's extents survive a hole punch in [startoff, endoff),
+    /// and which blocks that frees.
+    ///
+    /// An extent wholly below startoff or wholly at/above endoff is kept.
+    /// An extent wholly inside [startoff, endoff) is freed.
+    /// An extent straddling startoff is trimmed at the front.
+    /// An extent straddling endoff is trimmed at the end.
+    /// An extent spanning the entire range is split into two kept extents
+    /// with a hole in the middle.
+    pub fn split_extents_in_range(
+        extents: &[BmbtRec],
+        startoff: u64,
+        endoff: u64,
+    ) -> (Vec<BmbtRec>, Vec<(u64, u32)>) {
+        let mut kept: Vec<BmbtRec> = Vec::new();
+        let mut freed: Vec<(u64, u32)> = Vec::new();
+        for e in extents {
+            let end = e.br_startoff + e.br_blockcount;
+            if end <= startoff {
+                // Entirely before hole - keep
+                kept.push(*e);
+                continue;
+            }
+            if e.br_startoff >= endoff {
+                // Entirely after hole - keep
+                kept.push(*e);
+                continue;
+            }
+            // Overlaps with hole
+            if e.br_startoff < startoff && end > endoff {
+                // Spans the entire hole - split into two kept extents
+                let mut left = *e;
+                left.br_blockcount = startoff - e.br_startoff;
+                kept.push(left);
+                
+                let freed_len = endoff - startoff;
+                freed.push((e.br_startblock + (startoff - e.br_startoff), freed_len as u32));
+                
+                let mut right = *e;
+                right.br_startoff = endoff;
+                right.br_startblock = e.br_startblock + (endoff - e.br_startoff);
+                right.br_blockcount = end - endoff;
+                kept.push(right);
+            } else if e.br_startoff < startoff {
+                // Straddles startoff - trim front
+                let mut trimmed = *e;
+                let kept_blocks = startoff - e.br_startoff;
+                trimmed.br_blockcount = kept_blocks;
+                kept.push(trimmed);
+                
+                let freed_len = end - startoff;
+                freed.push((e.br_startblock + kept_blocks, freed_len as u32));
+            } else if end > endoff {
+                // Straddles endoff - trim end
+                let mut trimmed = *e;
+                let kept_blocks = endoff - e.br_startoff;
+                trimmed.br_blockcount = kept_blocks;
+                kept.push(trimmed);
+                
+                let freed_len = end - endoff;
+                freed.push((e.br_startblock + kept_blocks, freed_len as u32));
+            } else {
+                // Fully inside hole - free entirely
+                freed.push((e.br_startblock, e.br_blockcount as u32));
+            }
+        }
+        (kept, freed)
+    }
+
     /// The root of a data fork that is a B+tree, decoded from the inode.
     ///
     /// The mirror of what `Dinode` does when it reads the same fork, and in the
