@@ -3256,6 +3256,209 @@ impl Filesystem for Volume {
             }
         }
     }
+
+    fn setxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        if !self.writable {
+            reply.error(libc::EROFS);
+            return;
+        }
+
+        let mut nameparts = name.as_bytes().splitn(2, |c| *c == b'.');
+        let _namespace = nameparts.next().unwrap();
+        let name = OsStr::from_bytes(nameparts.next().unwrap());
+
+        // Get the inode and do attribute operations before starting the transaction
+        let (xfs_ino, attr_bytes) = {
+            let oi = &mut self.open_files.get_mut(&ino).unwrap();
+            self.device.set_bufsize(self.sb.sb_blocksize as usize);
+
+            // Get the inode number first
+            let xfs_ino = oi.dinode.di_core.di_ino;
+
+            // Get the attribute fork
+            let attrs = match oi.dinode.get_attrs(self.device.by_ref(), &self.sb) {
+                Some(attrs) => attrs,
+                None => {
+                    reply.error(crate::libxfuse::ENOATTR);
+                    return;
+                }
+            };
+
+            // Set the attribute
+            match attrs.set(self.device.by_ref(), &self.sb, name, value, flags as u32) {
+                Ok(_) => {}
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
+            }
+
+            // Serialize the attribute fork
+            let attr_bytes = match attrs.serialize(&self.sb) {
+                Ok(b) => b,
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
+            };
+
+            (xfs_ino, attr_bytes)
+        };
+
+        // Extract superblock values needed during the transaction.
+        let sb = self.sb;
+        let inode_offset = sb.inode_offset(xfs_ino);
+        let inode_size = sb.inode_size();
+
+        // Start a transaction
+        let mut tx = self.begin();
+
+        // Read the raw inode bytes
+        let raw_inode_bytes = match tx.read_bytes(inode_offset, inode_size) {
+            Ok(b) => b,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+
+        // Create a RawDinode from the bytes
+        let mut raw_inode = match RawDinode::from_bytes(raw_inode_bytes) {
+            Ok(ri) => ri,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+
+        // Write the attribute bytes back to the inode
+        if let Err(e) = raw_inode.set_attr_bytes(&attr_bytes) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        // Write the inode back to disk
+        if let Err(e) = tx.write_bytes(inode_offset, raw_inode.as_bytes()) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        if let Err(e) = tx.commit() {
+            reply.error(e.errno());
+            return;
+        }
+        reply.ok();
+    }
+
+    fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        if !self.writable {
+            reply.error(libc::EROFS);
+            return;
+        }
+
+        let mut nameparts = name.as_bytes().splitn(2, |c| *c == b'.');
+        let _namespace = nameparts.next().unwrap();
+        let name = OsStr::from_bytes(nameparts.next().unwrap());
+
+        // Get the inode and do attribute operations before starting the transaction
+        let (xfs_ino, attr_bytes) = {
+            let oi = &mut self.open_files.get_mut(&ino).unwrap();
+            self.device.set_bufsize(self.sb.sb_blocksize as usize);
+
+            // Get the inode number first
+            let xfs_ino = oi.dinode.di_core.di_ino;
+
+            // Get the attribute fork
+            let attrs = match oi.dinode.get_attrs(self.device.by_ref(), &self.sb) {
+                Some(attrs) => attrs,
+                None => {
+                    reply.error(crate::libxfuse::ENOATTR);
+                    return;
+                }
+            };
+
+            // Remove the attribute
+            match attrs.remove(self.device.by_ref(), &self.sb, name) {
+                Ok(_) => {}
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
+            }
+
+            // Serialize the attribute fork
+            let attr_bytes = match attrs.serialize(&self.sb) {
+                Ok(b) => b,
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
+            };
+
+            (xfs_ino, attr_bytes)
+        };
+
+        // Extract superblock values needed during the transaction.
+        let sb = self.sb;
+        let inode_offset = sb.inode_offset(xfs_ino);
+        let inode_size = sb.inode_size();
+
+        // Start a transaction
+        let mut tx = self.begin();
+
+        // Read the raw inode bytes
+        let raw_inode_bytes = match tx.read_bytes(inode_offset, inode_size) {
+            Ok(b) => b,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+
+        // Create a RawDinode from the bytes
+        let mut raw_inode = match RawDinode::from_bytes(raw_inode_bytes) {
+            Ok(ri) => ri,
+            Err(e) => {
+                tx.abort();
+                reply.error(e.errno());
+                return;
+            }
+        };
+
+        // Write the attribute bytes back to the inode
+        if let Err(e) = raw_inode.set_attr_bytes(&attr_bytes) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        // Write the inode back to disk
+        if let Err(e) = tx.write_bytes(inode_offset, raw_inode.as_bytes()) {
+            tx.abort();
+            reply.error(e.errno());
+            return;
+        }
+
+        if let Err(e) = tx.commit() {
+            reply.error(e.errno());
+            return;
+        }
+        reply.ok();
+    }
 }
 
 #[cfg(test)]
