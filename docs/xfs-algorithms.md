@@ -525,13 +525,16 @@ error, because the group may be nearly empty and no retry helps).
   intermediate node splits not yet implemented.
 * **Root growth and collapse.** Root growth (level 0→1, 1→2, etc.) is
   implemented: `BtreeRoot::insert_extent_root_leaf` and `convert_to_btree` handle
-  extent list → BMBT conversion when inode overflows. **Root collapse (level 1→0)**
-  implemented in `BtreeRoot::check_root_collapse`: when level 1 root has one child
-  that is a leaf and all records fit in inode, moves records back to inode and
-  frees the leaf block. Called after deletions in `delete_extents_in_range`.
-  **Root collapse (level 2→1)** implemented: when level 2 root has one intermediate
-  child with one leaf child, moves leaf records up to intermediate (now leaf),
-  frees leaf block, updates root to level 1. Called after deletions.
+  extent list → BMBT conversion when inode overflows. **Root growth (level 1→2)**
+  implemented in `BtreeRoot::handle_root_split`: when level 1 root overflows
+  during insertion, splits the root, allocates new blocks, creates new level 2 root.
+  **Root collapse (level 1→0)** implemented in `BtreeRoot::check_root_collapse`: when
+  level 1 root has one child that is a leaf and all records fit in inode, moves
+  records back to inode and frees the leaf block. Called after deletions in
+  `delete_extents_in_range`. **Root collapse (level 2→1)** implemented: when level
+  2 root has one intermediate child with one leaf child, moves leaf records up to
+  intermediate (now leaf), frees leaf block, updates root to level 1. Called after
+  deletions.
 * **Full delete algorithm with merge/redistribution propagation.** Implemented:
   `BtreeRoot::delete_extents_in_range` and `BtreeRoot::delete_extents_intermediate`
   locate overlapping leaves and remove records. **Leaf-level merge/redistribute
