@@ -1153,18 +1153,153 @@ impl BtreeRoot {
     #[allow(dead_code)]
     fn insert_extent_root_leaf<R>(
         &mut self,
-        _buf_reader: &mut R,
-        _record: BmbtLeafRecord,
-        _sb: &Sb,
-        _tx: &mut Transaction<'_>,
+        buf_reader: &mut R,
+        record: BmbtLeafRecord,
+        sb: &Sb,
+        tx: &mut Transaction<'_>,
     ) -> Result<(), i32>
     where
         R: bincode_next::de::read::Reader + BufRead + Seek,
     {
         // The root is currently a leaf (records in the inode).
         // This case requires converting the inode from extent list format to BMBT format.
-        // For now, return ENOSYS as this is a significant format change.
+        // We need to:
+        // 1. Read current extents from the inode
+        // 2. Allocate a new leaf block
+        // 3. Write extents to the leaf block
+        // 4. Update the inode's root to point to the new leaf (level 1)
+        
+        // Get current extents from the inode
+        let extents = self.all_extents_from_inode(sb)?;
+        if extents.is_empty() {
+            // No extents yet - just insert the new record
+            return self.insert_extent_root_leaf_empty(buf_reader, record, sb, tx);
+        }
+        
+        // Insert the new record into the extent list first
+        let mut all_extents = extents;
+        let new_extent = BmbtLeafRecord::as_extent(&record);
+        // Find insertion point
+        let insert_idx = all_extents.partition_point(|e| e.br_startoff < new_extent.br_startoff);
+        all_extents.insert(insert_idx, new_extent);
+        
+        // Check if all extents fit in inode
+        let max_inode_extents = self.max_inode_extents(sb);
+        if all_extents.len() <= max_inode_extents {
+            // Still fits in inode - write back to inode
+            return self.write_extents_to_inode(&all_extents, sb, tx);
+        }
+        
+        // Need to convert to BMBT: allocate leaf block, write extents, update root
+        self.convert_to_btree(buf_reader, &all_extents, sb, tx)
+    }
+    
+    /// Insert when root is empty (level 0, no extents)
+    #[allow(dead_code)]
+    fn insert_extent_root_leaf_empty<R>(
+        &mut self,
+        _buf_reader: &mut R,
+        record: BmbtLeafRecord,
+        sb: &Sb,
+        tx: &mut Transaction<'_>,
+    ) -> Result<(), i32>
+    where
+        R: bincode_next::de::read::Reader + BufRead + Seek,
+    {
+        // Just write the single extent to the inode
+        let extents = vec![record.as_extent()];
+        self.write_extents_to_inode(&extents, sb, tx)
+    }
+    
+    /// Maximum number of extents that fit in an inode's data fork
+    fn max_inode_extents(&self, sb: &Sb) -> usize {
+        let fork_size = self.inode_fork_size(sb);
+        fork_size / BMBT_RECORD_LEN
+    }
+    
+    /// Size of the inode's data fork in bytes
+    fn inode_fork_size(&self, sb: &Sb) -> usize {
+        // The data fork starts after the inode core and attribute fork
+        // For simplicity, use a reasonable estimate based on inode size
+        let inode_size = sb.inode_size();
+        let core_size = 176; // size of di_core
+        let attr_fork_size = if self.bmdr.bb_level == 0 && self.bmdr.bb_numrecs == 0 {
+            0
+        } else {
+            (self.bmdr.bb_numrecs as usize) * BMBT_RECORD_LEN
+        };
+        inode_size.saturating_sub(core_size + attr_fork_size)
+    }
+    
+    /// Write extents directly to inode (extent list format)
+    fn write_extents_to_inode(
+        &mut self,
+        _extents: &[BmbtRec],
+        _sb: &Sb,
+        _tx: &mut Transaction<'_>,
+    ) -> Result<(), i32>
+    {
+        // This would write the extent list back to the inode
+        // For now, return ENOSYS as this requires inode-level coordination
         Err(libc::ENOSYS)
+    }
+    
+    /// Convert from extent list format to BMBT format
+    fn convert_to_btree<R>(
+        &mut self,
+        _buf_reader: &mut R,
+        extents: &[BmbtRec],
+        sb: &Sb,
+        tx: &mut Transaction<'_>,
+    ) -> Result<(), i32>
+    where
+        R: bincode_next::de::read::Reader + BufRead + Seek,
+    {
+        // Allocate a new leaf block
+        let agno = 0; // TODO: choose AG intelligently
+        let run_opt = allocate_in_group(tx, sb, agno, 1).map_err(|e| e.errno())?;
+        let run = run_opt.ok_or(libc::ENOSPC)?;
+        let leaf_block = (agno as u64 * sb.sb_agblocks as u64) + run.start as u64;
+        
+        // Create leaf block with all extents
+        let leaf = BmbtLeafBlock {
+            level: 0,
+            records: extents.iter().map(BmbtLeafRecord::from_extent).collect(),
+        };
+        
+        // Write leaf block
+        let leaf_hdr = BtreeLblockHdr {
+            blkno: leaf_block,
+            lsn: 0,
+            leftsib: BMBT_NULL_PTR,
+            rightsib: BMBT_NULL_PTR,
+            owner: 0,
+            uuid: sb.sb_uuid.as_image_bytes(),
+        };
+        let leaf_bytes = leaf.to_bytes(&leaf_hdr, sb.sb_blocksize as usize);
+        tx.write_bytes(sb.fsb_to_offset(leaf_block), &leaf_bytes).map_err(|e| e.errno())?;
+        
+        // Update root to point to leaf (level 1)
+        self.bmdr.bb_level = 1;
+        self.bmdr.bb_numrecs = 1;
+        self.keys = vec![BmbtKey { br_startoff: leaf.records[0].startoff() }];
+        self.ptrs = vec![leaf_block];
+        
+        // Note: The inode itself needs to be updated with the new root
+        // This requires coordination with the inode write path
+        Ok(())
+    }
+    
+    /// Get all extents from the inode's root (for level 0)
+    fn all_extents_from_inode(&self, _sb: &Sb) -> Result<Vec<BmbtRec>, i32> {
+        // For level 0 root, the keys ARE the extent records
+        // but they're stored in the inode's literal area
+        // This is a simplified implementation
+        // The key's startoff is the extent's startoff
+        // But we don't have the full extent data in the key
+        // This would need to read from the inode's extent list
+        // For now, return empty
+        Ok(Vec::<BmbtRec>::new())
     }
     
     /// Recursive insertion for multi-level trees (level >= 1)
