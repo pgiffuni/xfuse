@@ -1525,8 +1525,8 @@ impl BtreeRoot {
                     }
                 }
                 
-                // For now, just remove whole records that are fully in range
-                // A full implementation would split partial records
+                // For now, handle partial overlaps by splitting records
+                // A full implementation would also handle merge/redistribute
                 let mut need_merge = false;
                 for &idx in records_to_remove.iter().rev() {
                     let record = leaf.records[idx];
@@ -1537,8 +1537,56 @@ impl BtreeRoot {
                         // Record fully in range - remove it
                         leaf.records.remove(idx);
                         freed_blocks.push((record.startblock(), record.blockcount() as u32));
+                    } else if rec_start < startoff && rec_end > endoff {
+                        // Record spans the entire hole - split into two
+                        let left_extent = BmbtRec {
+                            br_startoff: rec_start,
+                            br_startblock: record.startblock(),
+                            br_blockcount: startoff - rec_start,
+                            br_flag: record.extent_flag(),
+                        };
+                        let right_extent = BmbtRec {
+                            br_startoff: endoff,
+                            br_startblock: record.startblock() + (endoff - rec_start),
+                            br_blockcount: rec_end - endoff,
+                            br_flag: record.extent_flag(),
+                        };
+                        leaf.records.remove(idx);
+                        leaf.records.insert(idx, BmbtLeafRecord::from_extent(&left_extent));
+                        leaf.records.insert(idx + 1, BmbtLeafRecord::from_extent(&right_extent));
+                        
+                        let freed_len = endoff - startoff;
+                        freed_blocks.push((record.startblock() + (startoff - rec_start), freed_len as u32));
+                    } else if rec_start < startoff && rec_end > startoff {
+                        // Straddles startoff - trim front
+                        let kept_blocks = startoff - rec_start;
+                        let trimmed_extent = BmbtRec {
+                            br_startoff: rec_start,
+                            br_startblock: record.startblock(),
+                            br_blockcount: kept_blocks,
+                            br_flag: record.extent_flag(),
+                        };
+                        leaf.records.remove(idx);
+                        leaf.records.insert(idx, BmbtLeafRecord::from_extent(&trimmed_extent));
+                        
+                        let freed_len = rec_end - startoff;
+                        freed_blocks.push((record.startblock() + kept_blocks, freed_len as u32));
+                    } else if rec_start < endoff && rec_end > endoff {
+                        // Straddles endoff - trim end
+                        let kept_blocks = endoff - rec_start;
+                        let trimmed_extent = BmbtRec {
+                            br_startoff: rec_start,
+                            br_startblock: record.startblock(),
+                            br_blockcount: kept_blocks,
+                            br_flag: record.extent_flag(),
+                        };
+                        leaf.records.remove(idx);
+                        leaf.records.insert(idx, BmbtLeafRecord::from_extent(&trimmed_extent));
+                        
+                        let freed_len = rec_end - endoff;
+                        freed_blocks.push((record.startblock() + kept_blocks, freed_len as u32));
                     }
-                    // Partial overlap - not handled yet
+                    // Fully inside case already handled above
                 }
                 
                 let min = BmbtLeafBlock::min_records(sb.sb_blocksize as usize, sb.has_crc());
