@@ -527,15 +527,14 @@ error, because the group may be nearly empty and no retry helps).
   implemented only as part of bulk construction; incremental root growth
   during a single-extent insert is not yet implemented. Root collapse
   (level 2→1, 1→0) is not implemented.
-* **Full delete algorithm with merge/redistribution propagation.** Partially
-  implemented: `BtreeRoot::delete_extents_in_range` and
-  `BtreeRoot::delete_extents_intermediate` locate overlapping leaves and
-  remove fully-contained records. Leaf and interior `remove_*` methods exist
-  and signal when merge/redistribution is needed. **Leaf-level merge/redistribute
-  propagation is now implemented** in `BtreeRoot::handle_leaf_underflow`: tries
-  right sibling first, then left sibling; attempts redistribution, falls back
-  to merge; updates parent separator keys; frees merged block. Intermediate
-  node merge/redistribution propagation and root collapse not yet implemented.
+* **Full delete algorithm with merge/redistribution propagation.** Implemented:
+  `BtreeRoot::delete_extents_in_range` and `BtreeRoot::delete_extents_intermediate`
+  locate overlapping leaves and remove records. **Leaf-level merge/redistribute
+  propagation** in `BtreeRoot::handle_leaf_underflow`: tries right sibling first,
+  then left; attempts redistribution, falls back to merge; updates parent
+  separator keys; frees merged block. **Intermediate node merge/redistribute
+  propagation** in `BtreeRoot::handle_intermediate_underflow`: same logic for
+  intermediate nodes. Root collapse not yet implemented.
 * **Extent coalescing/splitting.** Adjacent extent merging and extent
   splitting during insertion/deletion is not implemented.
 * **CRC updates for v5 nodes.** Implemented in all `to_bytes` methods
@@ -559,6 +558,9 @@ error, because the group may be nearly empty and no retry helps).
   inserts key-pointer pair, splits on overflow, returns new node and separator.
 * **Intermediate node merge/redistribute.** `merge_with` and
   `redistribute_with` for intermediate nodes implemented.
+* **Intermediate node merge/redistribute propagation.** Implemented in
+  `BtreeRoot::handle_intermediate_underflow`: same sibling selection and
+  redistribution/merge logic as leaves, propagates separator key updates up.
 
 ---
 

@@ -53,6 +53,7 @@ use num_traits::{PrimInt, Unsigned};
 use super::{
     bmbt_rec::{BmbtRec, Bmx},
     definitions::{XfsFileoff, XfsFsblock, XfsIno, XFS_BMAP_CRC_MAGIC, XFS_BMAP_MAGIC},
+    error::FsError,
     sb::Sb,
     utils::{decode, decode_from, Uuid},
     volume::SUPERBLOCK,
@@ -1619,7 +1620,7 @@ impl BtreeRoot {
                 // Check if intermediate needs merge/redistribute
                 let min = BmbtInteriorBlock::min_children(sb.sb_blocksize as usize, sb.has_crc());
                 if intermediate.keys.len() < min {
-                    // Need to merge with sibling - not implemented yet
+                    self.handle_intermediate_underflow(child_idx, child_ptr, &intermediate, sb, tx, buf_reader)?;
                 }
             }
         }
@@ -1783,6 +1784,162 @@ impl BtreeRoot {
         Ok(())
     }
     
+    /// Handle intermediate node underflow after deletion by trying to redistribute or merge with sibling.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    fn handle_intermediate_underflow<R>(
+        &mut self,
+        child_idx: usize,
+        child_ptr: XfsFsblock,
+        intermediate: &BtreeIntermediate,
+        sb: &Sb,
+        tx: &mut Transaction<'_>,
+        buf_reader: &mut R,
+    ) -> Result<(), i32>
+    where
+        R: bincode_next::de::read::Reader + BufRead + Seek,
+    {
+        // Try right sibling first
+        if child_idx + 1 < self.ptrs.len() {
+            let right_ptr = self.ptrs[child_idx + 1];
+            let right_offset = sb.fsb_to_offset(right_ptr);
+            
+            buf_reader.seek(SeekFrom::Start(right_offset)).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            let mut right_bytes = vec![0u8; sb.sb_blocksize as usize];
+            buf_reader.read_exact(&mut right_bytes).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            
+            let mut right_intermediate = BtreeIntermediate::from_bytes(&right_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+            
+            // Try redistribute
+            let mut intermediate_mut = intermediate.clone();
+            if intermediate_mut.redistribute_with(&mut right_intermediate) {
+                // Write both intermediates back
+                let left_hdr = BtreeLblockHdr {
+                    blkno: child_ptr,
+                    lsn: 0,
+                    leftsib: BMBT_NULL_PTR,
+                    rightsib: BMBT_NULL_PTR,
+                    owner: 0,
+                    uuid: sb.sb_uuid.as_image_bytes(),
+                };
+                let right_hdr = BtreeLblockHdr {
+                    blkno: right_ptr,
+                    lsn: 0,
+                    leftsib: BMBT_NULL_PTR,
+                    rightsib: BMBT_NULL_PTR,
+                    owner: 0,
+                    uuid: sb.sb_uuid.as_image_bytes(),
+                };
+                tx.write_bytes(sb.fsb_to_offset(child_ptr), &intermediate_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
+                tx.write_bytes(right_offset, &right_intermediate.to_bytes(&right_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
+                
+                // Update separator key in parent
+                let new_separator = BmbtKey { br_startoff: right_intermediate.keys[0].br_startoff };
+                self.keys[child_idx + 1] = new_separator;
+                return Ok(());
+            }
+            
+            // Redistribute failed, try merge (merge right into left)
+            intermediate_mut.merge_with(right_intermediate);
+            
+            // Write merged intermediate
+            let left_hdr = BtreeLblockHdr {
+                blkno: child_ptr,
+                lsn: 0,
+                leftsib: BMBT_NULL_PTR,
+                rightsib: BMBT_NULL_PTR,
+                owner: 0,
+                uuid: sb.sb_uuid.as_image_bytes(),
+            };
+            tx.write_bytes(sb.fsb_to_offset(child_ptr), &intermediate_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
+            
+            // Remove the right sibling from parent
+            self.keys.remove(child_idx + 1);
+            self.ptrs.remove(child_idx + 1);
+            self.bmdr.bb_numrecs = self.keys.len() as u16;
+            
+            // Free the right sibling block
+            let agno = (right_ptr >> sb.sb_agblklog) as u32;
+            let mask = u64::from(1u32 << sb.sb_agblklog) - 1;
+            let start = (right_ptr & mask) as u32;
+            crate::libxfuse::alloc::allocator::free_in_group(tx, sb, agno, crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 }).map_err(|e| e.errno())?;
+            
+            return Ok(());
+        }
+        
+        // Try left sibling
+        if child_idx > 0 {
+            let left_ptr = self.ptrs[child_idx - 1];
+            let left_offset = sb.fsb_to_offset(left_ptr);
+            
+            buf_reader.seek(SeekFrom::Start(left_offset)).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            let mut left_bytes = vec![0u8; sb.sb_blocksize as usize];
+            buf_reader.read_exact(&mut left_bytes).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            
+            let left_intermediate = BtreeIntermediate::from_bytes(&left_bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+            
+            // Try redistribute
+            let mut left_intermediate_mut = left_intermediate.clone();
+            let mut intermediate_mut = intermediate.clone();
+            if left_intermediate_mut.redistribute_with(&mut intermediate_mut) {
+                // Write both intermediates back
+                let left_hdr = BtreeLblockHdr {
+                    blkno: left_ptr,
+                    lsn: 0,
+                    leftsib: BMBT_NULL_PTR,
+                    rightsib: BMBT_NULL_PTR,
+                    owner: 0,
+                    uuid: sb.sb_uuid.as_image_bytes(),
+                };
+                let right_hdr = BtreeLblockHdr {
+                    blkno: child_ptr,
+                    lsn: 0,
+                    leftsib: BMBT_NULL_PTR,
+                    rightsib: BMBT_NULL_PTR,
+                    owner: 0,
+                    uuid: sb.sb_uuid.as_image_bytes(),
+                };
+                tx.write_bytes(left_offset, &left_intermediate_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
+                tx.write_bytes(sb.fsb_to_offset(child_ptr), &intermediate_mut.to_bytes(&right_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
+                
+                // Update separator key in parent
+                let new_separator = BmbtKey { br_startoff: intermediate_mut.keys[0].br_startoff };
+                self.keys[child_idx] = new_separator;
+                return Ok(());
+            }
+            
+            // Redistribute failed, try merge (merge current into left)
+            left_intermediate_mut.merge_with(intermediate_mut);
+            
+            // Write merged intermediate
+            let left_hdr = BtreeLblockHdr {
+                blkno: left_ptr,
+                lsn: 0,
+                leftsib: BMBT_NULL_PTR,
+                rightsib: BMBT_NULL_PTR,
+                owner: 0,
+                uuid: sb.sb_uuid.as_image_bytes(),
+            };
+            tx.write_bytes(left_offset, &left_intermediate_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize)).map_err(|e| e.errno())?;
+            
+            // Remove current intermediate from parent
+            self.keys.remove(child_idx);
+            self.ptrs.remove(child_idx);
+            self.bmdr.bb_numrecs = self.keys.len() as u16;
+            
+            // Free the current intermediate block
+            let agno = (child_ptr >> sb.sb_agblklog) as u32;
+            let mask = u64::from(1u32 << sb.sb_agblklog) - 1;
+            let start = (child_ptr & mask) as u32;
+            crate::libxfuse::alloc::allocator::free_in_group(tx, sb, agno, crate::libxfuse::alloc::free_space::FreeRun { start, len: 1 }).map_err(|e| e.errno())?;
+            
+            return Ok(());
+        }
+        
+        // No siblings to merge with - just leave as is
+        Ok(())
+    }
+    
     #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     fn delete_extents_intermediate<R>(
@@ -1887,7 +2044,7 @@ impl BtreeRoot {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum BtreeBlockCache {
     Intermediate(BTreeMap<usize, BtreeIntermediate>),
     Leaf(BTreeMap<usize, BtreeLeaf>),
@@ -2021,7 +2178,7 @@ enum BtreeChild {
 }
 
 /// An intermediate Btree.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BtreeIntermediate {
     hdr: XfsBmbtLblock,
     keys: Vec<BmbtKey>,
@@ -2077,6 +2234,95 @@ impl BtreeIntermediate {
         let crc = crc32c_without_its_own_field(&b, 64);
         b[64..68].copy_from_slice(&crc.to_le_bytes());
         b
+    }
+    
+    /// Deserialize an intermediate node from bytes.
+    #[allow(dead_code)]
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, FsError> {
+        let config = bincode_next::config::standard()
+            .with_big_endian()
+            .with_fixed_int_encoding();
+        let reader = bincode_next::de::read::SliceReader::new(bytes);
+        let mut decoder = bincode_next::de::DecoderImpl::new(reader, config, ());
+        
+        let hdr = XfsBmbtLblock::decode(&mut decoder).map_err(|e| {
+            FsError::corrupt(format!("intermediate node header: {e:?}"))
+        })?;
+        
+        // Check magic
+        if hdr.bb_magic != XFS_BMAP_CRC_MAGIC && hdr.bb_magic != XFS_BMAP_MAGIC {
+            return Err(FsError::corrupt(format!(
+                "bad intermediate node magic 0x{:x}", hdr.bb_magic
+            )));
+        }
+        
+        let has_crc = hdr.bb_magic == XFS_BMAP_CRC_MAGIC;
+        let max_children = BmbtInteriorBlock::max_children(bytes.len(), has_crc);
+        
+        let mut keys = Vec::with_capacity(hdr.bb_numrecs as usize);
+        for _ in 0..hdr.bb_numrecs {
+            keys.push(BmbtKey::decode(&mut decoder).map_err(|e| {
+                FsError::corrupt(format!("intermediate node key: {e:?}"))
+            })?);
+        }
+        
+        // Skip padding to pointers
+        let header_len = if has_crc { BMBT_CRC_HEADER_LEN } else { BMBT_HEADER_LEN };
+        let keys_end = header_len + max_children * BmbtKey::SIZE;
+        let ptrs_start = keys_end;
+        
+        // We need to seek to the pointers position
+        // Since we're using SliceReader, we need to manually skip
+        // For simplicity, let's decode the rest manually
+        let mut ptrs = Vec::with_capacity(hdr.bb_numrecs as usize);
+        for i in 0..hdr.bb_numrecs as usize {
+            let offset = ptrs_start + i * 8;
+            if offset + 8 <= bytes.len() {
+                let ptr = u64::from_be_bytes(bytes[offset..offset+8].try_into().unwrap());
+                ptrs.push(ptr);
+            }
+        }
+        
+        Ok(Self {
+            hdr,
+            keys,
+            ptrs,
+            blocks: RefCell::new(BtreeBlockCache::new(hdr.bb_level)),
+        })
+    }
+    
+    /// Merge this node with another node (right sibling).
+    #[allow(dead_code)]
+    pub fn merge_with(&mut self, other: BtreeIntermediate) {
+        self.keys.extend(other.keys);
+        self.ptrs.extend(other.ptrs);
+    }
+    
+    /// Redistribute key-pointer pairs with a sibling to maintain minimum occupancy.
+    #[allow(dead_code)]
+    pub fn redistribute_with(&mut self, other: &mut BtreeIntermediate) -> bool {
+        let total = self.keys.len() + other.keys.len();
+        if total < 2 * BmbtInteriorBlock::min_children(0, false) {
+            // Can't redistribute while maintaining minimum
+            return false;
+        }
+        // Combine and split evenly
+        let mut all_keys = self.keys.clone();
+        all_keys.append(&mut other.keys);
+        let mut all_ptrs = self.ptrs.clone();
+        all_ptrs.append(&mut other.ptrs);
+        // Re-sort by key
+        let combined: Vec<_> = all_keys.into_iter().zip(all_ptrs).collect();
+        let mut combined_sorted = combined;
+        combined_sorted.sort_by_key(|(k, _)| k.br_startoff);
+        let mid = combined_sorted.len() / 2;
+        let (new_self_keys, new_self_ptrs): (Vec<_>, Vec<_>) = combined_sorted[..mid].iter().cloned().unzip();
+        let (new_other_keys, new_other_ptrs): (Vec<_>, Vec<_>) = combined_sorted[mid..].iter().cloned().unzip();
+        self.keys = new_self_keys;
+        self.ptrs = new_self_ptrs;
+        other.keys = new_other_keys;
+        other.ptrs = new_other_ptrs;
+        true
     }
 
     /// Insert an extent record into this intermediate node's subtree.
@@ -2187,7 +2433,7 @@ impl<Ctx> Decode<Ctx> for BtreeIntermediate {
 }
 
 /// A Leaf Btree.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BtreeLeaf {
     bmx: Bmx,
 }
