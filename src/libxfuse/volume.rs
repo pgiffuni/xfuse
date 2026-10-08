@@ -3440,7 +3440,7 @@ impl Filesystem for Volume {
                 let extents = match raw_inode.core_extents() {
                     Some(e) => e,
                     None => {
-                        reply.error(libc::ENODATA);
+                        reply.error(crate::libxfuse::ENODATA);
                         return;
                     }
                 };

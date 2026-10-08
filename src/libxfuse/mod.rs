@@ -84,6 +84,18 @@ cfg_if! {
         const ENOATTR: i32 = libc::ENODATA;
     }
 }
+cfg_if! {
+    if #[cfg(target_os = "freebsd")] {
+        // FreeBSD doesn't have ENODATA in libc; use 61 (same as Linux)
+        const ENODATA_VAL: i32 = 61;
+    } else if #[cfg(target_os = "linux")] {
+        const ENODATA_VAL: i32 = libc::ENODATA;
+    } else {
+        const ENODATA_VAL: i32 = 61;
+    }
+}
+
+pub const ENODATA: i32 = ENODATA_VAL;
 
 /// The errno to report for a file system that is damaged.
 ///
