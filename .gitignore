@@ -4,3 +4,4 @@ build/
 .*.swp
 resources/xfs.img
 resources/*.img
+.kilo/
