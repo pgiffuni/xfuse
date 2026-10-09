@@ -40,8 +40,8 @@ use fuser::{
         FOPEN_CACHE_DIR, FOPEN_KEEP_CACHE, FUSE_ASYNC_READ, FUSE_EXPORT_SUPPORT,
         FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT,
     },
-    Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, FUSE_ROOT_ID,
+    Filesystem, KernelConfig, ReplyAttr, ReplyBmap, ReplyCreate, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, FUSE_ROOT_ID,
 };
 use libc::{ERANGE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK};
 // fallocate(2) mode flags (from linux/falloc.h)
@@ -59,7 +59,7 @@ use super::{
     block_device::{Access, BlockDevice},
     block_reader::BlockReader,
     capabilities::FsCapabilities,
-    definitions::{XfsIno, XFS_DINODE_MAGIC},
+    definitions::{XfsFsblock, XfsIno, XFS_DINODE_MAGIC},
     dinode::Dinode,
     dinode_core::XfsDinodeFmt,
     dir3::{
@@ -76,8 +76,8 @@ use crate::libxfuse::{
     alloc::free_space::FreeRun,
     bmbt_rec::BmbtRec,
     btree::{
-        BmbtInteriorBlock, BmbtKey, BmbtLeafBlock, BmbtLeafRecord, Btree, BtreeLblockHdr,
-        BMBT_NULL_PTR,
+        BmbtInteriorBlock, BmbtKey, BmbtLeafBlock, BmbtLeafRecord, BmdrBlock, Btree,
+        BtreeLblockHdr, BtreeRoot, BMBT_NULL_PTR,
     },
 };
 
@@ -3425,8 +3425,17 @@ impl Filesystem for Volume {
                     }
                 }
 
-                // Update inode size, nblocks, times
-                let blocks: u64 = btree_root.keys.iter().map(|_| 0).sum(); // placeholder - need to recalculate
+                // Update inode
+                // Recalculate blocks from the btree extent map
+                let bmx = match btree_root.all_extents(&mut buf_reader) {
+                    Ok(tuple) => tuple.0,
+                    Err(e) => {
+                        tx.abort();
+                        reply.error(e);
+                        return;
+                    }
+                };
+                let blocks: u64 = bmx.extents().iter().map(|e| e.br_blockcount).sum();
                 raw_inode.set_nblocks(blocks);
                 raw_inode.set_mtime(std::time::SystemTime::now());
                 raw_inode.set_ctime(std::time::SystemTime::now());
@@ -3548,7 +3557,6 @@ impl Filesystem for Volume {
                 }
             };
 
-            // Create a separate reader for tree operations (doesn't conflict with transaction)
             let device_arc = self.device.device();
             let mut buf_reader = BlockReader::from_device(device_arc);
 
@@ -3604,7 +3612,16 @@ impl Filesystem for Volume {
             }
 
             // Update inode
-            let blocks: u64 = btree_root.keys.iter().map(|_| 0).sum(); // placeholder
+            // Recalculate blocks from the btree extent map
+            let bmx = match btree_root.all_extents(&mut buf_reader) {
+                Ok(tuple) => tuple.0,
+                Err(e) => {
+                    tx.abort();
+                    reply.error(e);
+                    return;
+                }
+            };
+            let blocks: u64 = bmx.extents().iter().map(|e| e.br_blockcount).sum();
             raw_inode.set_nblocks(blocks);
             raw_inode.set_mtime(std::time::SystemTime::now());
             raw_inode.set_ctime(std::time::SystemTime::now());
@@ -3738,6 +3755,129 @@ impl Filesystem for Volume {
         } else {
             reply.error(libc::ENOTSUP);
         }
+    }
+
+    fn bmap(&mut self, _req: &Request<'_>, ino: u64, blocksize: u32, idx: u64, reply: ReplyBmap) {
+        if blocksize == 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
+        let oi = match self.open_files.get(&ino) {
+            Some(oi) => oi,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let dinode = &oi.dinode;
+        let format = dinode.di_core.di_format;
+        if !matches!(format, XfsDinodeFmt::Extents | XfsDinodeFmt::Btree) {
+            reply.error(libc::ENOTSUP);
+            return;
+        }
+
+        if dinode.is_realtime() {
+            reply.error(libc::ENOTSUP);
+            return;
+        }
+
+        let sb = self.sb;
+        let xfs_ino = dinode.di_core.di_ino;
+        let inode_offset = sb.inode_offset(xfs_ino);
+        let inode_size = sb.inode_size();
+
+        // Convert file block index (idx) to file block offset
+        // The FUSE bmap blocksize may differ from the filesystem blocksize
+        let fs_blocksize = u64::from(sb.sb_blocksize);
+        let file_block = (idx * u64::from(blocksize)) / fs_blocksize;
+
+        let phys_block: Result<Option<XfsFsblock>, i32> = {
+            let mut result = Err(libc::ENOTSUP);
+            match dinode.di_core.di_format {
+                XfsDinodeFmt::Extents => {
+                    let mut peek = vec![0u8; inode_size];
+                    if let Err(_e) = self.device.device().read_at(&mut peek, inode_offset) {
+                        result = Err(libc::EIO);
+                    } else {
+                        let mut dinode = Dinode::from_bytes(&peek, &sb, xfs_ino);
+                        let file = dinode.get_file();
+                        if let Ok(file) = file {
+                            result = match file.lookup(self.device.by_ref(), &sb, file_block, false)
+                            {
+                                Ok((Some(block), _)) => Ok(Some(block)),
+                                Ok((None, _)) => Ok(None),
+                                Err(errno) => Err(errno),
+                            };
+                        } else if let Err(e) = file {
+                            result = Err(e);
+                        }
+                    }
+                }
+                XfsDinodeFmt::Btree => {
+                    let mut peek = vec![0u8; inode_size];
+                    if let Err(_e) = self.device.device().read_at(&mut peek, inode_offset) {
+                        result = Err(libc::EIO);
+                    } else {
+                        match RawDinode::from_bytes(peek) {
+                            Ok(raw_inode) => {
+                                let root = match raw_inode.data_btree_root() {
+                                    Ok(mut r) => {
+                                        r.set_owner(xfs_ino);
+                                        r
+                                    }
+                                    Err(e) => {
+                                        result = Err(e.errno());
+                                        BtreeRoot::new(
+                                            BmdrBlock::default(),
+                                            Vec::new(),
+                                            Vec::new(),
+                                            None,
+                                        )
+                                    }
+                                };
+                                if result.is_ok() {
+                                    let mut buf_reader =
+                                        BlockReader::from_device(self.device.device());
+                                    let map_result =
+                                        root.map_block(&mut buf_reader, file_block, false);
+                                    result = map_result.map(|(block, _)| block);
+                                }
+                            }
+                            Err(e) => {
+                                result = Err(e.errno());
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    result = Err(libc::ENOTSUP);
+                }
+            }
+            result
+        };
+
+        let phys_block = match phys_block {
+            Ok(block) => block,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+
+        let Some(phys_fsblock) = phys_block else {
+            // Hole in the file
+            reply.error(libc::ENOENT);
+            return;
+        };
+
+        // Convert filesystem block to device sector (512-byte sectors for BMAP)
+        let sector_size = 512u64;
+        let phys_offset = sb.fsb_to_offset(phys_fsblock);
+        let sector = phys_offset / sector_size;
+
+        reply.bmap(sector);
     }
 
     fn setxattr(

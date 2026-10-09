@@ -1059,7 +1059,7 @@ impl BmbtLeafBlock {
     }
 }
 
-#[derive(Debug, Clone, Decode)]
+#[derive(Debug, Clone, Decode, Default)]
 pub struct BmdrBlock {
     pub bb_level: u16,
     pub bb_numrecs: u16,
