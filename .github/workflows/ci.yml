@@ -43,7 +43,10 @@ jobs:
         shell: freebsd {0}
         run: |
           . $HOME/.cargo/env
-          cargo test
+          # FUSE tests mount and unmount kernels filesystems in parallel, which
+          # can exhaust mount table entries or leave stale mounts on FreeBSD VMs.
+          # Serial execution avoids mount-point conflicts.
+          cargo test -- --test-threads=1
       - name: No test is registered twice
         shell: freebsd {0}
         run: |
