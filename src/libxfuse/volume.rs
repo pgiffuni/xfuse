@@ -3296,6 +3296,13 @@ impl Filesystem for Volume {
             return;
         }
 
+        // Compute xfs_ino before borrowing self mutably via open_files.
+        let xfs_ino = self.xfs_ino(ino);
+        let sb = self.sb;
+        let blocksize = u64::from(sb.sb_blocksize);
+        let inode_size = sb.inode_size();
+        let inode_offset = sb.inode_offset(xfs_ino);
+
         let oi = match self.open_files.get_mut(&ino) {
             Some(oi) => oi,
             None => {
@@ -3337,19 +3344,14 @@ impl Filesystem for Volume {
             return;
         }
 
-        // PUNCH_HOLE cannot be combined with other modes
-        if punch_hole && (keep_size || zero_range) {
+        // PUNCH_HOLE requires KEEP_SIZE (per Linux fallocate API) and cannot
+        // be combined with ZERO_RANGE
+        if punch_hole && (!keep_size || zero_range) {
             reply.error(libc::EINVAL);
             return;
         }
 
         let end = offset.saturating_add(length);
-
-        let sb = self.sb;
-        let blocksize = u64::from(sb.sb_blocksize);
-        let inode_size = sb.inode_size();
-        let xfs_ino = dinode.di_core.di_ino;
-        let inode_offset = sb.inode_offset(xfs_ino);
 
         // Convert byte offsets to file block offsets
         let startoff = offset.div_ceil(blocksize);
@@ -3426,17 +3428,18 @@ impl Filesystem for Volume {
                 }
 
                 // Update inode
-                // Recalculate blocks from the btree extent map
-                let bmx = match btree_root.all_extents(&mut buf_reader) {
-                    Ok(tuple) => tuple.0,
+                // Recalculate blocks from the btree extent map (through tx to see uncommitted writes)
+                let (bmx, nodes) = match btree_root.all_extents_tx(&mut tx) {
+                    Ok(tuple) => tuple,
                     Err(e) => {
                         tx.abort();
                         reply.error(e);
                         return;
                     }
                 };
-                let blocks: u64 = bmx.extents().iter().map(|e| e.br_blockcount).sum();
-                raw_inode.set_nblocks(blocks);
+                let data_blocks: u64 = bmx.extents().iter().map(|e| e.br_blockcount).sum();
+                raw_inode.set_nblocks(data_blocks + nodes.len() as u64);
+                raw_inode.set_nextents(bmx.extents().len() as u64);
                 raw_inode.set_mtime(std::time::SystemTime::now());
                 raw_inode.set_ctime(std::time::SystemTime::now());
                 raw_inode.finalise();
@@ -3591,7 +3594,7 @@ impl Filesystem for Volume {
                             br_startoff: fblock,
                             br_startblock: fsblock,
                             br_blockcount: 1,
-                            br_flag: true, // Mark as unwritten (delayed allocation)
+                            br_flag: false,
                         };
 
                         // Insert into btree
@@ -3612,17 +3615,18 @@ impl Filesystem for Volume {
             }
 
             // Update inode
-            // Recalculate blocks from the btree extent map
-            let bmx = match btree_root.all_extents(&mut buf_reader) {
-                Ok(tuple) => tuple.0,
+            // Recalculate blocks from the btree extent map (through tx to see uncommitted writes)
+            let (bmx, nodes) = match btree_root.all_extents_tx(&mut tx) {
+                Ok(tuple) => tuple,
                 Err(e) => {
                     tx.abort();
                     reply.error(e);
                     return;
                 }
             };
-            let blocks: u64 = bmx.extents().iter().map(|e| e.br_blockcount).sum();
-            raw_inode.set_nblocks(blocks);
+            let data_blocks: u64 = bmx.extents().iter().map(|e| e.br_blockcount).sum();
+            raw_inode.set_nblocks(data_blocks + nodes.len() as u64);
+            raw_inode.set_nextents(bmx.extents().len() as u64);
             raw_inode.set_mtime(std::time::SystemTime::now());
             raw_inode.set_ctime(std::time::SystemTime::now());
             raw_inode.finalise();
@@ -3706,7 +3710,7 @@ impl Filesystem for Volume {
                     br_startoff: fblock,
                     br_startblock: fsblock,
                     br_blockcount: 1,
-                    br_flag: true, // Mark as unwritten (delayed allocation)
+                    br_flag: false,
                 };
 
                 // Simple coalescing: if last extent is adjacent, extend it

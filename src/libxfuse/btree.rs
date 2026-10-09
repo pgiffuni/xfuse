@@ -476,6 +476,20 @@ impl BmbtInteriorBlock {
         b
     }
 
+    /// Serialize this node for the file system described by `has_crc`.
+    pub fn to_bytes_auto(
+        &self,
+        hdr: &BtreeLblockHdr,
+        sb_blocksize: usize,
+        has_crc: bool,
+    ) -> Vec<u8> {
+        if has_crc {
+            self.to_bytes(hdr, sb_blocksize)
+        } else {
+            self.to_bytes_v4(hdr.leftsib, hdr.rightsib, sb_blocksize)
+        }
+    }
+
     /// Insert a key-pointer pair into this intermediate node, returning the split result if it overflows.
     /// Returns None if inserted without splitting, or Some((new_node, separator_key)) if split.
     #[allow(dead_code)]
@@ -745,6 +759,20 @@ impl BmbtLeafBlock {
         let crc = crc32c_without_its_own_field(&b, 64);
         b[64..68].copy_from_slice(&crc.to_le_bytes());
         b
+    }
+
+    /// Serialize this leaf for the file system described by `has_crc`.
+    pub fn to_bytes_auto(
+        &self,
+        hdr: &BtreeLblockHdr,
+        sb_blocksize: usize,
+        has_crc: bool,
+    ) -> Vec<u8> {
+        if has_crc {
+            self.to_bytes(hdr, sb_blocksize)
+        } else {
+            self.to_bytes_v4(hdr.leftsib, hdr.rightsib, sb_blocksize)
+        }
     }
 
     /// The most records a leaf can hold in one block of this shape.
@@ -1243,6 +1271,43 @@ impl BtreeRoot {
         }
         Ok((Bmx::new(&out), nodes))
     }
+
+    /// Like [`all_extents`](Self::all_extents), but reads blocks through the
+    /// transaction cache so it sees uncommitted writes.
+    pub fn all_extents_tx(
+        &self,
+        tx: &mut Transaction<'_>,
+    ) -> Result<(Bmx, Vec<XfsFsblock>), i32> {
+        let _sb = super::volume::try_superblock().ok_or(libc::ENODEV)?;
+        let mut out: Vec<BmbtRec> = Vec::new();
+        let mut nodes: Vec<XfsFsblock> = Vec::new();
+        let mut stack: Vec<(Vec<XfsBmbtPtr>, u16)> = vec![(self.ptrs.clone(), self.level())];
+
+        while let Some((ptrs, level)) = stack.pop() {
+            for ptr in ptrs {
+                let child = level - 1;
+                nodes.push(ptr);
+                if child == 0 {
+                    let bytes = tx.read_block(ptr).map_err(|e| e.errno())?;
+                    let leaf =
+                        BmbtLeafBlock::from_bytes(&bytes).map_err(|_| crate::libxfuse::EUCLEAN)?;
+                    if leaf.level != child {
+                        return Err(crate::libxfuse::EUCLEAN);
+                    }
+                    out.extend(leaf.extents().extents().iter().copied());
+                } else {
+                    let bytes = tx.read_block(ptr).map_err(|e| e.errno())?;
+                    let node: BtreeIntermediate =
+                        decode(&bytes).map_err(|_| libc::EDESTADDRREQ)?.0;
+                    if node.level() != child {
+                        return Err(crate::libxfuse::EUCLEAN);
+                    }
+                    stack.push((node.ptrs().to_vec(), node.level()));
+                }
+            }
+        }
+        Ok((Bmx::new(&out), nodes))
+    }
 }
 
 /// Result of inserting into a child node: either no split, or a new node with separator key.
@@ -1444,7 +1509,7 @@ impl BtreeRoot {
             owner: 0,
             uuid: sb.sb_uuid.as_image_bytes(),
         };
-        let leaf_bytes = leaf.to_bytes(&leaf_hdr, sb.sb_blocksize as usize);
+        let leaf_bytes = leaf.to_bytes_auto(&leaf_hdr, sb.sb_blocksize as usize, sb.has_crc());
         tx.write_bytes(sb.fsb_to_offset(leaf_block), &leaf_bytes)
             .map_err(|e| e.errno())?;
 
@@ -1534,7 +1599,7 @@ impl BtreeRoot {
                         owner: 0,
                         uuid: sb.sb_uuid.as_image_bytes(),
                     };
-                    let leaf_bytes = leaf.to_bytes(&hdr, sb.sb_blocksize as usize);
+                    let leaf_bytes = leaf.to_bytes_auto(&hdr, sb.sb_blocksize as usize, sb.has_crc());
                     tx.write_bytes(offset, &leaf_bytes).map_err(|e| e.errno())?;
 
                     // Allocate a new block for the split leaf
@@ -1552,7 +1617,7 @@ impl BtreeRoot {
                         owner: 0,
                         uuid: sb.sb_uuid.as_image_bytes(),
                     };
-                    let new_leaf_bytes = new_leaf.to_bytes(&new_hdr, sb.sb_blocksize as usize);
+                    let new_leaf_bytes = new_leaf.to_bytes_auto(&new_hdr, sb.sb_blocksize as usize, sb.has_crc());
                     tx.write_bytes(sb.fsb_to_offset(new_block), &new_leaf_bytes)
                         .map_err(|e| e.errno())?;
 
@@ -1640,7 +1705,7 @@ impl BtreeRoot {
             uuid: sb.sb_uuid.as_image_bytes(),
         };
         let old_root_bytes =
-            old_root_intermediate.to_bytes(&old_root_hdr, sb.sb_blocksize as usize);
+            old_root_intermediate.to_bytes_auto(&old_root_hdr, sb.sb_blocksize as usize, sb.has_crc());
         tx.write_bytes(sb.fsb_to_offset(old_root_block), &old_root_bytes)
             .map_err(|e| e.errno())?;
 
@@ -1673,7 +1738,7 @@ impl BtreeRoot {
             owner: 0,
             uuid: sb.sb_uuid.as_image_bytes(),
         };
-        let right_bytes = right_sibling.to_bytes(&right_hdr, sb.sb_blocksize as usize);
+        let right_bytes = right_sibling.to_bytes_auto(&right_hdr, sb.sb_blocksize as usize, sb.has_crc());
         tx.write_bytes(sb.fsb_to_offset(right_block), &right_bytes)
             .map_err(|e| e.errno())?;
 
@@ -1740,7 +1805,7 @@ impl BtreeRoot {
                         owner: 0,
                         uuid: sb.sb_uuid.as_image_bytes(),
                     };
-                    let leaf_bytes = leaf.to_bytes(&hdr, sb.sb_blocksize as usize);
+                    let leaf_bytes = leaf.to_bytes_auto(&hdr, sb.sb_blocksize as usize, sb.has_crc());
                     tx.write_bytes(offset, &leaf_bytes).map_err(|e| e.errno())?;
 
                     // Allocate a new block for the split leaf
@@ -1758,7 +1823,7 @@ impl BtreeRoot {
                         owner: 0,
                         uuid: sb.sb_uuid.as_image_bytes(),
                     };
-                    let new_leaf_bytes = new_leaf.to_bytes(&new_hdr, sb.sb_blocksize as usize);
+                    let new_leaf_bytes = new_leaf.to_bytes_auto(&new_hdr, sb.sb_blocksize as usize, sb.has_crc());
                     tx.write_bytes(sb.fsb_to_offset(new_block), &new_leaf_bytes)
                         .map_err(|e| e.errno())?;
 
@@ -1802,7 +1867,7 @@ impl BtreeRoot {
                         owner: 0,
                         uuid: sb.sb_uuid.as_image_bytes(),
                     };
-                    let node_bytes = intermediate.to_bytes(&hdr, sb.sb_blocksize as usize);
+                    let node_bytes = intermediate.to_bytes_auto(&hdr, sb.sb_blocksize as usize, sb.has_crc());
                     tx.write_bytes(offset, &node_bytes).map_err(|e| e.errno())?;
                     Ok(None)
                 } else {
@@ -1841,7 +1906,7 @@ impl BtreeRoot {
                         owner: 0,
                         uuid: sb.sb_uuid.as_image_bytes(),
                     };
-                    let node_bytes = intermediate.to_bytes(&hdr, sb.sb_blocksize as usize);
+                    let node_bytes = intermediate.to_bytes_auto(&hdr, sb.sb_blocksize as usize, sb.has_crc());
                     tx.write_bytes(offset, &node_bytes).map_err(|e| e.errno())?;
 
                     // Write the new intermediate node
@@ -1853,7 +1918,7 @@ impl BtreeRoot {
                         owner: 0,
                         uuid: sb.sb_uuid.as_image_bytes(),
                     };
-                    let new_node_bytes = new_node.to_bytes(&new_hdr, sb.sb_blocksize as usize);
+                    let new_node_bytes = new_node.to_bytes_auto(&new_hdr, sb.sb_blocksize as usize, sb.has_crc());
                     tx.write_bytes(sb.fsb_to_offset(new_block), &new_node_bytes)
                         .map_err(|e| e.errno())?;
 
@@ -2045,7 +2110,7 @@ impl BtreeRoot {
                     owner: 0,
                     uuid: sb.sb_uuid.as_image_bytes(),
                 };
-                let leaf_bytes = leaf.to_bytes(&hdr, sb.sb_blocksize as usize);
+                let leaf_bytes = leaf.to_bytes_auto(&hdr, sb.sb_blocksize as usize, sb.has_crc());
                 tx.write_bytes(offset, &leaf_bytes).map_err(|e| e.errno())?;
 
                 if need_merge {
@@ -2166,7 +2231,7 @@ impl BtreeRoot {
                         };
                         tx.write_bytes(
                             sb.fsb_to_offset(child_ptr),
-                            &intermediate.to_bytes(&new_hdr, sb.sb_blocksize as usize),
+                            &intermediate.to_bytes_auto(&new_hdr, sb.sb_blocksize as usize, sb.has_crc()),
                         )
                         .map_err(|e| e.errno())?;
 
@@ -2298,12 +2363,12 @@ impl BtreeRoot {
                 };
                 tx.write_bytes(
                     sb.fsb_to_offset(child_ptr),
-                    &leaf_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize),
+                    &leaf_mut.to_bytes_auto(&left_hdr, sb.sb_blocksize as usize, sb.has_crc()),
                 )
                 .map_err(|e| e.errno())?;
                 tx.write_bytes(
                     right_offset,
-                    &right_leaf.to_bytes(&right_hdr, sb.sb_blocksize as usize),
+                    &right_leaf.to_bytes_auto(&right_hdr, sb.sb_blocksize as usize, sb.has_crc()),
                 )
                 .map_err(|e| e.errno())?;
 
@@ -2329,7 +2394,7 @@ impl BtreeRoot {
             };
             tx.write_bytes(
                 sb.fsb_to_offset(child_ptr),
-                &leaf_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize),
+                &leaf_mut.to_bytes_auto(&left_hdr, sb.sb_blocksize as usize, sb.has_crc()),
             )
             .map_err(|e| e.errno())?;
 
@@ -2392,12 +2457,12 @@ impl BtreeRoot {
                 };
                 tx.write_bytes(
                     left_offset,
-                    &left_leaf_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize),
+                    &left_leaf_mut.to_bytes_auto(&left_hdr, sb.sb_blocksize as usize, sb.has_crc()),
                 )
                 .map_err(|e| e.errno())?;
                 tx.write_bytes(
                     sb.fsb_to_offset(child_ptr),
-                    &leaf_mut.to_bytes(&right_hdr, sb.sb_blocksize as usize),
+                    &leaf_mut.to_bytes_auto(&right_hdr, sb.sb_blocksize as usize, sb.has_crc()),
                 )
                 .map_err(|e| e.errno())?;
 
@@ -2423,7 +2488,7 @@ impl BtreeRoot {
             };
             tx.write_bytes(
                 left_offset,
-                &left_leaf_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize),
+                &left_leaf_mut.to_bytes_auto(&left_hdr, sb.sb_blocksize as usize, sb.has_crc()),
             )
             .map_err(|e| e.errno())?;
 
@@ -2504,12 +2569,12 @@ impl BtreeRoot {
                 };
                 tx.write_bytes(
                     sb.fsb_to_offset(child_ptr),
-                    &intermediate_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize),
+                    &intermediate_mut.to_bytes_auto(&left_hdr, sb.sb_blocksize as usize, sb.has_crc()),
                 )
                 .map_err(|e| e.errno())?;
                 tx.write_bytes(
                     right_offset,
-                    &right_intermediate.to_bytes(&right_hdr, sb.sb_blocksize as usize),
+                    &right_intermediate.to_bytes_auto(&right_hdr, sb.sb_blocksize as usize, sb.has_crc()),
                 )
                 .map_err(|e| e.errno())?;
 
@@ -2535,7 +2600,7 @@ impl BtreeRoot {
             };
             tx.write_bytes(
                 sb.fsb_to_offset(child_ptr),
-                &intermediate_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize),
+                &intermediate_mut.to_bytes_auto(&left_hdr, sb.sb_blocksize as usize, sb.has_crc()),
             )
             .map_err(|e| e.errno())?;
 
@@ -2598,12 +2663,12 @@ impl BtreeRoot {
                 };
                 tx.write_bytes(
                     left_offset,
-                    &left_intermediate_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize),
+                    &left_intermediate_mut.to_bytes_auto(&left_hdr, sb.sb_blocksize as usize, sb.has_crc()),
                 )
                 .map_err(|e| e.errno())?;
                 tx.write_bytes(
                     sb.fsb_to_offset(child_ptr),
-                    &intermediate_mut.to_bytes(&right_hdr, sb.sb_blocksize as usize),
+                    &intermediate_mut.to_bytes_auto(&right_hdr, sb.sb_blocksize as usize, sb.has_crc()),
                 )
                 .map_err(|e| e.errno())?;
 
@@ -2629,7 +2694,7 @@ impl BtreeRoot {
             };
             tx.write_bytes(
                 left_offset,
-                &left_intermediate_mut.to_bytes(&left_hdr, sb.sb_blocksize as usize),
+                &left_intermediate_mut.to_bytes_auto(&left_hdr, sb.sb_blocksize as usize, sb.has_crc()),
             )
             .map_err(|e| e.errno())?;
 
@@ -2744,7 +2809,7 @@ impl BtreeRoot {
                     owner: 0,
                     uuid: sb.sb_uuid.as_image_bytes(),
                 };
-                let leaf_bytes = leaf.to_bytes(&hdr, sb.sb_blocksize as usize);
+                let leaf_bytes = leaf.to_bytes_auto(&hdr, sb.sb_blocksize as usize, sb.has_crc());
                 tx.write_bytes(offset, &leaf_bytes).map_err(|e| e.errno())?;
 
                 if need_merge {
@@ -2974,6 +3039,58 @@ impl BtreeIntermediate {
         let crc = crc32c_without_its_own_field(&b, 64);
         b[64..68].copy_from_slice(&crc.to_le_bytes());
         b
+    }
+
+    /// This node as the bytes of a block on a file system without checksums.
+    #[allow(dead_code)]
+    pub fn to_bytes_v4(
+        &self,
+        leftsib: XfsFsblock,
+        rightsib: XfsFsblock,
+        sb_blocksize: usize,
+    ) -> Vec<u8> {
+        let mut b = vec![0u8; sb_blocksize];
+        put_header(
+            &mut b,
+            XFS_BMAP_MAGIC,
+            self.hdr.bb_level,
+            self.keys.len(),
+            &BtreeLblockHdr {
+                blkno: 0,
+                lsn: 0,
+                leftsib,
+                rightsib,
+                owner: 0,
+                uuid: [0; 16],
+            },
+            sb_blocksize,
+        );
+        let room = BmbtInteriorBlock::max_children(sb_blocksize, false);
+        let mut at = BMBT_HEADER_LEN;
+        for k in &self.keys {
+            b[at..at + 8].copy_from_slice(&k.br_startoff.to_be_bytes());
+            at += BmbtKey::SIZE;
+        }
+        at = BMBT_HEADER_LEN + room * BmbtKey::SIZE;
+        for p in &self.ptrs {
+            b[at..at + 8].copy_from_slice(&p.to_be_bytes());
+            at += 8;
+        }
+        b
+    }
+
+    /// Serialize this node for the file system described by `has_crc`.
+    pub fn to_bytes_auto(
+        &self,
+        hdr: &BtreeLblockHdr,
+        sb_blocksize: usize,
+        has_crc: bool,
+    ) -> Vec<u8> {
+        if has_crc {
+            self.to_bytes(hdr, sb_blocksize)
+        } else {
+            self.to_bytes_v4(hdr.leftsib, hdr.rightsib, sb_blocksize)
+        }
     }
 
     /// Deserialize an intermediate node from bytes.
