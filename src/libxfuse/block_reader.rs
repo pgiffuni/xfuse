@@ -130,6 +130,10 @@ impl BlockReader {
     /// where in the image the caller asked to read.
     fn refill(&mut self) -> IoResult<()> {
         self.start = self.pos - (self.pos % self.block.len() as u64);
+        eprintln!(
+            "DEBUG BlockReader::refill: pos={} block_len={} start={} reading {} bytes",
+            self.pos, self.block.len(), self.start, self.block.len(),
+        );
         self.device.read_at(&mut self.block, self.start)?;
         self.idx = (self.pos - self.start) as usize;
         self.valid = true;

@@ -95,9 +95,17 @@ impl Dinode {
         inode_number: XfsIno,
     ) -> Dinode {
         let off = superblock.inode_offset(inode_number);
+        eprintln!(
+            "DEBUG Dinode::from: inode_number={} offset={} inode_size={}",
+            inode_number, off, superblock.inode_size(),
+        );
         buf_reader.seek(SeekFrom::Start(off)).unwrap();
         let mut raw = vec![0u8; superblock.inode_size()];
         buf_reader.read_exact(&mut raw).unwrap();
+        eprintln!(
+            "DEBUG Dinode::from: read {} bytes, first 4 bytes = 0x{:02x}{:02x}{:02x}{:02x}",
+            raw.len(), raw[0], raw[1], raw[2], raw[3],
+        );
         Self::from_bytes(&raw, superblock, inode_number)
     }
 
