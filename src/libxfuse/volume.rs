@@ -3454,6 +3454,12 @@ impl Filesystem for Volume {
                     reply.error(e.errno());
                     return;
                 }
+                self.device.invalidate();
+                self.device.set_bufsize(inode_size);
+                let dinode = Dinode::from(self.device.by_ref(), &sb, xfs_ino);
+                if let Some(oi) = self.open_files.get_mut(&ino) {
+                    oi.dinode = dinode;
+                }
                 reply.ok();
             } else if dinode.di_core.di_format == XfsDinodeFmt::Extents {
                 // Extents format: punch hole by modifying extent list in inode
@@ -3522,6 +3528,12 @@ impl Filesystem for Volume {
                 if let Err(e) = tx.commit() {
                     reply.error(e.errno());
                     return;
+                }
+                self.device.invalidate();
+                self.device.set_bufsize(inode_size);
+                let dinode = Dinode::from(self.device.by_ref(), &sb, xfs_ino);
+                if let Some(oi) = self.open_files.get_mut(&ino) {
+                    oi.dinode = dinode;
                 }
                 reply.ok();
             } else {
@@ -3641,6 +3653,12 @@ impl Filesystem for Volume {
                 reply.error(e.errno());
                 return;
             }
+            self.device.invalidate();
+            self.device.set_bufsize(inode_size);
+            let dinode = Dinode::from(self.device.by_ref(), &sb, xfs_ino);
+            if let Some(oi) = self.open_files.get_mut(&ino) {
+                oi.dinode = dinode;
+            }
             reply.ok();
         } else if dinode.di_core.di_format == XfsDinodeFmt::Extents {
             // Extents format: allocate blocks by adding to extent list in inode
@@ -3754,6 +3772,12 @@ impl Filesystem for Volume {
             if let Err(e) = tx.commit() {
                 reply.error(e.errno());
                 return;
+            }
+            self.device.invalidate();
+            self.device.set_bufsize(inode_size);
+            let dinode = Dinode::from(self.device.by_ref(), &sb, xfs_ino);
+            if let Some(oi) = self.open_files.get_mut(&ino) {
+                oi.dinode = dinode;
             }
             reply.ok();
         } else {

@@ -247,6 +247,16 @@ impl BlockDevice {
                         ffi::diocgsectorsize(f.as_raw_fd(), sectorsize.as_mut_ptr()).unwrap();
                         return sectorsize.assume_init() as usize;
                     }
+                } else if ft.is_file() {
+                    // md.blksize() on FreeBSD returns the filesystem's preferred
+                    // I/O block size (e.g. 65536 on ZFS), not the image's sector
+                    // size.  Using it as the "sector size" causes set_bufsize to
+                    // round buffers up and invalidate the read-ahead window on
+                    // every call, which amplifies I/O thousands of times over and
+                    // triggers FUSE timeouts.  Regular files do not have a real
+                    // sector size; 512 is the smallest valid alignment and works
+                    // for all XFS image formats (sb_sectsize is always 512).
+                    return 512;
                 }
             }
         }
