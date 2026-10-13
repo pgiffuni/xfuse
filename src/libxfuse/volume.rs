@@ -292,9 +292,9 @@ impl Volume {
             state:      Mutex::new(State {
                 device,
                 rt_device,
-                sb: superblock,
+                sb:          superblock,
                 open_files,
-                handles: HashMap::new(),
+                handles:     HashMap::new(),
                 next_handle: 1,
                 tx,
                 writable,
@@ -530,7 +530,7 @@ impl State {
         // it until the walk has finished.
         let tree: Option<(Vec<BmbtRec>, Vec<u64>, u64)> = {
             let mut peek = vec![0u8; inode_size];
-            self.device
+                self.device
                 .device()
                 .read_at(&mut peek, inode_offset)
                 .map_err(|e| FsError::Corrupt {
@@ -1139,7 +1139,7 @@ impl State {
         // write any of it until the walk is finished.
         let tree: Option<(Vec<crate::libxfuse::bmbt_rec::BmbtRec>, Vec<u64>)> = {
             let mut peek = vec![0u8; inode_size];
-            self.device
+                self.device
                 .device()
                 .read_at(&mut peek, inode_offset)
                 .map_err(|e| FsError::Corrupt {
