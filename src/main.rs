@@ -56,6 +56,14 @@ struct App {
     /// xfuse cannot keep up to date.
     #[arg(long = "experimental-rw", short = 'r')]
     experimental_rw: bool,
+
+    /// Number of threads for the FUSE event loop.
+    ///
+    /// Default: 1.  A value greater than 1 requires Linux (fuser 0.18.0
+    /// rejects `n_threads != 1` on other platforms).  Use `--threads=4` for
+    /// parallel request processing.
+    #[arg(long = "threads", default_value_t = 1)]
+    threads:    usize,
 }
 
 fn main() {
@@ -160,7 +168,18 @@ fn main() {
     let mut config = fuser::Config::default();
     config.mount_options = opts;
     config.acl = acl;
-    config.n_threads = None;
+    // fuser 0.18.0 rejects `n_threads != 1` on non-Linux platforms.
+    // Warn and fall back on FreeBSD.
+    if app.threads != 1 && !cfg!(target_os = "linux") {
+        eprintln!(
+            "warning: --threads={} is not supported on this platform; \
+             using single-threaded mode",
+            app.threads
+        );
+        config.n_threads = None;
+    } else {
+        config.n_threads = Some(app.threads);
+    }
     config.clone_fd = false;
     mount(vol, &app.mountpoint, &config).unwrap();
 }
