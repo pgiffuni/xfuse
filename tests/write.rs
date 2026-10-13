@@ -1627,3 +1627,115 @@ fn concurrent_writes() {
         eprintln!("concurrent_writes: file size after concurrent writes: {}", content.len());
     });
 }
+
+/// Phase 4: Concurrent directory traversal and file reads with multi-threaded FUSE.
+///
+/// Spawns multiple client threads that traverse directories (readdir) and read
+/// files simultaneously through a `--threads=4` FUSE mount on Linux. This
+/// stresses the parallel event-loop paths and verifies data integrity under
+/// concurrent metadata + data requests.
+///
+/// On FreeBSD, `--threads` is ignored (fuser falls back to 1 thread), so this
+/// test is Linux-only.
+///
+/// Run with `cargo test concurrent_mixed_workload -- --ignored --nocapture`
+#[test]
+#[ignore]
+#[cfg(target_os = "linux")]
+fn concurrent_mixed_workload() {
+    require_fusefs!();
+    let image = writable_copy(&GOLDENWRITABLE, "mixed");
+    let _guard = serialize();
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut mnt = mountpoint_dir();
+    mnt.push(format!("mnt-mixed-{seq}"));
+    std::fs::create_dir_all(&mnt)
+        .unwrap_or_else(|e| panic!("creating the mountpoint {mnt:?}: {e}"));
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_xfs-fuse"));
+    command.args(["-f", "-r", "--threads=4"]);
+    let mut process = command
+        .arg(&image)
+        .arg(&mnt)
+        .stdout(Stdio::null())
+        .stderr(if std::env::var_os("XFUSE_TEST_LOG").is_some() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
+        .spawn()
+        .unwrap_or_else(|e| panic!("running xfs-fuse: {e}"));
+
+    let mounted = util::waitfor(Duration::from_secs(60), || is_live(&mnt));
+    if let Err(e) = mounted {
+        let _ = process.kill();
+        panic!("xfs-fuse did not mount {image:?} at {mnt:?}: {e}");
+    }
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::time::Instant;
+
+    let big_bin = mnt.join("dir/big.bin");
+    let original = std::fs::read(&big_bin).expect("reading benchmark file");
+    let dir_path = mnt.clone();
+
+    let num_threads = 4;
+    let iterations = 30;
+    let readdir_count = Arc::new(AtomicU64::new(0));
+    let read_count = Arc::new(AtomicU64::new(0));
+    let start = Instant::now();
+
+    let mut handles = Vec::new();
+    for t in 0..num_threads {
+        let dir_path = dir_path.clone();
+        let big_bin = big_bin.clone();
+        let data = original.clone();
+        let readdir_count = Arc::clone(&readdir_count);
+        let read_count = Arc::clone(&read_count);
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..iterations {
+                // Traverse directory tree
+                if let Ok(entries) = std::fs::read_dir(&dir_path) {
+                    for entry in entries.flatten() {
+                        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                            let _ = std::fs::read_dir(entry.path());
+                        }
+                    }
+                    readdir_count.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+
+                // Read a file
+                match std::fs::read(&big_bin) {
+                    Ok(read_data) => {
+                        assert_eq!(read_data, data, "data mismatch in thread {t}");
+                        read_count.fetch_add(1, AtomicOrdering::SeqCst);
+                    }
+                    Err(e) => {
+                        eprintln!("read failed in thread {t}: {e}");
+                    }
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().expect("thread panicked");
+    }
+
+    let elapsed = start.elapsed();
+    eprintln!(
+        "concurrent_mixed_workload: {} threads, {} iters each, {} readdir ops + {} file reads in {:.2}s",
+        num_threads,
+        iterations,
+        readdir_count.load(AtomicOrdering::SeqCst),
+        read_count.load(AtomicOrdering::SeqCst),
+        elapsed.as_secs_f64()
+    );
+
+    let _ = process.kill();
+    let _ = process.wait();
+    let _ = util::waitfor(Duration::from_secs(10), || !is_live(&mnt));
+    let _ = std::fs::remove_dir_all(&mnt);
+}
