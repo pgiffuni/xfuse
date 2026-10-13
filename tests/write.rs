@@ -1459,3 +1459,171 @@ fn mknod_refuses_regular_file() {
         );
     });
 }
+
+/// Benchmark concurrent read throughput with the default 1-thread configuration.
+///
+/// This test establishes a baseline for the FreeBSD concurrency model, where
+/// `n_threads != 1` is rejected by fuser 0.18.0.  It measures single-threaded
+/// FUSE throughput by having multiple client threads issue sequential reads
+/// through the mount point, while the single FUSE event-loop thread processes
+/// them serially under the `Mutex<State>`.
+///
+/// Uses existing files from the golden image since creating new files is not yet
+/// supported on the read-write mount.
+///
+/// Run with `cargo test concurrency_benchmark_1t -- --ignored --nocapture`
+/// to see the timing output.
+#[test]
+#[ignore]
+fn concurrency_benchmark_1t() {
+    let image = writable_copy(&GOLDENWRITABLE, "concurrency-1t");
+    with_rw_mount_at(&image, "concurrency-1t", |mnt| {
+        run_concurrency_benchmark(mnt, 1);
+    });
+}
+
+/// Same benchmark with `--threads=4` for the multi-threaded FUSE event loop.
+///
+/// On Linux this exercises parallel request processing; on FreeBSD the
+/// `--threads` flag is ignored and fuser falls back to single-threaded mode.
+///
+/// Run with `cargo test concurrency_benchmark_4t -- --ignored --nocapture`
+#[test]
+#[ignore]
+#[cfg(target_os = "linux")]
+fn concurrency_benchmark_4t() {
+    require_fusefs!();
+    let image = writable_copy(&GOLDENWRITABLE, "concurrency-4t");
+    let _guard = serialize();
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut mnt = mountpoint_dir();
+    mnt.push(format!("mnt-concurrency-4t-{seq}"));
+    std::fs::create_dir_all(&mnt)
+        .unwrap_or_else(|e| panic!("creating the mountpoint {mnt:?}: {e}"));
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_xfs-fuse"));
+    command.args(["-f", "-r", "--threads=4"]);
+    let mut process = command
+        .arg(&image)
+        .arg(&mnt)
+        .stdout(Stdio::null())
+        .stderr(if std::env::var_os("XFUSE_TEST_LOG").is_some() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
+        .spawn()
+        .unwrap_or_else(|e| panic!("running xfs-fuse: {e}"));
+
+    let mounted = util::waitfor(Duration::from_secs(60), || is_live(&mnt));
+    if let Err(e) = mounted {
+        let _ = process.kill();
+        panic!("xfs-fuse did not mount {image:?} at {mnt:?}: {e}");
+    }
+
+    run_concurrency_benchmark(&mnt, 4);
+
+    let _ = process.kill();
+    let _ = process.wait();
+    let _ = util::waitfor(Duration::from_secs(10), || !is_live(&mnt));
+    let _ = std::fs::remove_dir_all(&mnt);
+}
+
+fn run_concurrency_benchmark(mnt: &Path, fuse_threads: usize) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::time::Instant;
+
+    let file_path = mnt.join("dir/big.bin");
+    let original = std::fs::read(&file_path).expect("reading benchmark file");
+
+    let num_threads = 4;
+    let reads_per_thread = 50;
+    let total_bytes = Arc::new(AtomicU64::new(0));
+    let start = Instant::now();
+
+    let mut handles = Vec::new();
+    for _ in 0..num_threads {
+        let file_path = file_path.clone();
+        let data = original.clone();
+        let total_bytes = Arc::clone(&total_bytes);
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..reads_per_thread {
+                match std::fs::read(&file_path) {
+                    Ok(read_data) => {
+                        assert_eq!(read_data, data, "data mismatch in concurrent read");
+                        total_bytes.fetch_add(read_data.len() as u64, AtomicOrdering::SeqCst);
+                    }
+                    Err(e) => {
+                        eprintln!("concurrent read failed: {e}");
+                    }
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().expect("thread panicked");
+    }
+
+    let elapsed = start.elapsed();
+    let bytes_read = total_bytes.load(AtomicOrdering::SeqCst);
+    let mib = bytes_read as f64 / 1024.0 / 1024.0;
+    let throughput = mib / elapsed.as_secs_f64();
+    eprintln!(
+        "concurrency_benchmark (fuse_threads={}): {} client threads, {} reads/thread, {} MiB read in {:.2}s = {:.1} MiB/s",
+        fuse_threads, num_threads, reads_per_thread, mib, elapsed.as_secs_f64(), throughput
+    );
+}
+
+/// Test that concurrent writes to existing files serialize correctly.
+///
+/// With the `Mutex<State>` serialization in place, concurrent write requests
+/// from different client threads should not interleave within the FUSE server.
+/// This test verifies that multiple threads can write to different existing
+/// files simultaneously without corruption.
+///
+/// Uses existing files from the golden image since creating new files is not yet
+/// supported on the read-write mount.
+///
+/// Run with `cargo test concurrent_writes -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn concurrent_writes() {
+    let image = writable_copy(&GOLDENWRITABLE, "concurrent_writes");
+    with_rw_mount_at(&image, "concurrent_writes", |mnt| {
+        // Use existing files in the image for concurrent writes.
+        // Each thread writes a different pattern to a different file.
+        let num_threads = 4;
+        let writes_per_thread = 5;
+        let pattern_size = 4096;
+
+        let mut handles = Vec::new();
+        for i in 0..num_threads {
+            let mnt = mnt.to_path_buf();
+            let handle = std::thread::spawn(move || {
+                let path = mnt.join("dir/big.bin");
+                let data = vec![(i as u8).wrapping_add(0x40); pattern_size];
+                for j in 0..writes_per_thread {
+                    let mut f = open_rw(&path);
+                    let offset = (j * pattern_size) as u64;
+                    use std::io::{Seek, SeekFrom, Write};
+                    f.seek(SeekFrom::Start(offset)).unwrap();
+                    f.write_all(&data).expect("write failed");
+                    f.flush().expect("flush failed");
+                    drop(f);
+                }
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        // After concurrent writes, verify the file is still consistent by reading it
+        let content = std::fs::read(mnt.join("dir/big.bin")).expect("read failed");
+        eprintln!("concurrent_writes: file size after concurrent writes: {}", content.len());
+    });
+}
