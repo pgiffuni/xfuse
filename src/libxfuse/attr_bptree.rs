@@ -26,11 +26,11 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use std::{
-    cell::RefCell,
-    collections::{btree_map::Entry, BTreeMap},
+    collections::BTreeMap,
     convert::TryInto,
     ffi::OsStr,
     io::{BufRead, Seek, SeekFrom},
+    sync::Mutex,
 };
 
 use bincode_next::de::read::Reader;
@@ -108,7 +108,7 @@ pub struct AttrBtree {
     total_size: i64,
     node:       AttrBtreeBlock0,
     /// A cache of leaf blocks, indexed by directory block number
-    leaves:     RefCell<BTreeMap<XfsDablk, AttrLeafblock>>,
+    leaves:     Mutex<BTreeMap<XfsDablk, AttrLeafblock>>,
 }
 
 impl AttrBtree {
@@ -146,27 +146,25 @@ impl AttrBtree {
     }
 
     /// Read the AttrLeafblock located at the given directory block number
-    fn read_leaf<'a, R>(
-        &'a self,
+    fn read_leaf<R>(
+        &self,
         buf_reader: &mut R,
         sb: &Sb,
         dblock: XfsDablk,
-    ) -> Result<impl std::ops::DerefMut<Target = AttrLeafblock> + 'a, i32>
+    ) -> Result<AttrLeafblock, i32>
     where
         R: Reader + BufRead + Seek,
     {
-        let mut cache_guard = self.leaves.borrow_mut();
-        let entry = cache_guard.entry(dblock);
-        if matches!(entry, Entry::Vacant(_)) {
+        let mut cache_guard = self.leaves.lock().unwrap();
+        #[allow(clippy::map_entry)]
+        if !cache_guard.contains_key(&dblock) {
             let fsblock = self.map_dblock(buf_reader.by_ref(), dblock)?;
             let leaf_offset = sb.fsb_to_offset(fsblock);
-            buf_reader.seek(SeekFrom::Start(leaf_offset)).unwrap();
+            buf_reader.seek(SeekFrom::Start(leaf_offset)).map_err(|_| libc::EIO)?;
             let leaf: AttrLeafblock = utils::decode_from(buf_reader.by_ref()).unwrap();
-            entry.or_insert(leaf);
+            cache_guard.insert(dblock, leaf);
         }
-        Ok(std::cell::RefMut::map(cache_guard, |v| {
-            v.get_mut(&dblock).unwrap()
-        }))
+        Ok(cache_guard.get(&dblock).unwrap().clone())
     }
 }
 
@@ -219,7 +217,7 @@ impl Attr for AttrBtree {
             let leaf = self
                 .read_leaf(buf_reader.by_ref(), super_block, dablk)
                 .unwrap();
-            (*leaf).list(&mut list);
+            leaf.list(&mut list);
             dablk = leaf.hdr.forw;
             if dablk == 0 {
                 break;

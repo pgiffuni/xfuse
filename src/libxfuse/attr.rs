@@ -81,13 +81,13 @@ pub const fn get_namespace_size_from_flags(flags: u8) -> u32 {
     get_namespace_from_flags(flags).len() as u32
 }
 
-#[derive(Debug, Decode)]
+#[derive(Debug, Clone, Decode)]
 pub struct AttrLeafMap {
     _base: u16,
     _size: u16,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AttrLeafHdr {
     pub forw:  u32,
     pub count: u16,
@@ -122,7 +122,7 @@ impl<Ctx> Decode<Ctx> for AttrLeafHdr {
 }
 impl_borrow_decode!(AttrLeafHdr);
 
-#[derive(Debug, Decode)]
+#[derive(Debug, Clone, Decode)]
 pub struct AttrLeafEntry {
     pub hashval: u32,
     pub nameidx: u16,
@@ -130,7 +130,7 @@ pub struct AttrLeafEntry {
     _pad2:       u8,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AttrLeafNameLocal {
     pub namelen: u8,
     pub nameval: Vec<u8>,
@@ -147,7 +147,7 @@ impl<Ctx> Decode<Ctx> for AttrLeafNameLocal {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AttrLeafName {
     Local(AttrLeafNameLocal),
     Remote(AttrLeafNameRemote),
@@ -186,7 +186,7 @@ impl AttrLeafName {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AttrLeafblock {
     pub hdr:     AttrLeafHdr,
     // TODO: in-memory, combine AttrLeafEntry and AttrLeafName into a struct, so we'll only need a
@@ -268,7 +268,7 @@ impl<Ctx> Decode<Ctx> for AttrLeafblock {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AttrLeafNameRemote {
     pub valueblk: u32,
     pub valuelen: u32,

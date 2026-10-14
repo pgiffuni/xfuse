@@ -37,11 +37,10 @@
 //! algorithms) for the algorithm map with DOCUMENTED/MEASURED/IMPLEMENTED/
 //! HYPOTHESIS labels.
 use std::{
-    cell::RefCell,
     collections::{btree_map::Entry, BTreeMap},
     io::{prelude::*, SeekFrom},
     marker::PhantomData,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use bincode_next::{
@@ -1117,7 +1116,7 @@ pub type XfsBmbtLblock = BtreeBlockHdr<u64>;
 trait BtreePriv {
     fn keys(&self) -> &[BmbtKey];
     fn level(&self) -> u16;
-    fn block_cache(&self) -> &RefCell<BtreeBlockCache>;
+    fn block_cache(&self) -> &Mutex<BtreeBlockCache>;
     fn ptrs(&self) -> &[XfsBmbtPtr];
 }
 
@@ -1142,7 +1141,7 @@ pub trait Btree: BtreePriv {
         // BtreeLeaf::get_extent will calculate the hole's size.
         let idx = pp.saturating_sub(1);
 
-        let mut guard = self.block_cache().borrow_mut();
+        let mut guard = self.block_cache().lock().unwrap();
         match &mut *guard {
             BtreeBlockCache::Intermediate(bci) => {
                 if self.level() <= 1 {
@@ -2936,7 +2935,7 @@ pub struct BtreeRoot {
     /// The inode number that owns this b-tree root (only set for the actual root)
     pub owner: Option<XfsIno>,
     /// A cache of the object's extents, indexed by block number
-    blocks:    RefCell<BtreeBlockCache>,
+    blocks:    Mutex<BtreeBlockCache>,
 }
 
 impl BtreeRoot {
@@ -3010,7 +3009,7 @@ impl BtreeRoot {
         ptrs: Vec<XfsBmdrPtr>,
         owner: Option<XfsIno>,
     ) -> Self {
-        let blocks = RefCell::new(BtreeBlockCache::new(bmdr.bb_level));
+        let blocks = Mutex::new(BtreeBlockCache::new(bmdr.bb_level));
         Self {
             bmdr,
             keys,
@@ -3048,7 +3047,7 @@ impl BtreeRoot {
 }
 
 impl BtreePriv for BtreeRoot {
-    fn block_cache(&self) -> &RefCell<BtreeBlockCache> {
+    fn block_cache(&self) -> &Mutex<BtreeBlockCache> {
         &self.blocks
     }
 
@@ -3075,17 +3074,30 @@ enum BtreeChild {
 }
 
 /// An intermediate Btree.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct BtreeIntermediate {
     hdr:    XfsBmbtLblock,
     keys:   Vec<BmbtKey>,
     ptrs:   Vec<XfsBmbtPtr>,
     /// A cache of the object's extents, indexed by block number
-    blocks: RefCell<BtreeBlockCache>,
+    blocks: Mutex<BtreeBlockCache>,
+}
+
+impl Clone for BtreeIntermediate {
+    fn clone(&self) -> Self {
+        let hdr = self.hdr;
+        let level = hdr.bb_level;
+        Self {
+            hdr,
+            keys:   self.keys.clone(),
+            ptrs:   self.ptrs.clone(),
+            blocks: Mutex::new(BtreeBlockCache::new(level)),
+        }
+    }
 }
 
 impl BtreePriv for BtreeIntermediate {
-    fn block_cache(&self) -> &RefCell<BtreeBlockCache> {
+    fn block_cache(&self) -> &Mutex<BtreeBlockCache> {
         &self.blocks
     }
 
@@ -3241,7 +3253,7 @@ impl BtreeIntermediate {
             hdr,
             keys,
             ptrs,
-            blocks: RefCell::new(BtreeBlockCache::new(hdr.bb_level)),
+            blocks: Mutex::new(BtreeBlockCache::new(hdr.bb_level)),
         })
     }
 
@@ -3383,7 +3395,7 @@ impl<Ctx> Decode<Ctx> for BtreeIntermediate {
             ptrs.push(ptr);
         }
 
-        let blocks = RefCell::new(BtreeBlockCache::new(hdr.bb_level));
+        let blocks = Mutex::new(BtreeBlockCache::new(hdr.bb_level));
         Ok(Self {
             hdr,
             keys,
