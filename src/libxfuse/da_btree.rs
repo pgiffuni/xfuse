@@ -170,9 +170,9 @@ pub struct XfsDa3Intnode {
 impl Clone for XfsDa3Intnode {
     fn clone(&self) -> Self {
         Self {
-            magic: self.magic,
-            level: self.level,
-            btree: self.btree.clone(),
+            magic:    self.magic,
+            level:    self.level,
+            btree:    self.btree.clone(),
             children: Mutex::new(BTreeMap::new()),
         }
     }

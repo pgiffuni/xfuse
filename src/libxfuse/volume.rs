@@ -294,9 +294,9 @@ impl Volume {
             state:      RwLock::new(State {
                 device,
                 rt_device,
-                sb:          superblock,
+                sb: superblock,
                 open_files,
-                handles:     HashMap::new(),
+                handles: HashMap::new(),
                 next_handle: 1,
                 tx,
                 writable,
@@ -371,7 +371,12 @@ impl State {
             .and_modify(|e| e.count += 1)
             .or_insert_with(|| {
                 self.device.set_bufsize(sb.inode_size());
-                let dinode = Dinode::from(self.device.by_ref(), sb, xfs_ino);
+                let mut dinode = Dinode::from(self.device.by_ref(), sb, xfs_ino);
+                // Pre-populate caches so the read path can use read locks.
+                let mode = dinode.di_core.di_mode as u32;
+                if mode & S_IFMT == S_IFREG {
+                    let _ = dinode.get_file();
+                }
                 OpenInode { dinode, count: 1 }
             })
     }
@@ -532,7 +537,7 @@ impl State {
         // it until the walk has finished.
         let tree: Option<(Vec<BmbtRec>, Vec<u64>, u64)> = {
             let mut peek = vec![0u8; inode_size];
-                self.device
+            self.device
                 .device()
                 .read_at(&mut peek, inode_offset)
                 .map_err(|e| FsError::Corrupt {
@@ -1141,7 +1146,7 @@ impl State {
         // write any of it until the walk is finished.
         let tree: Option<(Vec<crate::libxfuse::bmbt_rec::BmbtRec>, Vec<u64>)> = {
             let mut peek = vec![0u8; inode_size];
-                self.device
+            self.device
                 .device()
                 .read_at(&mut peek, inode_offset)
                 .map_err(|e| FsError::Corrupt {
@@ -3362,7 +3367,10 @@ impl Filesystem for Volume {
             None
         };
 
-        match oi.dinode.read(s.device.by_ref(), rtdev, offset as i64, size) {
+        match oi
+            .dinode
+            .read(s.device.by_ref(), rtdev, offset as i64, size)
+        {
             Ok((v, ignore)) => reply.data(&v[ignore..]),
             Err(e) => reply.error(Errno::from_i32(e)),
         }

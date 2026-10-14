@@ -3089,8 +3089,8 @@ impl Clone for BtreeIntermediate {
         let level = hdr.bb_level;
         Self {
             hdr,
-            keys:   self.keys.clone(),
-            ptrs:   self.ptrs.clone(),
+            keys: self.keys.clone(),
+            ptrs: self.ptrs.clone(),
             blocks: Mutex::new(BtreeBlockCache::new(level)),
         }
     }

@@ -338,6 +338,7 @@ impl Dinode {
     /// Return the cached extent map, if already populated.
     ///
     /// Used by the read-only path to avoid `&mut self`.
+    #[allow(dead_code)]
     pub fn file(&self) -> Option<&ExtentMap> {
         self.file.as_ref()
     }
@@ -345,6 +346,7 @@ impl Dinode {
     /// Return the cached directory, if already populated.
     ///
     /// Used by the read-only path to avoid `&mut self`.
+    #[allow(dead_code)]
     pub fn dir(&self) -> Option<&Directory> {
         self.directory.as_ref()
     }
@@ -354,6 +356,7 @@ impl Dinode {
     /// This is the read-only path used when the extent map has already been
     /// populated by `get_file()` (e.g., during `open_inode`). It avoids the
     /// need for `&mut self`, enabling concurrent reads with `RwLock`.
+    #[allow(dead_code)]
     pub fn read_cached<R>(
         &self,
         file: &ExtentMap,
@@ -383,6 +386,7 @@ impl Dinode {
     }
 
     /// Read sectors using a pre-populated extent map (read-only).
+    #[allow(dead_code)]
     fn read_sectors_from<R>(
         file: &ExtentMap,
         buf_reader: &mut R,
@@ -400,8 +404,7 @@ impl Dinode {
         let mut block_offset: u64 = 0;
 
         while size > 0 {
-            let (blk, blocks) =
-                file.lookup(buf_reader.by_ref(), sb, logical_block, true)?;
+            let (blk, blocks) = file.lookup(buf_reader.by_ref(), sb, logical_block, true)?;
             let z = usize::try_from(min(
                 u64::try_from(size).unwrap(),
                 (blocks << sb.sb_blocklog) - block_offset,
@@ -488,7 +491,7 @@ impl Dinode {
         &mut self.attributes
     }
 
-     /// Perform a sector-size aligned read of the file
+    /// Perform a sector-size aligned read of the file
     #[allow(dead_code)]
     fn read_sectors<R>(
         &mut self,

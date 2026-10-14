@@ -63,7 +63,7 @@ struct App {
     /// rejects `n_threads != 1` on other platforms).  Use `--threads=4` for
     /// parallel request processing.
     #[arg(long = "threads", default_value_t = 1)]
-    threads:    usize,
+    threads: usize,
 }
 
 fn main() {
@@ -172,8 +172,7 @@ fn main() {
     // Warn and fall back on FreeBSD.
     if app.threads != 1 && !cfg!(target_os = "linux") {
         eprintln!(
-            "warning: --threads={} is not supported on this platform; \
-             using single-threaded mode",
+            "warning: --threads={} is not supported on this platform; using single-threaded mode",
             app.threads
         );
         config.n_threads = None;

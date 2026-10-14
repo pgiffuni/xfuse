@@ -84,7 +84,9 @@ impl AttrNode {
         if !cache_guard.contains_key(&dblock) {
             let fsblock = self.map_dblock(dblock);
             let leaf_offset = sb.fsb_to_offset(fsblock);
-            buf_reader.seek(SeekFrom::Start(leaf_offset)).map_err(|_| libc::EIO)?;
+            buf_reader
+                .seek(SeekFrom::Start(leaf_offset))
+                .map_err(|_| libc::EIO)?;
             let node: AttrLeafblock = decode_from(buf_reader.by_ref()).unwrap();
             cache_guard.insert(dblock, node);
         }

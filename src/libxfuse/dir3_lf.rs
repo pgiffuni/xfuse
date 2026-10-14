@@ -316,12 +316,7 @@ impl Dir2Lf {
         NodeLikeAddressIterator::new(self, buf_reader, hash, sb).map(|ai| Box::new(ai) as _)
     }
 
-    fn read_dblock<R>(
-        &self,
-        mut buf_reader: R,
-        sb: &Sb,
-        dblock: XfsDablk,
-    ) -> Result<Vec<u8>, i32>
+    fn read_dblock<R>(&self, mut buf_reader: R, sb: &Sb, dblock: XfsDablk) -> Result<Vec<u8>, i32>
     where
         R: Reader + BufRead + Seek,
     {

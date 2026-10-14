@@ -25,9 +25,11 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use std::io::{self, BufRead, Read, Result as IoResult, Seek, SeekFrom};
-use std::path::Path;
-use std::sync::Arc;
+use std::{
+    io::{self, BufRead, Read, Result as IoResult, Seek, SeekFrom},
+    path::Path,
+    sync::Arc,
+};
 
 use bincode_next::{de::read::Reader, error::DecodeError};
 

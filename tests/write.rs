@@ -1531,9 +1531,13 @@ fn concurrency_benchmark_4t() {
 }
 
 fn run_concurrency_benchmark(mnt: &Path, fuse_threads: usize) {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-    use std::time::Instant;
+    use std::{
+        sync::{
+            atomic::{AtomicU64, Ordering as AtomicOrdering},
+            Arc,
+        },
+        time::Instant,
+    };
 
     let file_path = mnt.join("dir/big.bin");
     let original = std::fs::read(&file_path).expect("reading benchmark file");
@@ -1572,8 +1576,14 @@ fn run_concurrency_benchmark(mnt: &Path, fuse_threads: usize) {
     let mib = bytes_read as f64 / 1024.0 / 1024.0;
     let throughput = mib / elapsed.as_secs_f64();
     eprintln!(
-        "concurrency_benchmark (fuse_threads={}): {} client threads, {} reads/thread, {} MiB read in {:.2}s = {:.1} MiB/s",
-        fuse_threads, num_threads, reads_per_thread, mib, elapsed.as_secs_f64(), throughput
+        "concurrency_benchmark (fuse_threads={}): {} client threads, {} reads/thread, {} MiB read \
+         in {:.2}s = {:.1} MiB/s",
+        fuse_threads,
+        num_threads,
+        reads_per_thread,
+        mib,
+        elapsed.as_secs_f64(),
+        throughput
     );
 }
 
@@ -1624,7 +1634,10 @@ fn concurrent_writes() {
 
         // After concurrent writes, verify the file is still consistent by reading it
         let content = std::fs::read(mnt.join("dir/big.bin")).expect("read failed");
-        eprintln!("concurrent_writes: file size after concurrent writes: {}", content.len());
+        eprintln!(
+            "concurrent_writes: file size after concurrent writes: {}",
+            content.len()
+        );
     });
 }
 
@@ -1673,9 +1686,13 @@ fn concurrent_mixed_workload() {
         panic!("xfs-fuse did not mount {image:?} at {mnt:?}: {e}");
     }
 
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-    use std::time::Instant;
+    use std::{
+        sync::{
+            atomic::{AtomicU64, Ordering as AtomicOrdering},
+            Arc,
+        },
+        time::Instant,
+    };
 
     let big_bin = mnt.join("dir/big.bin");
     let original = std::fs::read(&big_bin).expect("reading benchmark file");
@@ -1726,7 +1743,8 @@ fn concurrent_mixed_workload() {
 
     let elapsed = start.elapsed();
     eprintln!(
-        "concurrent_mixed_workload: {} threads, {} iters each, {} readdir ops + {} file reads in {:.2}s",
+        "concurrent_mixed_workload: {} threads, {} iters each, {} readdir ops + {} file reads in \
+         {:.2}s",
         num_threads,
         iterations,
         readdir_count.load(AtomicOrdering::SeqCst),
