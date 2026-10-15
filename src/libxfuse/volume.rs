@@ -117,6 +117,7 @@ use crate::libxfuse::{
         BtreeRoot,
         BMBT_NULL_PTR,
     },
+    log::{LogRecovery, LogReplayer},
 };
 
 /// We must store the Superblock in a global variable.  This is unfortunate, and limits us to only
@@ -268,6 +269,12 @@ impl Volume {
                 what: "the superblock has no root inode".into(),
             });
         }
+
+        // If mounting read-write with journaling, replay the log first
+        if writable {
+            Self::recover_log(device_name, &block_device, &superblock)?;
+        }
+
         let mut root_inode = Dinode::from(device.by_ref(), &superblock, superblock.sb_rootino);
         if root_inode.di_core.di_mode as u32 & S_IFMT == S_IFDIR {
             let _ = root_inode.get_dir(device.by_ref(), &superblock);
@@ -310,6 +317,23 @@ impl Volume {
             no_open:    AtomicBool::new(false),
             no_opendir: AtomicBool::new(false),
         })
+    }
+
+    /// Replay the log if it contains committed transactions.
+    ///
+    /// This scans the log region for committed transactions and applies
+    /// any buffer items to the device.  A crash-consistent image has an
+    /// empty (or already-replayed) log, so this is a no-op for most mounts.
+    fn recover_log(device_name: &Path, device: &BlockDevice, sb: &Sb) -> FsResult<()> {
+        // Open a separate read handle for log analysis (BlockReader implements Read+Seek)
+        let mut reader = BlockReader::open(device_name)?;
+        let recovery = LogRecovery::analyze(&mut reader, sb)?;
+        if recovery.committed_count() > 0 {
+            let mut replayer = LogReplayer::new(device, sb);
+            let blocks = replayer.replay(&recovery)?;
+            debug!("recovered {} blocks from log", blocks);
+        }
+        Ok(())
     }
 
     /// Test-only accessor: delegates to `State::add_dirent`.

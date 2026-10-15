@@ -740,8 +740,16 @@ impl<'a> LogReplayer<'a> {
         let mut blocks_replayed = 0usize;
         for txn in &recovery.committed {
             for op in &txn.ops {
+                // Only replay buffer item operations
+                if op.item_kind != Some(XlogItemKind::Buf) {
+                    continue;
+                }
                 if let Some(item) = self.extract_buf_item(op) {
-                    let offset = item.fsbno * u64::from(self.sb.sb_blocksize);
+                    let bs = u64::from(self.sb.sb_blocksize);
+                    let offset = item
+                        .fsbno
+                        .checked_mul(bs)
+                        .ok_or_else(|| FsError::corrupt("fsbno * bs overflows"))?;
                     self.device.write_at(&item.data, offset)?;
                     blocks_replayed += item.len as usize;
                 }
@@ -759,11 +767,20 @@ impl<'a> LogReplayer<'a> {
     /// - 4 bytes: length in bytes (big-endian)
     /// - remaining: the block data
     fn extract_buf_item(&self, op: &LogOp) -> Option<BufItem> {
+        // Only parse ops identified as Buf items
+        if op.item_kind != Some(XlogItemKind::Buf) {
+            return None;
+        }
         if op.payload.len() < 12 {
             return None;
         }
+        // Validate that fsbno and len are reasonable (prevent overflow on multiplication)
         let fsbno = u64::from_be_bytes(op.payload[0..8].try_into().unwrap());
         let len = u32::from_be_bytes(op.payload[8..12].try_into().unwrap());
+        // Check for obviously malformed values
+        if fsbno > u32::MAX as u64 || len > 65536 {
+            return None;
+        }
         let data = op.payload[12..].to_vec();
         Some(BufItem { fsbno, len, data })
     }
