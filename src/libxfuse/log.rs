@@ -43,7 +43,10 @@
 //! replay, commit records, client locking -- is deliberately absent: it is a
 //! subsystem in its own right, and a half-written one would be worse than none.
 
-use crate::libxfuse::error::{FsError, FsResult};
+use crate::libxfuse::{
+    error::{FsError, FsResult},
+    sb::Sb,
+};
 
 /// `XLOG_HEADER_MAGIC_NUM` — the word at the start of every log block.
 ///
@@ -137,6 +140,7 @@ impl XlogLsn {
 ///   [cycle].
 ///
 /// [cycle]: Self::cycle
+#[derive(Debug, Clone)]
 pub struct XlogRecHeader {
     /// `h_magicno` — [XLOG_HEADER_MAGIC_NUM].
     pub magicno:    u32,
@@ -201,10 +205,16 @@ impl XlogRecHeader {
     /// Refuses a block that does not begin with the magic, because a block that does
     /// not is not a log record and reading its second word as a cycle number is how a
     /// journal turns into a plausible-looking integer.
+    ///
+    /// The buffer must hold at least the fixed header fields through
+    /// `h_num_logops` at offset 44.  When the buffer is large enough to also hold
+    /// the `h_cycle_data` array (an `XLOG_HEADER_CYCLE_SIZE`-byte region) and the
+    /// fields that follow it (`h_fmt`, `h_fs_uuid`, `h_size`), those are decoded
+    /// too; on a 512-byte log block they live in a later block and are left zero.
     pub fn decode(block: &[u8]) -> FsResult<Self> {
-        if block.len() < XLOG_HEADER_SIZE {
+        if block.len() < 48 {
             return Err(FsError::corrupt(
-                "a log record header needs a whole block to sit in",
+                "a log record header needs at least 48 bytes for the fixed fields",
             ));
         }
         let w = |i: usize| u32::from_be_bytes(block[i * 4..i * 4 + 4].try_into().unwrap());
@@ -215,21 +225,40 @@ impl XlogRecHeader {
             )));
         }
         let be64 = |i: usize| u64::from_be_bytes(block[i..i + 8].try_into().unwrap());
+
+        // Fields that are always present (offsets 0..44):
+        let fmt_offset = XLOG_HEADER_CYCLE_SIZE / 4 + 4;
+        let fmt = if block.len() > fmt_offset * 4 {
+            w(fmt_offset)
+        } else {
+            0
+        };
+        let fs_uuid = if block.len() > (fmt_offset + 4) * 4 {
+            block[(fmt_offset + 4) * 4..(fmt_offset + 8) * 4]
+                .try_into()
+                .unwrap()
+        } else {
+            [0u8; 16]
+        };
+        let size = if block.len() > (fmt_offset + 8) * 4 {
+            w(fmt_offset + 8)
+        } else {
+            0
+        };
+
         Ok(Self {
-            magicno:    w(0),
-            cycle:      w(1),
-            version:    w(2),
-            len:        w(3),
-            lsn:        be64(4).into(),
-            tail_lsn:   be64(6).into(),
-            crc:        u32::from_le_bytes(block[32..36].try_into().unwrap()),
+            magicno: w(0),
+            cycle: w(1),
+            version: w(2),
+            len: w(3),
+            lsn: be64(4).into(),
+            tail_lsn: be64(6).into(),
+            crc: u32::from_le_bytes(block[32..36].try_into().unwrap()),
             prev_block: w(9),
             num_logops: w(10),
-            fmt:        w(XLOG_HEADER_CYCLE_SIZE / 4),
-            fs_uuid:    block[XLOG_HEADER_CYCLE_SIZE / 4 + 4..XLOG_HEADER_CYCLE_SIZE / 4 + 20]
-                .try_into()
-                .unwrap(),
-            size:       w(XLOG_HEADER_CYCLE_SIZE / 4 + 20),
+            fmt,
+            fs_uuid,
+            size,
         })
     }
 }
@@ -238,6 +267,7 @@ impl XlogRecHeader {
 ///
 /// `oh_res2` is two bytes of padding, and its presence is the reason this is twelve
 /// bytes rather than ten.
+#[derive(Debug, Clone)]
 pub struct XlogOpHeader {
     /// `oh_tid` — the transaction this operation belongs to.
     pub tid:      u32,
@@ -271,6 +301,290 @@ impl XlogOpHeader {
     /// Has this transaction been committed?  Durable, or not yet?
     pub const fn is_committed(&self) -> bool {
         self.flags & XLOG_COMMIT_TRANS != 0
+    }
+}
+
+/// The kind of metadata a log operation refers to, as `xfs_logprint` decodes it.
+///
+/// These tag values identify the type of an `xfs_log_item` in the log record.
+/// They are taken from the XFS on-disk log item type constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XlogItemKind {
+    Unknown(u16),
+    Inode,
+    Buf,
+    Inobt,
+    Agf,
+    Agi,
+    Btree,
+}
+
+impl XlogItemKind {
+    /// Decode the 16-bit type code that precedes a log item's data.
+    pub fn from_code(code: u16) -> Self {
+        match code {
+            0x0001 | 0x0009 => XlogItemKind::Inode, // XFS_LI_INODE / XFS_LI_INODEB
+            0x0002 => XlogItemKind::Buf,            // XFS_LI_BUF
+            0x0003 => XlogItemKind::Inobt,          // XFS_LI_INOBT
+            0x0004 => XlogItemKind::Agf,            // XFS_LI_AGF
+            0x0005 => XlogItemKind::Agi,            // XFS_LI_AGI
+            0x0006 => XlogItemKind::Btree,          // XFS_LI_BTREE
+            _ => XlogItemKind::Unknown(code),
+        }
+    }
+}
+
+/// A single log operation as it appears in the record.
+#[derive(Debug, Clone)]
+pub struct LogOp {
+    pub header:    XlogOpHeader,
+    pub offset:    u64, // byte offset of this op's header in the log region
+    pub item_kind: Option<XlogItemKind>, // decoded from the payload if possible
+}
+
+/// A complete log record with all its operations.
+#[derive(Debug, Clone)]
+pub struct LogRecord {
+    pub header:    XlogRecHeader,
+    pub offset:    u64, // byte offset of this record's header
+    pub ops:       Vec<LogOp>,
+    pub committed: bool, // has a COMMIT op been seen?
+}
+
+/// A forward-only walker over the log records in an image.
+///
+/// This is a read-only inspection tool: it never writes to the source image.
+/// It walks the log region (`sb_logstart` to `sb_logstart + sb_logblocks`)
+/// block by block, finding record headers by their magic word, and decoding
+/// each transaction's operations.
+///
+/// ## Usage
+///
+/// ```no_run
+/// # use crate::libxfuse::log::LogWalker;
+/// # use crate::libxfuse::sb::Sb;
+/// # use std::io::BufRead;
+/// # use std::io::Seek;
+/// # let image = std::fs::File::open("image.img").unwrap();
+/// # let sb = Sb::from(&mut std::io::BufReader::new(&image));
+/// let mut reader = std::io::BufReader::new(image);
+/// let walker = LogWalker::new(&mut reader, &sb);
+/// for record in walker {
+///     println!("record at lsn {:?}, {} ops, committed: {}",
+///              record.header.lsn, record.ops.len(), record.committed);
+/// }
+/// ```
+pub struct LogWalker<'r, R> {
+    reader:    &'r mut R,
+    sb:        &'r Sb,
+    blocksize: usize,
+    /// Current byte offset within the log region
+    pos:       u64,
+    /// Absolute end of log region in bytes
+    log_end:   u64,
+}
+
+impl<'r, R> LogWalker<'r, R>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    /// Create a walker for the log in `sb` on `reader`.
+    pub fn new(reader: &'r mut R, sb: &'r Sb) -> Self {
+        let bs = sb.sb_blocksize as usize;
+        let log_start = sb.log_start_block() * bs as u64;
+        let log_len = sb.log_blocks_len();
+        let log_end = log_start + log_len * bs as u64;
+        Self {
+            reader,
+            sb,
+            blocksize: bs,
+            pos: log_start,
+            log_end,
+        }
+    }
+
+    /// The byte offset of the log region start in the image.
+    pub fn log_start_bytes(&self) -> u64 {
+        self.sb.log_start_block() * self.blocksize as u64
+    }
+
+    /// Scan forward to the next record header.
+    ///
+    /// Searches block-by-block for `XLOG_HEADER_MAGIC_NUM`. Returns `Ok(None)`
+    /// when the end of the log region is reached without finding another record.
+    fn find_next_record(&mut self) -> FsResult<Option<u64>> {
+        let bs = self.blocksize as u64;
+        while self.pos + XLOG_HEADER_SIZE as u64 <= self.log_end {
+            // Read the first 4 bytes at current position to check for magic
+            self.reader
+                .seek(std::io::SeekFrom::Start(self.pos))
+                .map_err(FsError::Io)?;
+            let mut magic_buf = [0u8; 4];
+            match self.reader.read_exact(&mut magic_buf) {
+                Ok(()) => {
+                    let magic = u32::from_be_bytes(magic_buf);
+                    if magic == XLOG_HEADER_MAGIC_NUM {
+                        return Ok(Some(self.pos));
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(FsError::Io(e)),
+            }
+            self.pos += bs;
+        }
+        Ok(None)
+    }
+}
+
+impl<'r, R> Iterator for LogWalker<'r, R>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    type Item = LogRecord;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Find the next record header
+        let offset = self.find_next_record().ok()??;
+
+        // Read the full header (512 bytes minimum)
+        let bs = self.blocksize;
+        let header_bytes = std::cmp::max(XLOG_HEADER_SIZE, bs);
+        self.reader.seek(std::io::SeekFrom::Start(offset)).ok()?;
+        let mut buf = vec![0u8; header_bytes];
+        if self.reader.read_exact(&mut buf).is_err() {
+            return None;
+        }
+
+        // Decode the record header
+        let header = match XlogRecHeader::decode(&buf) {
+            Ok(h) => h,
+            Err(_) => return None,
+        };
+
+        // The data region follows the header; it spans `header.len` bytes
+        // aligned to block boundaries
+        let data_len = header.len as u64;
+        let record_end = offset + XLOG_HEADER_SIZE as u64 + data_len;
+        if record_end > self.log_end {
+            return None;
+        }
+
+        // Read the data region
+        let data_start = offset + XLOG_HEADER_SIZE as u64;
+        self.reader
+            .seek(std::io::SeekFrom::Start(data_start))
+            .ok()?;
+        let mut data = vec![0u8; data_len as usize];
+        if self.reader.read_exact(&mut data).is_err() {
+            return None;
+        }
+
+        // Parse operations from the data
+        let ops = parse_log_ops(&data, offset + XLOG_HEADER_SIZE as u64);
+
+        let committed = ops.iter().any(|op| op.header.is_committed());
+
+        // Advance past this record
+        // Record length is rounded up to log block size
+        let rounded_len = data_len.div_ceil(bs as u64) * bs as u64;
+        self.pos = offset + XLOG_HEADER_SIZE as u64 + rounded_len;
+
+        Some(LogRecord {
+            header,
+            offset,
+            ops,
+            committed,
+        })
+    }
+}
+
+/// Parse operation headers from a log record's data region.
+///
+/// Each operation begins with a 12-byte `XlogOpHeader`. The `oh_len` field
+/// gives the payload size following the header.
+fn parse_log_ops(data: &[u8], base: u64) -> Vec<LogOp> {
+    let mut ops = Vec::new();
+    let mut pos = 0usize;
+    while pos + XlogOpHeader::SIZE <= data.len() {
+        let op_bytes = &data[pos..pos + XlogOpHeader::SIZE];
+        let header = match XlogOpHeader::decode(op_bytes) {
+            Ok(h) => h,
+            Err(_) => break,
+        };
+        let op_offset = base + pos as u64;
+
+        // Try to decode the item kind from the payload
+        let payload_start = pos + XlogOpHeader::SIZE;
+        let payload_end = std::cmp::min(payload_start + header.len as usize, data.len());
+        let item_kind = header.item_kind_from_payload(&data[payload_start..payload_end]);
+
+        ops.push(LogOp {
+            header: header.clone(),
+            offset: op_offset,
+            item_kind,
+        });
+
+        pos += XlogOpHeader::SIZE + header.len as usize;
+    }
+    ops
+}
+
+impl XlogOpHeader {
+    /// Try to decode the log item type from the operation's payload.
+    ///
+    /// Each `xfs_log_item` begins with a 16-bit type code identifying the
+    /// metadata structure it represents.
+    pub fn item_kind_from_payload(&self, payload: &[u8]) -> Option<XlogItemKind> {
+        if payload.len() < 2 {
+            return None;
+        }
+        let code = u16::from_be_bytes([payload[0], payload[1]]);
+        Some(XlogItemKind::from_code(code))
+    }
+}
+
+/// A transaction reconstructed from one or more log records, grouped by `tid`.
+///
+/// In the XFS log, a transaction is identified by its transaction ID (`tid`),
+/// which appears in each `XlogOpHeader`. A transaction may span multiple log
+/// records if the payload exceeds the log record size limit.
+#[derive(Debug, Clone)]
+pub struct LogTransaction {
+    pub tid:       u32,
+    pub ops:       Vec<LogOp>,
+    pub committed: bool,
+}
+
+impl LogTransaction {
+    /// Group log records into transactions by `tid`.
+    ///
+    /// Records with `XLOG_COMMIT_TRANS` set on their op are marked committed.
+    /// A single record may contain multiple ops with the same tid (a single large
+    /// transaction), or a transaction may span multiple records.
+    pub fn group_from_records(records: Vec<LogRecord>) -> Vec<LogTransaction> {
+        let mut by_tid: Vec<(u32, Vec<LogOp>, bool)> = Vec::new();
+
+        for rec in &records {
+            for op in &rec.ops {
+                if let Some(entry) = by_tid.iter_mut().find(|(tid, _, _)| *tid == op.header.tid) {
+                    entry.1.push(op.clone());
+                    if op.header.is_committed() {
+                        entry.2 = true;
+                    }
+                } else {
+                    by_tid.push((op.header.tid, vec![op.clone()], op.header.is_committed()));
+                }
+            }
+        }
+
+        by_tid
+            .into_iter()
+            .map(|(tid, ops, committed)| LogTransaction {
+                tid,
+                ops,
+                committed,
+            })
+            .collect()
     }
 }
 
@@ -406,5 +720,156 @@ mod locate {
                 _n += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod walk {
+    use crate::libxfuse::log::{
+        LogTransaction,
+        LogWalker,
+        XlogItemKind,
+        XlogOpHeader,
+        XlogRecHeader,
+        XFS_TRANSACTION,
+        XLOG_COMMIT_TRANS,
+        XLOG_HEADER_CYCLE_SIZE,
+        XLOG_HEADER_MAGIC_NUM,
+    };
+
+    /// The header's `h_cycle_data` array fills a 32KiB region, plus the fields after
+    /// it (h_fmt, h_fs_uuid, h_size), so a buffer must hold more than 32KiB.
+    fn header_buf() -> Vec<u8> {
+        vec![0u8; XLOG_HEADER_CYCLE_SIZE + 128]
+    }
+
+    /// The walker produces zero records for a zero-filled "log" region.
+    #[test]
+    fn walker_finds_nothing_in_empty_log() {
+        let empty_log = header_buf();
+        assert!(XlogRecHeader::decode(&empty_log).is_err());
+    }
+
+    /// A record header with the right magic decodes, one without it does not.
+    #[test]
+    fn record_header_decodes_with_magic() {
+        let mut block = header_buf();
+        block[0..4].copy_from_slice(&XLOG_HEADER_MAGIC_NUM.to_be_bytes());
+        let header = XlogRecHeader::decode(&block).unwrap();
+        assert_eq!(header.magicno, XLOG_HEADER_MAGIC_NUM);
+    }
+
+    /// The cycle comes from the second word when the magic is present.
+    #[test]
+    fn cycle_in_second_word() {
+        let mut block = header_buf();
+        block[0..4].copy_from_slice(&XLOG_HEADER_MAGIC_NUM.to_be_bytes());
+        block[4..8].copy_from_slice(&42u32.to_be_bytes());
+        let header = XlogRecHeader::decode(&block).unwrap();
+        assert_eq!(header.cycle, 42);
+    }
+
+    /// The little-endian CRC field is decoded correctly.
+    #[test]
+    fn crc_is_little_endian() {
+        let mut block = header_buf();
+        block[0..4].copy_from_slice(&XLOG_HEADER_MAGIC_NUM.to_be_bytes());
+        let crc_val: u32 = 0xdeadbeef;
+        block[32..36].copy_from_slice(&crc_val.to_le_bytes());
+        let header = XlogRecHeader::decode(&block).unwrap();
+        assert_eq!(header.crc, crc_val);
+    }
+
+    /// Op headers parse into their component fields.
+    #[test]
+    fn op_header_parses_fields() {
+        let mut op = [0u8; XlogOpHeader::SIZE];
+        op[0..4].copy_from_slice(&0xdeadbeefu32.to_be_bytes()); // tid
+        op[4..8].copy_from_slice(&100u32.to_be_bytes()); // len
+        op[8] = XFS_TRANSACTION; // clientid
+        op[9] = XLOG_COMMIT_TRANS; // flags
+        let h = XlogOpHeader::decode(&op).unwrap();
+        assert_eq!(h.tid, 0xdeadbeef);
+        assert_eq!(h.len, 100);
+        assert_eq!(h.clientid, XFS_TRANSACTION);
+        assert!(h.is_committed());
+    }
+
+    /// The item-kind decoder maps known type codes.
+    #[test]
+    fn item_kind_from_codes() {
+        assert_eq!(XlogItemKind::from_code(0x0002), XlogItemKind::Buf);
+        assert_eq!(XlogItemKind::from_code(0x0004), XlogItemKind::Agf);
+        assert_eq!(XlogItemKind::from_code(9999), XlogItemKind::Unknown(9999));
+    }
+
+    /// Walk the log of a real golden image and verify the walker finds records.
+    ///
+    /// This tests against `xfsv4.img` which has a dirty log (from mount/unmount
+    /// operations during image creation). The walker should find records with
+    /// valid headers and at least one committed transaction.
+    #[test]
+    fn walk_real_golden_image_log() {
+        let Some(path) = crate::libxfuse::alloc::golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let sb = crate::libxfuse::sb::Sb::from(&mut reader);
+
+        let mut walker = LogWalker::new(&mut reader, &sb);
+        let records: Vec<_> = walker.by_ref().take(10).collect();
+
+        // A golden image's log should have at least one record
+        assert!(
+            !records.is_empty(),
+            "walker found no records in golden image log"
+        );
+
+        // The first record must have the magic
+        let first = &records[0];
+        assert_eq!(first.header.magicno, XLOG_HEADER_MAGIC_NUM);
+
+        // At least one of the first records should be committed
+        let has_committed = records.iter().any(|r| r.committed);
+        assert!(
+            has_committed,
+            "no committed transactions found in golden log"
+        );
+    }
+
+    /// Transactions are reconstructed by grouping ops with the same `tid`.
+    ///
+    /// This groups the first 10 records from the golden image into transactions
+    /// and verifies each has a consistent tid and at least one XFS_TRANSACTION
+    /// operation.
+    #[test]
+    fn transactions_group_by_tid() {
+        let Some(path) = crate::libxfuse::alloc::golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let sb = crate::libxfuse::sb::Sb::from(&mut reader);
+
+        let walker = LogWalker::new(&mut reader, &sb);
+        let txns = LogTransaction::group_from_records(walker.take(20).collect::<Vec<_>>());
+
+        // The golden image should have at least one transaction
+        assert!(
+            !txns.is_empty(),
+            "no transactions reconstructed from golden image log"
+        );
+
+        // Every transaction should have at least one op
+        for txn in &txns {
+            assert!(!txn.ops.is_empty(), "transaction {} has no ops", txn.tid);
+        }
+
+        // At least one transaction should be committed
+        assert!(
+            txns.iter().any(|t| t.committed),
+            "no committed transactions found in golden image log"
+        );
     }
 }

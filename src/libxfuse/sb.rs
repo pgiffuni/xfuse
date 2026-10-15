@@ -787,7 +787,17 @@ impl Sb {
     /// So: the magic marks a log **record**, the log's extent comes from here, and a
     /// magic search is the way to check this range rather than to find it.
     /// Used by the log module's tests and by fixture tooling; nothing in the daemon
-    /// itself needs to find the log, because it does not read or write one yet.
+    /// The first filesystem block of the log, as a block number.
+    pub fn log_start_block(&self) -> u64 {
+        self.sb_logstart
+    }
+
+    /// How many filesystem blocks the log spans.
+    pub fn log_blocks_len(&self) -> u64 {
+        u64::from(self.sb_logblocks)
+    }
+
+    /// The range of filesystem blocks the log occupies, as block numbers.
     #[allow(dead_code)]
     pub fn log_blocks(&self) -> std::ops::Range<u64> {
         self.sb_logstart..self.sb_logstart + u64::from(self.sb_logblocks)
