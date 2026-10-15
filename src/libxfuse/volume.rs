@@ -3922,6 +3922,29 @@ impl Filesystem for Volume {
                 }
             }
 
+            // ZERO_RANGE: for each block, write zeros to disk
+            if zero_range {
+                let zero_buf = vec![0u8; sb.sb_blocksize as usize];
+                for fblock in startoff..endoff {
+                    match btree_root.map_block(&mut buf_reader, fblock, false) {
+                        Ok((Some(fsblock), _)) => {
+                            let offset = sb.fsb_to_offset(fsblock);
+                            if let Err(e) = tx.write_bytes(offset, &zero_buf) {
+                                tx.abort();
+                                reply.error(e.to_errno());
+                                return;
+                            }
+                        }
+                        Ok((None, _)) => continue,
+                        Err(e) => {
+                            tx.abort();
+                            reply.error(Errno::from_i32(e));
+                            return;
+                        }
+                    }
+                }
+            }
+
             // Update inode
             // Recalculate blocks from the btree extent map (through tx to see uncommitted writes)
             let (bmx, nodes) = match btree_root.all_extents_tx(&mut tx) {
@@ -4040,6 +4063,50 @@ impl Filesystem for Volume {
             while extents_idx < extents.len() {
                 new_extents.push(extents[extents_idx]);
                 extents_idx += 1;
+            }
+
+            // ZERO_RANGE: write zeros to all blocks in the range
+            if zero_range {
+                let zero_buf = vec![0u8; sb.sb_blocksize as usize];
+                for fblock in startoff..endoff {
+                    let mut found = false;
+                    for e in &new_extents {
+                        if e.br_startoff <= fblock && fblock < e.br_startoff + e.br_blockcount {
+                            let skip = fblock - e.br_startoff;
+                            let fsblock = e.br_startblock + skip;
+                            let offset = sb.fsb_to_offset(fsblock);
+                            if let Err(e) = tx.write_bytes(offset, &zero_buf) {
+                                tx.abort();
+                                reply.error(e.to_errno());
+                                return;
+                            }
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        // Block is still a hole - allocate and zero
+                        let agno = sb.locate_ino(xfs_ino).agno;
+                        let run = match crate::libxfuse::alloc::allocator::allocate(
+                            &mut tx, &sb, agno, 1,
+                        ) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tx.abort();
+                                reply.error(e.to_errno());
+                                return;
+                            }
+                        };
+                        let ag_base = u64::from(agno) * u64::from(sb.sb_agblocks);
+                        let fsblock = ag_base + run.start as u64;
+                        let offset = sb.fsb_to_offset(fsblock);
+                        if let Err(e) = tx.write_bytes(offset, &zero_buf) {
+                            tx.abort();
+                            reply.error(e.to_errno());
+                            return;
+                        }
+                    }
+                }
             }
 
             // Write new extent list back to inode
