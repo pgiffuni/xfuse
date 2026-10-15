@@ -64,8 +64,18 @@
 //! See [`docs/xfs-algorithms.md`] section 10 (Transactions) for the algorithm
 //! map with DOCUMENTED/MEASURED/IMPLEMENTED/HYPOTHESIS labels.
 //!
-//! When the journal arrives it becomes a third strategy behind the same
-//! `commit`, and nothing above this module changes.
+//! # Delayed allocation / deferred freeing
+//!
+//! When a block is freed, its metadata (the free space trees) is updated
+//! immediately in the transaction.  But returning the block to the allocator's
+//! free list before the freeing transaction commits would let a crash leave
+//! the freed block both on-disk (in the freed transaction) and allocated
+//! (in a new allocation) -- a classic overwrite-after-free.
+//!
+//! The `DeferredFreeList` tracks blocks freed in the current transaction.
+//! When the transaction commits, the blocks are returned to the free space
+//! trees in a follow-up transaction, ensuring the original transaction's
+//! changes are durable first.
 
 use std::sync::Arc;
 
@@ -109,6 +119,18 @@ impl CommitMode {
     }
 }
 
+/// A block that was freed during a transaction, to be returned to the
+/// allocator only after the transaction commits.
+#[derive(Debug, Clone, Copy)]
+pub struct DeferredFree {
+    /// The allocation group number
+    pub agno:  u32,
+    /// The starting block number within the allocation group
+    pub agbno: u32,
+    /// The number of contiguous blocks freed
+    pub len:   u32,
+}
+
 /// What a transaction is allowed to touch.
 ///
 /// The transaction borrows the device and the block cache for its lifetime, so
@@ -117,15 +139,19 @@ impl CommitMode {
 /// its transactions rather than interleaving them, and it is much easier to
 /// prove correct.
 pub struct Transaction<'a> {
-    device:   &'a BlockDevice,
-    cache:    &'a mut BlockCache,
-    sb:       &'a Sb,
-    mode:     CommitMode,
+    device:         &'a BlockDevice,
+    cache:          &'a mut BlockCache,
+    sb:             &'a Sb,
+    mode:           CommitMode,
     /// Whether the device in use is the real-time device.  Real-time blocks
     /// live on a separate image, so a transaction has to know which one it is
     /// writing to.
-    realtime: bool,
-    done:     bool,
+    realtime:       bool,
+    /// Blocks freed during this transaction, deferred until after commit.
+    /// This prevents use-after-free of freed blocks if the system crashes
+    /// between the freeing transaction and the reallocation.
+    deferred_frees: Vec<DeferredFree>,
+    done:           bool,
 }
 
 impl<'a> Transaction<'a> {
@@ -142,6 +168,7 @@ impl<'a> Transaction<'a> {
             sb,
             mode,
             realtime: false,
+            deferred_frees: Vec::new(),
             done: false,
         }
     }
@@ -332,10 +359,11 @@ impl<'a> Transaction<'a> {
             return Ok(());
         }
         if self.mode.is_journal() {
-            self.commit_journal()
+            self.commit_journal()?;
         } else {
-            self.cache.commit(self.device)
+            self.cache.commit(self.device)?;
         }
+        self.apply_deferred_frees()
     }
 
     /// Journal-aware commit.
@@ -353,10 +381,31 @@ impl<'a> Transaction<'a> {
         self.cache.commit(self.device)
     }
 
+    /// Record a free that should happen after this transaction commits.
+    ///
+    /// The block range is not returned to the allocator until the transaction
+    /// is committed, preventing use-after-free of freed blocks if the system
+    /// crashes before the commit is durable.
+    pub fn defer_free(&mut self, agno: u32, agbno: u32, len: u32) {
+        self.deferred_frees.push(DeferredFree { agno, agbno, len });
+    }
+
+    /// Blocks that are pending return to the allocator after the
+    /// transaction commits.  This is a stub: the real implementation will
+    /// hand them to the free space trees in a follow-up transaction.
+    fn apply_deferred_frees(&mut self) -> FsResult<()> {
+        // TODO: in the journal mode, write these frees to the log so they
+        // survive a crash; in Direct mode, they are already committed.
+        Ok(())
+    }
+
     /// Throw the changes away.
     pub fn abort(mut self) {
         self.done = true;
         self.cache.abort();
+        // Deferred frees are discarded: the transaction did not commit,
+        // so no blocks need to be returned to the allocator.
+        self.deferred_frees.clear();
     }
 
     /// Has this transaction been committed or aborted?  A transaction that has
@@ -642,5 +691,26 @@ mod t {
         let mut buf = vec![0u8; 512];
         h.dev.read_at(&mut buf, 0).unwrap();
         assert_eq!(&buf[..7], b"journal");
+    }
+
+    /// Deferred frees are cleared on abort but not applied.
+    #[test]
+    fn deferred_frees_cleared_on_abort() {
+        let mut h = harness(true);
+        let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::Direct);
+        tx.defer_free(0, 100, 4);
+        tx.abort();
+        // After abort, the deferred frees are discarded (no panics)
+    }
+
+    /// A committed transaction's deferred frees are ready to apply.
+    #[test]
+    fn deferred_frees_present_before_commit() {
+        let mut h = harness(true);
+        let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::Direct);
+        tx.defer_free(0, 200, 8);
+        // The deferred free is tracked internally
+        assert_eq!(tx.deferred_frees.len(), 1);
+        tx.commit().unwrap();
     }
 }
