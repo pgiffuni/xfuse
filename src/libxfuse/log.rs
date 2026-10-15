@@ -629,10 +629,14 @@ impl<'a> LogWriter<'a> {
     /// Advance to the next record boundary, wrapping within the log region.
     fn next_record_offset(&self) -> u64 {
         let bs = u64::from(self.sb.sb_blocksize);
+        let log_size = self.sb.log_blocks_len() * bs;
+        if log_size == 0 {
+            // No log area configured: advance past the current record
+            return self.pos + XLOG_HEADER_SIZE as u64 + self.pending.len() as u64;
+        }
         let header_end = self.pos + XLOG_HEADER_SIZE as u64;
         let record_end = header_end + self.pending.len() as u64;
         let rounded = record_end.div_ceil(bs) * bs;
-        let log_size = self.sb.log_blocks_len() * bs;
         let wrapped = (rounded - self.sb.log_start_bytes()) % log_size;
         self.sb.log_start_bytes() + wrapped
     }

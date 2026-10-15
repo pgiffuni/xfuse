@@ -85,6 +85,7 @@ use super::{
     block_cache::BlockCache,
     block_device::BlockDevice,
     error::{FsError, FsResult},
+    log::LogWriter,
     sb::Sb,
 };
 
@@ -368,16 +369,46 @@ impl<'a> Transaction<'a> {
 
     /// Journal-aware commit.
     ///
-    /// In the full implementation, this would:
-    /// 1. Write dirty blocks to the log
+    /// This implements the write-ahead logging protocol:
+    /// 1. Write dirty blocks to the log (via LogWriter)
     /// 2. Write a COMMIT record to the log
-    /// 3. Flush the log
+    /// 3. Flush the log to ensure durability
     /// 4. Write dirty blocks to their final locations on the data device
     /// 5. Mark the log space as reusable
     ///
-    /// For now (Phase 4), this writes directly to the device as a placeholder
-    /// that preserves correctness until the log writer is implemented.
+    /// If the system crashes between steps 2 and 4, the log can be replayed
+    /// to restore consistency. If it crashes before step 2, the transaction
+    /// is discarded (rolled back) during recovery.
     fn commit_journal(&mut self) -> FsResult<()> {
+        let mut writer = LogWriter::new(self.device, self.sb);
+        let tid = writer.begin_transaction();
+
+        // Write each dirty block to the log as a Buf item
+        for offset in self.cache.dirty_blocks() {
+            let block = self.cache.read_block(self.device, offset)?;
+            let data_len = block.len() as u32;
+            // Encode the buffer item payload: fsbno (8 bytes) + len (4 bytes) + data
+            let mut payload = Vec::new();
+            let fsbno = offset / u64::from(self.sb.sb_blocksize);
+            payload.extend_from_slice(&fsbno.to_be_bytes());
+            payload.extend_from_slice(&data_len.to_be_bytes());
+            payload.extend_from_slice(block);
+            writer.append_op(tid, crate::libxfuse::log::XFS_TRANSACTION, 0, &payload);
+        }
+
+        // Write the COMMIT record to the log
+        let commit_payload: Vec<u8> = Vec::new();
+        writer.append_op(
+            tid,
+            crate::libxfuse::log::XFS_TRANSACTION,
+            crate::libxfuse::log::XLOG_COMMIT_TRANS,
+            &commit_payload,
+        );
+
+        // Flush the log record
+        writer.flush(tid)?;
+
+        // Now write the dirty blocks to their final locations
         self.cache.commit(self.device)
     }
 
