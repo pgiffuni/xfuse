@@ -174,9 +174,12 @@ struct OpenFile {
 ///
 /// This is kept inside a `Mutex` so that `Volume` can implement
 /// `Filesystem` with `&self` methods (required by fuser 0.18).  Locking
-/// `state` serializes FUSE operations; the read-only fields (`sb`,
-/// `writable`, `no_open`, `no_opendir`) are outside the lock to avoid
-/// holding it when the value is not needed.
+/// `state` is protected by an `RwLock` so that read-only FUSE operations
+/// (`getattr`, `read`, `readdir`, `readlink`, `bmap`, `getxattr`, `listxattr`)
+/// can run concurrently via shared read locks, while mutating operations
+/// (`lookup`, `open`, `create`, `write`, etc.) acquire exclusive write locks.
+/// Read-only fields (`sb`, `writable`, `no_open`, `no_opendir`) are outside the
+/// lock to avoid holding it when the value is not needed.
 #[derive(Debug)]
 struct State {
     device:      BlockReader,
