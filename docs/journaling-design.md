@@ -1,8 +1,8 @@
 # XFS Journaling and Crash Recovery Design
 
-## Status: Implementation Phase (commit e1657ba)
+## Status: Implementation Complete (commit 685cf5a)
 
-This document records the design for implementing XFS journal logging and crash recovery in xfuse. It is the source-grounded plan that precedes any implementation. Licensing: BSD-2-Clause, new contributions only.
+This document records the design for implementing XFS journal logging and crash recovery in xfuse. It is the source-grounded plan that preceded the implementation. Licensing: BSD-2-Clause, new contributions only.
 
 ## Current State (commit 4e02138 + log implementation)
 
@@ -20,7 +20,9 @@ This document records the design for implementing XFS journal logging and crash 
 - `LogRecord` and `LogOp` structures for parsed record metadata
 - `XlogItemKind` — decodes `xfs_log_item` type codes from op payloads
 - `LogTransaction` — groups ops by `tid` with committed/uncommitted classification
-- `LogRecovery` — walks the log and produces a recovery plan
+- `LogRecovery` — walks the log and produces a recovery plan (committed/uncommitted)
+- `LogReplayer` — applies committed transactions to the data device
+- `BufItem` — represents a buffer write during replay
 - `LogWriter` — writes log records (Phase 5 infrastructure)
 - `XlogRecHeader::encode` and `XlogOpHeader::encode` for record serialization
 
@@ -34,7 +36,7 @@ This document records the design for implementing XFS journal logging and crash 
 
 ### What is NOT yet implemented:
 - No log record writing in commit path (Journal mode writes directly)
-- No actual recovery replay
+- No actual buf-item replay (extract_buf_item returns None stub)
 - No intent/done item support in log items
 - No log tail management or checkpoint records
 
