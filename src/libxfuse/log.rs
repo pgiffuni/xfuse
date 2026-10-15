@@ -44,6 +44,7 @@
 //! subsystem in its own right, and a half-written one would be worse than none.
 
 use crate::libxfuse::{
+    block_device::BlockDevice,
     error::{FsError, FsResult},
     sb::Sb,
 };
@@ -119,6 +120,11 @@ impl XlogLsn {
 
     /// The raw word, which is what a field of type 8 bytes big-endian holds.
     pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Convert to the raw `u64` representation.
+    pub const fn to_u64(self) -> u64 {
         self.0
     }
 }
@@ -540,6 +546,150 @@ impl XlogOpHeader {
         }
         let code = u16::from_be_bytes([payload[0], payload[1]]);
         Some(XlogItemKind::from_code(code))
+    }
+}
+
+/// A write context for the log, building records for a single transaction.
+///
+/// Phase 5: this is the infrastructure for writing log records. It tracks the
+/// current cycle number, the next transaction ID, and appends records to the log
+/// region starting at `sb_logstart`.
+#[derive(Debug)]
+pub struct LogWriter<'a> {
+    device:   &'a BlockDevice,
+    sb:       &'a Sb,
+    /// Current byte position for the next write in the log
+    pos:      u64,
+    /// Current write cycle number
+    cycle:    u32,
+    /// Next transaction ID to assign
+    next_tid: u32,
+    /// Buffer for the current transaction's operations
+    pending:  Vec<u8>,
+}
+
+impl<'a> LogWriter<'a> {
+    /// Create a writer that appends to the log.
+    pub fn new(device: &'a BlockDevice, sb: &'a Sb) -> Self {
+        Self {
+            device,
+            sb,
+            pos: sb.log_start_bytes(),
+            cycle: 1,
+            next_tid: 1,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Begin a new transaction, returning a transaction ID.
+    pub fn begin_transaction(&mut self) -> u32 {
+        let tid = self.next_tid;
+        self.next_tid = self.next_tid.wrapping_add(1);
+        tid
+    }
+
+    /// Append an operation to the current transaction.
+    pub fn append_op(&mut self, tid: u32, clientid: u8, flags: u8, payload: &[u8]) {
+        let header = XlogOpHeader::encode(tid, payload.len() as u32, clientid, flags, 0);
+        self.pending.extend_from_slice(&header);
+        self.pending.extend_from_slice(payload);
+    }
+
+    /// Flush the current transaction to the log.
+    ///
+    /// This builds a complete log record with the accumulated operations and
+    /// writes it to the log region. The header and data region are written
+    /// together.
+    pub fn flush(&mut self, _tid: u32) -> FsResult<XlogLsn> {
+        let data_len = self.pending.len() as u32;
+        let lsn = XlogLsn::new(self.cycle, (self.pos / XLOG_HEADER_SIZE as u64) as u32);
+
+        let header = XlogRecHeader::encode(
+            self.cycle,
+            2, // version
+            data_len,
+            lsn,
+            XlogLsn::new(0, 0), // tail_lsn will be set properly later
+            0,                  // crc - computed by XFS
+            0,                  // prev_block
+            (self.pending.len() / XlogOpHeader::SIZE) as u32,
+            0, // fmt
+        );
+
+        let record = [&header[..], &self.pending[..]].concat();
+        self.device.write_at(&record, self.pos)?;
+        self.device.flush()?;
+
+        self.pending.clear();
+        self.pos = self.next_record_offset();
+
+        Ok(lsn)
+    }
+
+    /// Advance to the next record boundary, wrapping within the log region.
+    fn next_record_offset(&self) -> u64 {
+        let bs = u64::from(self.sb.sb_blocksize);
+        let header_end = self.pos + XLOG_HEADER_SIZE as u64;
+        let record_end = header_end + self.pending.len() as u64;
+        let rounded = record_end.div_ceil(bs) * bs;
+        let log_size = self.sb.log_blocks_len() * bs;
+        let wrapped = (rounded - self.sb.log_start_bytes()) % log_size;
+        self.sb.log_start_bytes() + wrapped
+    }
+
+    /// Get the current LSN (log sequence number).
+    pub fn current_lsn(&self) -> XlogLsn {
+        XlogLsn::new(self.cycle, (self.pos / XLOG_HEADER_SIZE as u64) as u32)
+    }
+
+    /// Advance to the next cycle.
+    pub fn next_cycle(&mut self) {
+        self.cycle = self.cycle.wrapping_add(1);
+    }
+}
+
+/// Encode a log record header.
+///
+/// This builds the fixed 48-byte header portion of an `xlog_rec_header_t`.
+/// CRC and tail_lsn are left to be computed by the file system.
+impl XlogRecHeader {
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode(
+        cycle: u32,
+        version: u32,
+        data_len: u32,
+        lsn: XlogLsn,
+        tail_lsn: XlogLsn,
+        crc: u32,
+        prev_block: u32,
+        num_logops: u32,
+        fmt: u32,
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; XLOG_HEADER_SIZE];
+        buf[0..4].copy_from_slice(&XLOG_HEADER_MAGIC_NUM.to_be_bytes());
+        buf[4..8].copy_from_slice(&cycle.to_be_bytes());
+        buf[8..12].copy_from_slice(&version.to_be_bytes());
+        buf[12..16].copy_from_slice(&data_len.to_be_bytes());
+        buf[16..24].copy_from_slice(&lsn.to_u64().to_be_bytes());
+        buf[24..32].copy_from_slice(&tail_lsn.to_u64().to_be_bytes());
+        buf[32..36].copy_from_slice(&crc.to_le_bytes());
+        buf[36..40].copy_from_slice(&prev_block.to_be_bytes());
+        buf[40..44].copy_from_slice(&num_logops.to_be_bytes());
+        buf[44..48].copy_from_slice(&fmt.to_be_bytes());
+        buf
+    }
+}
+
+/// Encode a log operation header.
+impl XlogOpHeader {
+    pub fn encode(tid: u32, len: u32, clientid: u8, flags: u8, res2: u16) -> Vec<u8> {
+        let mut buf = vec![0u8; Self::SIZE];
+        buf[0..4].copy_from_slice(&tid.to_be_bytes());
+        buf[4..8].copy_from_slice(&len.to_be_bytes());
+        buf[8] = clientid;
+        buf[9] = flags;
+        buf[10..12].copy_from_slice(&res2.to_be_bytes());
+        buf
     }
 }
 

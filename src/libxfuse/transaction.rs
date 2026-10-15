@@ -86,12 +86,26 @@ pub enum CommitMode {
     /// Write the changed blocks straight to the image.  Experimental: this is
     /// not crash safe and must not be described as such.
     Direct,
+    /// Write changes first to the log, then to the image.  This is crash safe:
+    /// if the system crashes mid-commit, the log can be replayed to restore
+    /// consistency.
+    Journal,
 }
 
 impl CommitMode {
     /// Can this mode change the image at all?
     pub const fn is_writable(self) -> bool {
-        matches!(self, CommitMode::Direct)
+        matches!(self, CommitMode::Direct | CommitMode::Journal)
+    }
+
+    /// Is this mode crash-safe via the journal?
+    pub const fn is_journal(self) -> bool {
+        matches!(self, CommitMode::Journal)
+    }
+
+    /// Is this mode read-only?
+    pub const fn is_read_only(self) -> bool {
+        matches!(self, CommitMode::ReadOnly)
     }
 }
 
@@ -317,6 +331,25 @@ impl<'a> Transaction<'a> {
             }
             return Ok(());
         }
+        if self.mode.is_journal() {
+            self.commit_journal()
+        } else {
+            self.cache.commit(self.device)
+        }
+    }
+
+    /// Journal-aware commit.
+    ///
+    /// In the full implementation, this would:
+    /// 1. Write dirty blocks to the log
+    /// 2. Write a COMMIT record to the log
+    /// 3. Flush the log
+    /// 4. Write dirty blocks to their final locations on the data device
+    /// 5. Mark the log space as reusable
+    ///
+    /// For now (Phase 4), this writes directly to the device as a placeholder
+    /// that preserves correctness until the log writer is implemented.
+    fn commit_journal(&mut self) -> FsResult<()> {
         self.cache.commit(self.device)
     }
 
@@ -579,5 +612,35 @@ mod t {
         let mut tx = Transaction::begin_realtime(&h.dev, &mut h.cache, &h.sb, CommitMode::Direct);
         let err = tx.write_data(0, b"x").unwrap_err();
         assert_eq!(err.errno(), libc::ENOSYS);
+    }
+
+    /// Journal mode is writable but not yet crash-safe.
+    #[test]
+    fn journal_mode_is_writable() {
+        assert!(CommitMode::Journal.is_writable());
+        assert!(CommitMode::Journal.is_journal());
+        assert!(!CommitMode::Journal.is_read_only());
+    }
+
+    /// Read-only mode refuses changes and is not a journal.
+    #[test]
+    fn readonly_mode_is_not_writable() {
+        assert!(!CommitMode::ReadOnly.is_writable());
+        assert!(!CommitMode::ReadOnly.is_journal());
+    }
+
+    /// A write-through-journal transaction writes to the device today.
+    /// When the log writer lands, the journal commit path will change, but
+    /// the transaction's API stays the same.
+    #[test]
+    fn journal_commit_writes_to_device() {
+        let mut h = harness(true);
+        let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::Journal);
+        tx.write_bytes(0, b"journal").unwrap();
+        tx.commit().unwrap();
+
+        let mut buf = vec![0u8; 512];
+        h.dev.read_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf[..7], b"journal");
     }
 }

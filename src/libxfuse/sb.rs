@@ -803,6 +803,17 @@ impl Sb {
         self.sb_logstart..self.sb_logstart + u64::from(self.sb_logblocks)
     }
 
+    /// The byte offset where the log region begins in the image.
+    pub fn log_start_bytes(&self) -> u64 {
+        self.log_start_block() * u64::from(self.sb_blocksize)
+    }
+
+    /// The byte offset where the log region ends in the image.
+    #[allow(dead_code)]
+    pub fn log_end_bytes(&self) -> u64 {
+        self.log_start_bytes() + self.log_blocks_len() * u64::from(self.sb_blocksize)
+    }
+
     /// Does this file system checksum its metadata?
     ///
     /// A version 5 file system does, and its metadata carries a checksum that
