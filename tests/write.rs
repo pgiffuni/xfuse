@@ -1530,6 +1530,45 @@ fn concurrency_benchmark_4t() {
     let _ = std::fs::remove_dir_all(&mnt);
 }
 
+/// After a write operation, the image should have changed outside the log region.
+///
+/// This verifies the round-trip: modifying an existing file through FUSE should
+/// produce changes visible in the image, excluding the log region.
+#[test]
+fn write_produces_non_log_changes() {
+    require_fusefs!();
+    use util::changed_blocks_excluding_log;
+
+    // Copy the golden image and keep the copy through the whole test
+    let image = writable_copy(&GOLDENV4, "log_write_changes");
+    let before_data = std::fs::read(&*image).unwrap();
+
+    // Write through FUSE
+    with_rw_mount_at(&image, "log_write_changes", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(b"HELLO").unwrap();
+    });
+
+    // Read the modified image
+    let after_data = std::fs::read(&*image).unwrap();
+
+    // Parse the superblock from the image to find the log range
+    // From xfs_sb layout: magic@0, blocksize@4, logstart@48, logblocks@96
+    let blocksize = u32::from_be_bytes(after_data[4..8].try_into().unwrap()) as usize;
+    let logstart = u64::from_be_bytes(after_data[48..56].try_into().unwrap());
+    let logblocks = u32::from_be_bytes(after_data[96..100].try_into().unwrap()) as u64;
+    let log_range = (logstart as u64)..(logstart + logblocks as u64);
+
+    let changed = changed_blocks_excluding_log(&before_data, &after_data, blocksize, log_range);
+    assert!(
+        !changed.is_empty(),
+        "write produced no changes outside the log region"
+    );
+    eprintln!("write changed {} blocks outside the log", changed.len());
+}
+
 fn run_concurrency_benchmark(mnt: &Path, fuse_threads: usize) {
     use std::{
         sync::{
