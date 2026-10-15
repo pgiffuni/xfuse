@@ -588,6 +588,63 @@ impl LogTransaction {
     }
 }
 
+/// A recovery plan produced by analyzing the log.
+///
+/// `LogRecovery` groups transactions from `LogWalker` output into committed
+/// and uncommitted sets. Committed transactions are safe to replay; uncommitted
+/// transactions (those without a COMMIT record) are discarded during recovery.
+#[derive(Debug, Clone)]
+pub struct LogRecovery {
+    pub committed:     Vec<LogTransaction>,
+    pub uncommitted:   Vec<LogTransaction>,
+    pub total_records: usize,
+    pub total_ops:     usize,
+}
+
+impl LogRecovery {
+    /// Walk the log and produce a recovery plan.
+    ///
+    /// Returns the transactions grouped into committed and uncommitted sets.
+    /// Committed transactions have a COMMIT op and can be replayed safely.
+    pub fn analyze(reader: &mut (impl std::io::Read + std::io::Seek), sb: &Sb) -> FsResult<Self> {
+        let mut walker = LogWalker::new(reader, sb);
+        let mut committed = Vec::new();
+        let mut uncommitted = Vec::new();
+        let mut total_records = 0usize;
+        let mut total_ops = 0usize;
+
+        for record in &mut walker {
+            total_records += 1;
+            total_ops += record.ops.len();
+            let txns = LogTransaction::group_from_records(vec![record]);
+            for txn in txns {
+                if txn.committed {
+                    committed.push(txn);
+                } else {
+                    uncommitted.push(txn);
+                }
+            }
+        }
+
+        Ok(Self {
+            committed,
+            uncommitted,
+            total_records,
+            total_ops,
+        })
+    }
+
+    /// Number of committed transactions found in the log.
+    pub fn committed_count(&self) -> usize {
+        self.committed.len()
+    }
+
+    /// Number of uncommitted (in-doubt) transactions.
+    pub fn uncommitted_count(&self) -> usize {
+        self.uncommitted.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,6 +783,7 @@ mod locate {
 #[cfg(test)]
 mod walk {
     use crate::libxfuse::log::{
+        LogRecovery,
         LogTransaction,
         LogWalker,
         XlogItemKind,
@@ -870,6 +928,32 @@ mod walk {
         assert!(
             txns.iter().any(|t| t.committed),
             "no committed transactions found in golden image log"
+        );
+    }
+
+    /// LogRecovery::analyze walks the golden image log and classifies transactions.
+    #[test]
+    fn recovery_analysis_on_golden_image() {
+        let Some(path) = crate::libxfuse::alloc::golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let sb = crate::libxfuse::sb::Sb::from(&mut reader);
+
+        let recovery = LogRecovery::analyze(&mut reader, &sb).unwrap();
+
+        // The golden image log should have records
+        assert!(
+            recovery.total_records > 0,
+            "no records found by recovery analysis"
+        );
+        assert!(recovery.total_ops > 0, "no ops found by recovery analysis");
+
+        // At least some transactions should be committed
+        assert!(
+            recovery.committed_count() > 0,
+            "no committed transactions found during recovery analysis"
         );
     }
 }
