@@ -519,7 +519,7 @@ impl BmbtInteriorBlock {
 
         // Split in half
         let mid = all_keys.len() / 2;
-        let separator_key = all_keys[mid].clone();
+        let separator_key = all_keys[mid];
         let new_keys = all_keys.split_off(mid);
         let new_ptrs = all_ptrs.split_off(mid);
 
@@ -1090,6 +1090,41 @@ impl BmbtLeafBlock {
     }
 }
 
+/// Coalesce adjacent extent records into maximal contiguous runs.
+/// Mirrors `BmbtLeafBlock::coalesce_adjacent` but operates on `Vec<BmbtRec>`.
+pub fn coalesce_adjacent_extents(mut extents: Vec<BmbtRec>) -> Vec<BmbtRec> {
+    if extents.len() < 2 {
+        return extents;
+    }
+
+    let mut i = 0;
+    while i + 1 < extents.len() {
+        let current = &extents[i];
+        let next = &extents[i + 1];
+
+        let current_end = current.br_startoff + current.br_blockcount;
+        let current_end_block = current.br_startblock + current.br_blockcount;
+
+        if current_end == next.br_startoff
+            && current_end_block == next.br_startblock
+            && current.br_flag == next.br_flag
+        {
+            let merged = BmbtRec {
+                br_startoff:   current.br_startoff,
+                br_startblock: current.br_startblock,
+                br_blockcount: current.br_blockcount + next.br_blockcount,
+                br_flag:       current.br_flag,
+            };
+            extents[i] = merged;
+            extents.remove(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+
+    extents
+}
+
 #[derive(Debug, Clone, Decode, Default)]
 pub struct BmdrBlock {
     pub bb_level:   u16,
@@ -1100,7 +1135,7 @@ impl BmdrBlock {
     pub const SIZE: usize = 4;
 }
 
-#[derive(Debug, Clone, Decode)]
+#[derive(Debug, Clone, Copy, Decode)]
 pub struct BmbtKey {
     pub br_startoff: XfsFileoff,
 }
@@ -1715,7 +1750,7 @@ impl BtreeRoot {
 
         // 4. Split the keys/ptrs for new root (level 2)
         let mid = self.keys.len() / 2;
-        let new_separator = self.keys[mid].clone();
+        let new_separator = self.keys[mid];
 
         let left_keys = self.keys[..mid].to_vec();
         let left_ptrs = self.ptrs[..mid].to_vec();
@@ -1904,7 +1939,7 @@ impl BtreeRoot {
                     all_ptrs.insert(idx, new_block);
 
                     let mid = all_keys.len() / 2;
-                    let new_separator = all_keys[mid].clone();
+                    let new_separator = all_keys[mid];
                     let new_keys = all_keys.split_off(mid);
                     let new_ptrs = all_ptrs.split_off(mid);
 
@@ -1972,11 +2007,91 @@ impl BtreeRoot {
         tx: &mut Transaction<'_>,
     ) -> Result<Vec<(XfsFsblock, u32)>, i32>
     where
-        R: bincode_next::de::read::Reader + BufRead + Seek,
+        R: bincode_next::de::read::Reader + BufRead + Seek + DeviceReader,
     {
-        // For root level 0, use the inode's extent list
         if self.bmdr.bb_level == 0 {
-            return Err(libc::ENOSYS);
+            let device = buf_reader.device();
+            let mut extents = self.all_extents_from_inode(device, sb)?;
+            if extents.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let mut freed_blocks = Vec::new();
+
+            // Find and modify/remove records in range [startoff, endoff)
+            for idx in (0..extents.len()).rev() {
+                let record = extents[idx];
+                let rec_start = record.br_startoff;
+                let rec_end = rec_start + record.br_blockcount;
+
+                if rec_start < endoff && rec_end > startoff {
+                    // This record overlaps with the range
+                    if rec_start >= startoff && rec_end <= endoff {
+                        // Record fully in range - remove it
+                        extents.remove(idx);
+                        freed_blocks.push((record.br_startblock, record.br_blockcount as u32));
+                    } else if rec_start < startoff && rec_end > endoff {
+                        // Record spans the entire hole - split into two
+                        let left_extent = BmbtRec {
+                            br_startoff:   rec_start,
+                            br_startblock: record.br_startblock,
+                            br_blockcount: startoff - rec_start,
+                            br_flag:       record.br_flag,
+                        };
+                        let right_extent = BmbtRec {
+                            br_startoff:   endoff,
+                            br_startblock: record.br_startblock + (endoff - rec_start),
+                            br_blockcount: rec_end - endoff,
+                            br_flag:       record.br_flag,
+                        };
+                        extents.remove(idx);
+                        extents.insert(idx, left_extent);
+                        extents.insert(idx + 1, right_extent);
+
+                        let freed_len = endoff - startoff;
+                        freed_blocks.push((
+                            record.br_startblock + (startoff - rec_start),
+                            freed_len as u32,
+                        ));
+                    } else if rec_start < startoff && rec_end > startoff {
+                        // Straddles startoff - trim front
+                        let kept_blocks = startoff - rec_start;
+                        let trimmed_extent = BmbtRec {
+                            br_startoff:   rec_start,
+                            br_startblock: record.br_startblock,
+                            br_blockcount: kept_blocks,
+                            br_flag:       record.br_flag,
+                        };
+                        extents.remove(idx);
+                        extents.insert(idx, trimmed_extent);
+
+                        let freed_len = rec_end - startoff;
+                        freed_blocks.push((record.br_startblock + kept_blocks, freed_len as u32));
+                    } else if rec_start < endoff && rec_end > endoff {
+                        // Straddles endoff - trim end
+                        let kept_blocks = endoff - rec_start;
+                        let trimmed_extent = BmbtRec {
+                            br_startoff:   rec_start,
+                            br_startblock: record.br_startblock,
+                            br_blockcount: kept_blocks,
+                            br_flag:       record.br_flag,
+                        };
+                        extents.remove(idx);
+                        extents.insert(idx, trimmed_extent);
+
+                        let freed_len = rec_end - endoff;
+                        freed_blocks.push((record.br_startblock + kept_blocks, freed_len as u32));
+                    }
+                }
+            }
+
+            // Coalesce adjacent extents after modifications
+            extents = coalesce_adjacent_extents(extents);
+
+            // Write the modified extents back to the inode
+            self.write_extents_to_inode(&extents, sb, tx)?;
+
+            return Ok(freed_blocks);
         }
 
         // For multi-level tree, descend and delete
@@ -2591,10 +2706,12 @@ impl BtreeRoot {
 
             // Try redistribute
             let mut intermediate_mut = intermediate.clone();
+            let separator = self.keys[child_idx + 1];
             if intermediate_mut.redistribute_with(
                 &mut right_intermediate,
                 sb.sb_blocksize as usize,
                 sb.has_crc(),
+                separator,
             ) {
                 // Write both intermediates back
                 let left_hdr = BtreeLblockHdr {
@@ -2641,7 +2758,8 @@ impl BtreeRoot {
             }
 
             // Redistribute failed, try merge (merge right into left)
-            intermediate_mut.merge_with(right_intermediate);
+            let separator = self.keys[child_idx + 1];
+            intermediate_mut.merge_with(right_intermediate, separator);
 
             // Write merged intermediate
             let left_hdr = BtreeLblockHdr {
@@ -2697,10 +2815,12 @@ impl BtreeRoot {
             // Try redistribute
             let mut left_intermediate_mut = left_intermediate.clone();
             let mut intermediate_mut = intermediate.clone();
+            let separator = self.keys[child_idx];
             if left_intermediate_mut.redistribute_with(
                 &mut intermediate_mut,
                 sb.sb_blocksize as usize,
                 sb.has_crc(),
+                separator,
             ) {
                 // Write both intermediates back
                 let left_hdr = BtreeLblockHdr {
@@ -2747,7 +2867,8 @@ impl BtreeRoot {
             }
 
             // Redistribute failed, try merge (merge current into left)
-            left_intermediate_mut.merge_with(intermediate_mut);
+            let separator = self.keys[child_idx];
+            left_intermediate_mut.merge_with(intermediate_mut, separator);
 
             // Write merged intermediate
             let left_hdr = BtreeLblockHdr {
@@ -3257,31 +3378,37 @@ impl BtreeIntermediate {
         })
     }
 
-    /// Merge this node with another node (right sibling).
+    /// Merge this node with another node (right sibling), including the
+    /// separator key that sits between them in the parent.
     #[allow(dead_code)]
-    pub fn merge_with(&mut self, other: BtreeIntermediate) {
+    pub fn merge_with(&mut self, other: BtreeIntermediate, separator: BmbtKey) {
+        self.keys.push(separator);
         self.keys.extend(other.keys);
         self.ptrs.extend(other.ptrs);
     }
 
     /// Redistribute key-pointer pairs with a sibling to maintain minimum occupancy.
+    /// The `separator` key sits between `self` and `other` in the parent and must
+    /// participate in the redistribution.  Returns true if redistribution succeeded.
     #[allow(dead_code)]
     pub fn redistribute_with(
         &mut self,
         other: &mut BtreeIntermediate,
         sb_blocksize: usize,
         has_crc: bool,
+        separator: BmbtKey,
     ) -> bool {
-        let total = self.keys.len() + other.keys.len();
+        let total = self.keys.len() + 1 + other.keys.len();
         if total < 2 * BmbtInteriorBlock::min_children(sb_blocksize, has_crc) {
             // Can't redistribute while maintaining minimum
             return false;
         }
-        // Combine and split evenly
+        // Combine with separator and split evenly
         let mut all_keys = self.keys.clone();
-        all_keys.append(&mut other.keys);
+        all_keys.push(separator);
+        all_keys.append(&mut other.keys.clone());
         let mut all_ptrs = self.ptrs.clone();
-        all_ptrs.append(&mut other.ptrs);
+        all_ptrs.append(&mut other.ptrs.clone());
         // Re-sort by key
         let combined: Vec<_> = all_keys.into_iter().zip(all_ptrs).collect();
         let mut combined_sorted = combined;
