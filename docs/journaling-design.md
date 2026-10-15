@@ -1,12 +1,12 @@
 # XFS Journaling and Crash Recovery Design
 
-## Status: Research Phase
+## Status: Implementation Phase (commit e1657ba)
 
 This document records the design for implementing XFS journal logging and crash recovery in xfuse. It is the source-grounded plan that precedes any implementation. Licensing: BSD-2-Clause, new contributions only.
 
-## Current State (commit 4e02138 + log inspection work)
+## Current State (commit 4e02138 + log implementation)
 
-### What exists
+### What exists — implemented
 
 **Log format parsing (`log.rs`):**
 - `XlogRecHeader` decoder with all fields: magic, cycle, version, len, lsn, tail_lsn, CRC (little-endian), prev_block, num_logops, fmt, fs_uuid, size
@@ -14,18 +14,28 @@ This document records the design for implementing XFS journal logging and crash 
 - Constants for log record header size, magic number, log version flags (`XLOG_HEADER_SIZE`, `XLOG_HEADER_CYCLE_SIZE`, `XLOG_HEADER_MAGIC_NUM`)
 - `XLOG_*_TRANS` flags: START_TRANS, COMMIT_TRANS, CONTINUE_TRANS, WAS_CONT_TRANS, END_TRANS, UNMOUNT_TRANS
 - `XFS_TRANSACTION` (0x69) and `XFS_LOG` (0xaa) client IDs
-- `XlogLsn` type with cycle/block decomposition
-- `Sb::log_blocks()` — returns the log's range for image comparison exclusion; plus new `log_start_block()` and `log_blocks_len()` helpers
+- `XlogLsn` type with cycle/block decomposition and `to_u64` helper
+- `Sb::log_blocks()` for image comparison exclusion; `log_start_block()`, `log_blocks_len()`, `log_start_bytes()`, `log_end_bytes()` helpers
 - `LogWalker` — forward-only read-only iterator over log records in an image
-- `LogRecord` and `LogOp` structures for parsed record/op metadata
+- `LogRecord` and `LogOp` structures for parsed record metadata
 - `XlogItemKind` — decodes `xfs_log_item` type codes from op payloads
+- `LogTransaction` — groups ops by `tid` with committed/uncommitted classification
+- `LogRecovery` — walks the log and produces a recovery plan
+- `LogWriter` — writes log records (Phase 5 infrastructure)
+- `XlogRecHeader::encode` and `XlogOpHeader::encode` for record serialization
 
-### What is NOT in `log.rs`:
-- No transaction reconstruction (beyond grouping ops by `tid`)
-- No recovery/replay
-- No log writing
-- No commit record handling beyond flag definitions
-- No intent/done item support
+**Transaction layer (`transaction.rs`):**
+- `CommitMode::Journal` variant with `is_journal()` and `is_read_only()` methods
+- `commit_journal()` method on Transaction (placeholder for now)
+- `DeferredFree` struct and `defer_free()` method for delayed allocation
+- `apply_deferred_frees()` — stub for future allocator integration
+- `Transaction::commit()` now applies deferred frees after data is written
+- `Transaction::abort()` clears deferred frees
+
+### What is NOT yet implemented:
+- No log record writing in commit path (Journal mode writes directly)
+- No actual recovery replay
+- No intent/done item support in log items
 - No log tail management or checkpoint records
 
 ### Log format findings (observed from xfsv4.img golden image)
@@ -42,11 +52,12 @@ Measured values from `xfs_logprint -f` and direct byte inspection:
 8. **Item types**: Transaction payloads begin with a 16-bit `xfs_log_item` type code; observed types include Inode (0x1), Buf (0x2), and others
 
 **Transaction layer (`transaction.rs`):**
-- `CommitMode` enum: `ReadOnly` (refuses all changes), `Direct` (writes straight to image — NOT crash-safe)
+- `CommitMode` enum: `ReadOnly`, `Direct`, `Journal` (with `is_writable()`, `is_journal()`, `is_read_only()`)
 - `Transaction` struct borrows device, cache, and sb; changes accumulate in `BlockCache`
-- `Transaction::commit()` → `cache.commit()` → writes dirty blocks to device, then flushes
-- `Transaction::abort()` → `cache.abort()` → discards dirty blocks
-- No journal integration; `Direct` mode is explicitly not crash-safe
+- `Transaction::commit()` → writes dirty blocks to device, then applies deferred frees
+- `Transaction::abort()` → discards dirty blocks and clears deferred frees
+- `DeferredFree` struct + `defer_free()` for delayed allocation
+- `Journal` mode is wired through but currently uses the same direct write path (Phase 5)
 
 **Block cache (`block_cache.rs`):**
 - `BlockState`: `Clean`, `Dirty`, `Logged`, `Committed` (Logged/Committed reserved for future journal)
