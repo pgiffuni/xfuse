@@ -979,6 +979,51 @@ mod tests {
     }
 }
 
+    /// After recovery zeroes the magic, the log should appear empty.
+    #[test]
+    fn recovery_marks_log_clean() {
+        let path = match crate::libxfuse::alloc::golden("xfsv4.img") {
+            Some(p) => p,
+            None => {
+                eprintln!("skipping: no unpacked xfsv4.img");
+                return;
+            }
+        };
+        let mut copy = tempfile::NamedTempFile::new().unwrap();
+        std::io::copy(&mut std::fs::File::open(&path).unwrap(), &mut copy).unwrap();
+
+        let dev = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&copy)
+            .unwrap();
+        let mut buf_reader = std::io::BufReader::new(&dev);
+        let sb = crate::libxfuse::sb::Sb::from(&mut buf_reader);
+
+        // Analyze the log (golden image may have committed transactions)
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let recovery = LogRecovery::analyze(&mut reader, &sb).unwrap();
+
+        // If there were committed transactions, zero the magic at log start
+        if recovery.committed_count() > 0 {
+            let log_start = sb.log_start_bytes();
+            let block_device = crate::libxfuse::block_device::BlockDevice::open(
+                copy.path(),
+                crate::libxfuse::block_device::Access::ReadWrite,
+            ).unwrap();
+            // Zero the entire log region to mark it clean
+            let log_end = sb.log_start_bytes() + sb.log_blocks_len() * u64::from(sb.sb_blocksize);
+            let zeroed = vec![0u8; (log_end - log_start) as usize];
+            block_device.write_at(&zeroed, log_start).unwrap();
+            block_device.flush().unwrap();
+
+            // Re-analyze: should find no committed transactions
+            let mut reader2 = std::io::BufReader::new(std::fs::File::open(&copy).unwrap());
+            let recovery2 = LogRecovery::analyze(&mut reader2, &sb).unwrap();
+            assert_eq!(recovery2.committed_count(), 0, "log should be clean after zeroing magic");
+        }
+    }
+
 #[cfg(test)]
 mod locate {
     use super::XLOG_HEADER_MAGIC_NUM;

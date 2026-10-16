@@ -328,7 +328,6 @@ impl Volume {
     /// any buffer items to the device.  A crash-consistent image has an
     /// empty (or already-replayed) log, so this is a no-op for most mounts.
     fn recover_log(device_name: &Path, device: &BlockDevice, sb: &Sb) -> FsResult<()> {
-        // Open a separate read handle for log analysis (BlockReader implements Read+Seek)
         let mut reader = BlockReader::open(device_name)?;
         let recovery = LogRecovery::analyze(&mut reader, sb)?;
         if recovery.committed_count() > 0 {
