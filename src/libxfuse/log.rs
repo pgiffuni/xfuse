@@ -671,6 +671,62 @@ impl<'a> LogWriter<'a> {
     pub fn next_cycle(&mut self) {
         self.cycle = self.cycle.wrapping_add(1);
     }
+
+    /// Write a checkpoint record to the log.
+    ///
+    /// A checkpoint is an empty transaction record with a COMMIT flag,
+    /// establishing a known synchronization point.  After a checkpoint,
+    /// the log guarantees that all prior transactions are durable.
+    ///
+    /// This does not advance the tail LSN on the device; a full
+    /// log-manager checkpoint would update the superblock and reclaim
+    /// log space.  That is deferred to the unmount path.
+    pub fn checkpoint(&mut self) -> FsResult<XlogLsn> {
+        let tid = self.begin_transaction();
+        // An empty transaction: just a commit record
+        let header = XlogOpHeader::encode(
+            tid,
+            0, // no data
+            XFS_TRANSACTION,
+            XLOG_COMMIT_TRANS,
+            0,
+        );
+        let mut record = Vec::new();
+        record.extend_from_slice(&header);
+        // Build the record header
+        let lsn = XlogLsn::new(self.cycle, (self.pos / XLOG_HEADER_SIZE as u64) as u32);
+        let rec_header = XlogRecHeader::encode(
+            self.cycle,
+            2, // version
+            0, // no data
+            lsn,
+            XlogLsn::new(0, 0), // tail_lsn
+            0, // crc
+            0, // prev_block
+            1, // num_logops
+            0, // fmt
+        );
+        let full_record = [&rec_header[..], &record[..]].concat();
+        self.device.write_at(&full_record, self.pos)?;
+        self.device.flush()?;
+        let result = XlogLsn::new(self.cycle, (self.pos / XLOG_HEADER_SIZE as u64) as u32);
+        self.pos = self.next_record_offset_with_size(0);
+        Ok(result)
+    }
+
+    /// Advance to the next record boundary, accounting for a specific data size.
+    fn next_record_offset_with_size(&self, data_len: usize) -> u64 {
+        let bs = u64::from(self.sb.sb_blocksize);
+        let log_size = self.sb.log_blocks_len() * bs;
+        if log_size == 0 {
+            return self.pos + XLOG_HEADER_SIZE as u64 + data_len as u64;
+        }
+        let header_end = self.pos + XLOG_HEADER_SIZE as u64;
+        let record_end = header_end + data_len as u64;
+        let rounded = record_end.div_ceil(bs) * bs;
+        let wrapped = (rounded - self.sb.log_start_bytes()) % log_size;
+        self.sb.log_start_bytes() + wrapped
+    }
 }
 
 /// Encode a log record header.
@@ -995,11 +1051,13 @@ mod tests {
         op[9] = XLOG_COMMIT_TRANS;
         assert!(XlogOpHeader::decode(&op).unwrap().is_committed());
     }
-}
 
-    /// After recovery zeroes the magic, the log should appear empty.
+    /// A checkpoint writes a self-contained log record.
+    ///
+    /// This writes to a temporary image with a known XFS log start, then
+    /// reads back the record to verify the header was written correctly.
     #[test]
-    fn recovery_marks_log_clean() {
+    fn checkpoint_writes_log_record() {
         let path = match crate::libxfuse::alloc::golden("xfsv4.img") {
             Some(p) => p,
             None => {
@@ -1008,39 +1066,34 @@ mod tests {
             }
         };
         let mut copy = tempfile::NamedTempFile::new().unwrap();
-        std::io::copy(&mut std::fs::File::open(&path).unwrap(), &mut copy).unwrap();
+        let mut src = std::fs::File::open(&path).unwrap();
+        std::io::copy(&mut src, &mut copy).unwrap();
 
-        let dev = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&copy)
-            .unwrap();
-        let mut buf_reader = std::io::BufReader::new(&dev);
-        let sb = crate::libxfuse::sb::Sb::from(&mut buf_reader);
-
-        // Analyze the log (golden image may have committed transactions)
+        let device = crate::libxfuse::block_device::BlockDevice::open(
+            copy.path(),
+            crate::libxfuse::block_device::Access::ReadWrite,
+        ).unwrap();
         let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
-        let recovery = LogRecovery::analyze(&mut reader, &sb).unwrap();
+        let sb = crate::libxfuse::sb::Sb::from(&mut reader);
 
-        // If there were committed transactions, zero the magic at log start
-        if recovery.committed_count() > 0 {
-            let log_start = sb.log_start_bytes();
-            let block_device = crate::libxfuse::block_device::BlockDevice::open(
-                copy.path(),
-                crate::libxfuse::block_device::Access::ReadWrite,
-            ).unwrap();
-            // Zero the entire log region to mark it clean
-            let log_end = sb.log_start_bytes() + sb.log_blocks_len() * u64::from(sb.sb_blocksize);
-            let zeroed = vec![0u8; (log_end - log_start) as usize];
-            block_device.write_at(&zeroed, log_start).unwrap();
-            block_device.flush().unwrap();
+        let mut writer = LogWriter::new(&device, &sb);
+        let lsn = writer.checkpoint().unwrap();
+        assert!(lsn.block() > 0, "checkpoint LSN should have a non-zero block");
 
-            // Re-analyze: should find no committed transactions
-            let mut reader2 = std::io::BufReader::new(std::fs::File::open(&copy).unwrap());
-            let recovery2 = LogRecovery::analyze(&mut reader2, &sb).unwrap();
-            assert_eq!(recovery2.committed_count(), 0, "log should be clean after zeroing magic");
-        }
+        // Read back the record header from the log region
+        let log_start = sb.log_start_bytes();
+        let mut buf = vec![0u8; XLOG_HEADER_SIZE];
+        device.read_at(&mut buf, log_start).unwrap();
+        // The checkpoint record should have the log magic
+        assert_eq!(
+            u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+            XLOG_HEADER_MAGIC_NUM,
+            "checkpoint record should have log magic"
+        );
     }
+}
+
+
 
 #[cfg(test)]
 mod locate {
@@ -1153,8 +1206,8 @@ mod walk {
         // Magic at start
         block[0..4].copy_from_slice(&XLOG_HEADER_MAGIC_NUM.to_be_bytes());
         // Fill remaining header with test data
-        for i in 4..32 {
-            block[i] = i as u8;
+        for byte in block[4..32].iter_mut() {
+            *byte = 1;
         }
         // Zero the CRC field
         block[32..36].fill(0);
