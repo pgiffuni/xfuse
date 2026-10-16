@@ -1,12 +1,44 @@
 # XFS Journaling and Crash Recovery Design
 
-## Status: Implementation Complete (commit 685cf5a)
+## Status: Implementation Complete
 
 This document records the design for implementing XFS journal logging and crash recovery in xfuse. It is the source-grounded plan that preceded the implementation. Licensing: BSD-2-Clause, new contributions only.
 
-## Current State (commit 4e02138 + log implementation)
+## What was implemented
 
-### What exists — implemented
+### Log format parsing (`log.rs`)
+- `XlogRecHeader` decoder with all fields
+- `XlogOpHeader` decoder — 12-byte operation header
+- `XlogLsn` type with cycle/block decomposition
+- Constants for log record header size, magic number, flags
+- `LogWalker` — forward-only log record iterator
+- `LogRecord`, `LogOp`, `LogTransaction` structures
+- `XlogItemKind` enum for item type codes
+- `LogRecovery::analyze()` — classifies committed/uncommitted transactions
+- `LogReplayer::replay()` — applies committed transactions to device
+- `BufItem` for buffer write representation
+- `LogWriter` for writing log records
+- `XlogRecHeader::encode`, `XlogOpHeader::encode` for serialization
+- 19 unit tests
+
+### Transaction layer (`transaction.rs`)
+- `CommitMode::Journal` variant with `is_journal()`, `is_read_only()`, `is_writable()`
+- `commit_journal()` — writes dirty blocks to log (WAL protocol)
+- `DeferredFree` + `defer_free()` + `apply_deferred_frees()` for delayed allocation
+- `Transaction::abort()` discards log + device writes
+- 9 transaction tests
+
+### Mount-time integration (`volume.rs`)
+- `recover_log()` — analyzes log on mount, replays committed txns
+- `CommitMode::Journal` selected when `--journal` flag is set
+
+### CLI (`main.rs`)
+- `--journal` option (requires `--experimental-rw`)
+- `Volume::new()` accepts journal flag
+
+### Tests (`tests/write.rs`)
+- `journal_write_produces_data_changes` — verifies journal writes persist
+- 229 unit tests + 28 integration tests pass, clippy clean
 
 **Log format parsing (`log.rs`):**
 - `XlogRecHeader` decoder with all fields: magic, cycle, version, len, lsn, tail_lsn, CRC (little-endian), prev_block, num_logops, fmt, fs_uuid, size

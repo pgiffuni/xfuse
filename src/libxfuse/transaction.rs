@@ -638,6 +638,25 @@ mod t {
         assert!(buf.iter().all(|b| *b == 0x11));
     }
 
+    /// Aborting a journal-mode transaction must not write anything to the log
+    /// or the data device.
+    #[test]
+    fn journal_abort_leaves_image_alone() {
+        let mut h = harness(true);
+        let mut original = vec![0u8; 512];
+        original.fill(0x11);
+        h.dev.write_at(&original, 0).unwrap();
+        h.dev.flush().unwrap();
+
+        let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::Journal);
+        tx.write_bytes(0, b"junkjunk").unwrap();
+        tx.abort();
+
+        let mut buf = vec![0u8; 512];
+        h.dev.read_at(&mut buf, 0).unwrap();
+        assert!(buf.iter().all(|b| *b == 0x11));
+    }
+
     /// Dropping a transaction without committing must also leave the image
     /// alone, because the caller may have lost track of it.
     #[test]
