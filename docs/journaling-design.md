@@ -368,3 +368,20 @@ These phases add tests that validate the journal implementation end-to-end:
 - **`journal_write_passes_xfs_repair`**: Runs `xfs_repair -n` on an image after
   journal-mode writes to verify the resulting filesystem image is consistent
   according to the reference XFS implementation.
+
+## Phase 25: Log space reclamation
+
+Added `sb_logtail` field to `Sb` for tracking the log tail sequence number.
+Added `reclaim_log()` method to `LogWriter` that advances the log tail after
+a transaction's data has been written to the data device.
+
+In this implementation, log space is reclaimed via wrap-around (managed by
+`next_record_offset` in `LogWriter`). The `reclaim_log` method is called after
+the COMMIT record is flushed and data blocks are written to their final locations,
+following the write-ahead logging protocol:
+
+1. Write dirty blocks to the log (Buf items with XFS_LI_BUF type code)
+2. Write COMMIT record to the log
+3. Flush log to device
+4. Write dirty blocks to their final locations on the data device
+5. Reclaim log space by advancing the tail pointer

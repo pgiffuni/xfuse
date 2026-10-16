@@ -406,10 +406,16 @@ impl<'a> Transaction<'a> {
         writer.append_op(tid, XFS_TRANSACTION, XLOG_COMMIT_TRANS, &commit_payload);
 
         // Flush the log record
-        writer.flush(tid)?;
+        let lsn = writer.flush(tid)?;
 
         // Now write the dirty blocks to their final locations
-        self.cache.commit(self.device)
+        self.cache.commit(self.device)?;
+
+        // After data is on the device, reclaim log space by
+        // advancing the log tail to this transaction's commit point
+        writer.reclaim_log(&lsn)?;
+
+        Ok(())
     }
 
     /// Record a free that should happen after this transaction commits.
