@@ -79,6 +79,8 @@ pub const XLOG_START_TRANS: u8 = 0x01;
 /// `XLOG_COMMIT_TRANS` — a committed transaction.  Until this is written, the
 /// transaction is not durable, which is the whole of the ordering problem.
 pub const XLOG_COMMIT_TRANS: u8 = 0x02;
+/// `XFS_LI_BUF` — the log item type code for a buffer item.
+pub const XFS_LI_BUF: u16 = 0x0002;
 /// `XLOG_CONTINUE_TRANS` — this region is a partial, continued into the next.
 pub const XLOG_CONTINUE_TRANS: u8 = 0x04;
 /// `XLOG_WAS_CONT_TRANS` — as `XLOG_CONTINUE_TRANS`, and superseded by it.
@@ -149,32 +151,32 @@ impl XlogLsn {
 #[derive(Debug, Clone)]
 pub struct XlogRecHeader {
     /// `h_magicno` — [XLOG_HEADER_MAGIC_NUM].
-    pub magicno:    u32,
+    pub magicno: u32,
     /// `h_cycle` — the write cycle of the log, or [XLOG_HEADER_MAGIC_NUM]'s
     /// invalid-cycle marker.
-    pub cycle:      u32,
+    pub cycle: u32,
     /// `h_version` — `XLOG_VERSION_1` (1) or `XLOG_VERSION_2` (2), the second
     /// naming a later layout with larger IClogs and an explicit log unit.
-    pub version:    u32,
+    pub version: u32,
     /// `h_len` — length of the data region in bytes, 64-bit aligned.
-    pub len:        u32,
+    pub len: u32,
     /// `h_lsn` — this record's LSN.
-    pub lsn:        XlogLsn,
+    pub lsn: XlogLsn,
     /// `h_tail_lsn` — the LSN of the first record with buffers not yet committed,
     /// which is where recovery resumes.
-    pub tail_lsn:   XlogLsn,
+    pub tail_lsn: XlogLsn,
     /// `h_crc` — **little-endian**, unlike everything around it.
-    pub crc:        u32,
+    pub crc: u32,
     /// `h_prev_block` — the block number of the previous log record.
     pub prev_block: u32,
     /// `h_num_logops` — how many operations this record carries.
     pub num_logops: u32,
     /// `h_fmt` — `XLOG_FMT_LINUX_LE` is 1, `XLOG_FMT_LINUX_BE` is 2.
-    pub fmt:        u32,
+    pub fmt: u32,
     /// `h_fs_uuid` — the file system's identifier.
-    pub fs_uuid:    [u8; 16],
+    pub fs_uuid: [u8; 16],
     /// `h_size` — iclog size, present only for log version 2.
-    pub size:       u32,
+    pub size: u32,
 }
 
 impl XlogRecHeader {
@@ -294,15 +296,15 @@ impl XlogRecHeader {
 #[derive(Debug, Clone)]
 pub struct XlogOpHeader {
     /// `oh_tid` — the transaction this operation belongs to.
-    pub tid:      u32,
+    pub tid: u32,
     /// `oh_len` — bytes of data that follow.
-    pub len:      u32,
+    pub len: u32,
     /// `oh_clientid` — [XFS_TRANSACTION] or [XFS_LOG].
     pub clientid: u8,
     /// `oh_flags` — any of the `XLOG_*_TRANS` flags.
-    pub flags:    u8,
+    pub flags: u8,
     /// `oh_res2` — padding, for alignment.
-    pub res2:     u16,
+    pub res2: u16,
 }
 
 impl XlogOpHeader {
@@ -314,11 +316,11 @@ impl XlogOpHeader {
             return Err(FsError::corrupt("a log operation header is truncated"));
         }
         Ok(Self {
-            tid:      u32::from_be_bytes(b[0..4].try_into().unwrap()),
-            len:      u32::from_be_bytes(b[4..8].try_into().unwrap()),
+            tid: u32::from_be_bytes(b[0..4].try_into().unwrap()),
+            len: u32::from_be_bytes(b[4..8].try_into().unwrap()),
             clientid: b[8],
-            flags:    b[9],
-            res2:     u16::from_be_bytes(b[10..12].try_into().unwrap()),
+            flags: b[9],
+            res2: u16::from_be_bytes(b[10..12].try_into().unwrap()),
         })
     }
 
@@ -361,19 +363,19 @@ impl XlogItemKind {
 /// A single log operation as it appears in the record.
 #[derive(Debug, Clone)]
 pub struct LogOp {
-    pub header:    XlogOpHeader,
-    pub offset:    u64, // byte offset of this op's header in the log region
+    pub header: XlogOpHeader,
+    pub offset: u64, // byte offset of this op's header in the log region
     pub item_kind: Option<XlogItemKind>, // decoded from the payload if possible
     /// The raw payload bytes after the op header (before the next op header).
-    pub payload:   Vec<u8>,
+    pub payload: Vec<u8>,
 }
 
 /// A complete log record with all its operations.
 #[derive(Debug, Clone)]
 pub struct LogRecord {
-    pub header:    XlogRecHeader,
-    pub offset:    u64, // byte offset of this record's header
-    pub ops:       Vec<LogOp>,
+    pub header: XlogRecHeader,
+    pub offset: u64, // byte offset of this record's header
+    pub ops: Vec<LogOp>,
     pub committed: bool, // has a COMMIT op been seen?
 }
 
@@ -401,13 +403,13 @@ pub struct LogRecord {
 /// }
 /// ```
 pub struct LogWalker<'r, R> {
-    reader:    &'r mut R,
-    sb:        &'r Sb,
+    reader: &'r mut R,
+    sb: &'r Sb,
     blocksize: usize,
     /// Current byte offset within the log region
-    pos:       u64,
+    pos: u64,
     /// Absolute end of log region in bytes
-    log_end:   u64,
+    log_end: u64,
 }
 
 impl<'r, R> LogWalker<'r, R>
@@ -577,16 +579,16 @@ impl XlogOpHeader {
 /// region starting at `sb_logstart`.
 #[derive(Debug)]
 pub struct LogWriter<'a> {
-    device:   &'a BlockDevice,
-    sb:       &'a Sb,
+    device: &'a BlockDevice,
+    sb: &'a Sb,
     /// Current byte position for the next write in the log
-    pos:      u64,
+    pos: u64,
     /// Current write cycle number
-    cycle:    u32,
+    cycle: u32,
     /// Next transaction ID to assign
     next_tid: u32,
     /// Buffer for the current transaction's operations
-    pending:  Vec<u8>,
+    pending: Vec<u8>,
 }
 
 impl<'a> LogWriter<'a> {
@@ -701,10 +703,10 @@ impl<'a> LogWriter<'a> {
             0, // no data
             lsn,
             XlogLsn::new(0, 0), // tail_lsn
-            0, // crc
-            0, // prev_block
-            1, // num_logops
-            0, // fmt
+            0,                  // crc
+            0,                  // prev_block
+            1,                  // num_logops
+            0,                  // fmt
         );
         let full_record = [&rec_header[..], &record[..]].concat();
         self.device.write_at(&full_record, self.pos)?;
@@ -782,8 +784,8 @@ impl XlogOpHeader {
 #[derive(Debug, Clone)]
 pub struct BufItem {
     pub fsbno: u64,
-    pub len:   u32,
-    pub data:  Vec<u8>,
+    pub len: u32,
+    pub data: Vec<u8>,
 }
 
 /// Replay committed transactions from the log to the data device.
@@ -796,7 +798,7 @@ pub struct BufItem {
 #[derive(Debug)]
 pub struct LogReplayer<'a> {
     device: &'a BlockDevice,
-    sb:     &'a Sb,
+    sb: &'a Sb,
 }
 
 impl<'a> LogReplayer<'a> {
@@ -845,17 +847,19 @@ impl<'a> LogReplayer<'a> {
         if op.item_kind != Some(XlogItemKind::Buf) {
             return None;
         }
-        if op.payload.len() < 12 {
+        // Payload format: [2 bytes: type code] [8 bytes: fsbno] [4 bytes: len] [data]
+        // The 2-byte type code (XFS_LI_BUF) is read by item_kind_from_payload;
+        // skip it here to get to the fsbno.
+        if op.payload.len() < 14 {
             return None;
         }
-        // Validate that fsbno and len are reasonable (prevent overflow on multiplication)
-        let fsbno = u64::from_be_bytes(op.payload[0..8].try_into().unwrap());
-        let len = u32::from_be_bytes(op.payload[8..12].try_into().unwrap());
+        let fsbno = u64::from_be_bytes(op.payload[2..10].try_into().unwrap());
+        let len = u32::from_be_bytes(op.payload[10..14].try_into().unwrap());
         // Check for obviously malformed values
         if fsbno > u32::MAX as u64 || len > 65536 {
             return None;
         }
-        let data = op.payload[12..].to_vec();
+        let data = op.payload[14..].to_vec();
         Some(BufItem { fsbno, len, data })
     }
 }
@@ -867,8 +871,8 @@ impl<'a> LogReplayer<'a> {
 /// records if the payload exceeds the log record size limit.
 #[derive(Debug, Clone)]
 pub struct LogTransaction {
-    pub tid:       u32,
-    pub ops:       Vec<LogOp>,
+    pub tid: u32,
+    pub ops: Vec<LogOp>,
     pub committed: bool,
 }
 
@@ -912,10 +916,10 @@ impl LogTransaction {
 /// transactions (those without a COMMIT record) are discarded during recovery.
 #[derive(Debug, Clone)]
 pub struct LogRecovery {
-    pub committed:     Vec<LogTransaction>,
-    pub uncommitted:   Vec<LogTransaction>,
+    pub committed: Vec<LogTransaction>,
+    pub uncommitted: Vec<LogTransaction>,
     pub total_records: usize,
-    pub total_ops:     usize,
+    pub total_ops: usize,
 }
 
 impl LogRecovery {
@@ -1072,13 +1076,17 @@ mod tests {
         let device = crate::libxfuse::block_device::BlockDevice::open(
             copy.path(),
             crate::libxfuse::block_device::Access::ReadWrite,
-        ).unwrap();
+        )
+        .unwrap();
         let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
         let sb = crate::libxfuse::sb::Sb::from(&mut reader);
 
         let mut writer = LogWriter::new(&device, &sb);
         let lsn = writer.checkpoint().unwrap();
-        assert!(lsn.block() > 0, "checkpoint LSN should have a non-zero block");
+        assert!(
+            lsn.block() > 0,
+            "checkpoint LSN should have a non-zero block"
+        );
 
         // Read back the record header from the log region
         let log_start = sb.log_start_bytes();
@@ -1092,8 +1100,6 @@ mod tests {
         );
     }
 }
-
-
 
 #[cfg(test)]
 mod locate {
@@ -1142,16 +1148,8 @@ mod locate {
 #[cfg(test)]
 mod walk {
     use crate::libxfuse::log::{
-        LogRecovery,
-        LogTransaction,
-        LogWalker,
-        XlogItemKind,
-        XlogOpHeader,
-        XlogRecHeader,
-        XFS_TRANSACTION,
-        XLOG_COMMIT_TRANS,
-        XLOG_HEADER_CYCLE_SIZE,
-        XLOG_HEADER_MAGIC_NUM,
+        LogRecovery, LogTransaction, LogWalker, XlogItemKind, XlogOpHeader, XlogRecHeader,
+        XFS_TRANSACTION, XLOG_COMMIT_TRANS, XLOG_HEADER_CYCLE_SIZE, XLOG_HEADER_MAGIC_NUM,
     };
 
     /// The header's `h_cycle_data` array fills a 32KiB region, plus the fields after
@@ -1339,12 +1337,7 @@ mod walk {
 #[cfg(test)]
 mod replay {
     use crate::libxfuse::log::{
-        LogOp,
-        LogRecovery,
-        LogReplayer,
-        XlogItemKind,
-        XlogOpHeader,
-        XFS_TRANSACTION,
+        LogOp, LogRecovery, LogReplayer, XlogItemKind, XlogOpHeader, XFS_LI_BUF, XFS_TRANSACTION,
     };
 
     /// The replayer analyzes the golden image and accesses committed transactions.
@@ -1367,22 +1360,24 @@ mod replay {
     /// BufItem parsing decodes fsbno and data from the payload.
     #[test]
     fn buf_item_parses_payload() {
-        // Build a buf item payload matching the format our LogWriter produces:
+        // Build a buf item payload matching the on-disk format:
+        // 2 bytes: item type code (XFS_LI_BUF)
         // 8 bytes: target block number (fsbno, big-endian)
         // 4 bytes: length (big-endian)
         // remaining: block data
         let mut payload = Vec::new();
+        payload.extend_from_slice(&XFS_LI_BUF.to_be_bytes());
         payload.extend_from_slice(&42u64.to_be_bytes());
         payload.extend_from_slice(&8u32.to_be_bytes());
         payload.extend_from_slice(&[0xabu8; 8]);
 
         let op = LogOp {
             header: XlogOpHeader {
-                tid:      1,
-                len:      20,
+                tid: 1,
+                len: 24,
                 clientid: XFS_TRANSACTION,
-                flags:    0,
-                res2:     0,
+                flags: 0,
+                res2: 0,
             },
             offset: 0,
             item_kind: Some(XlogItemKind::Buf),
@@ -1408,5 +1403,94 @@ mod replay {
         assert_eq!(item.fsbno, 42);
         assert_eq!(item.len, 8);
         assert_eq!(item.data, vec![0xab; 8]);
+    }
+
+    /// Round-trip: a log record written by LogWriter is parseable by LogWalker,
+    /// and the buf item payload is extractable by LogReplayer.
+    #[test]
+    fn roundtrip_writer_output_is_parsable() {
+        let Some(path) = crate::libxfuse::alloc::golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+
+        // Create a writable copy
+        let mut copy_file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut src = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+            std::io::copy(&mut src, &mut copy_file).unwrap();
+        }
+        copy_file.as_file().sync_all().unwrap();
+
+        // Read the superblock from the copy
+        let mut reader = std::io::BufReader::new(std::fs::File::open(copy_file.path()).unwrap());
+        let sb = crate::libxfuse::sb::Sb::from(&mut reader);
+        let log_offset = sb.log_start_bytes();
+        assert!(log_offset > 0, "image must have a configured log");
+
+        // Write a single buf item transaction directly to the log region
+        let tid = 1u32;
+        let fsbno: u64 = 100;
+        let test_data = b"test data payload";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&crate::libxfuse::log::XFS_LI_BUF.to_be_bytes());
+        payload.extend_from_slice(&fsbno.to_be_bytes());
+        payload.extend_from_slice(&(test_data.len() as u32).to_be_bytes());
+        payload.extend_from_slice(test_data);
+
+        let op_header = crate::libxfuse::log::XlogOpHeader::encode(
+            tid,
+            payload.len() as u32,
+            crate::libxfuse::log::XFS_TRANSACTION,
+            0,
+            0,
+        );
+
+        let lsn = crate::libxfuse::log::XlogLsn::new(1, 0);
+        let rec_header = crate::libxfuse::log::XlogRecHeader::encode(
+            1,
+            2,
+            (op_header.len() + payload.len()) as u32,
+            lsn,
+            crate::libxfuse::log::XlogLsn::new(0, 0),
+            0,
+            0,
+            1,
+            0,
+        );
+
+        let record = [&rec_header[..], &op_header[..], &payload[..]].concat();
+
+        // Write the record to the log region using a writable file handle
+        let mut wfile = std::fs::OpenOptions::new()
+            .write(true)
+            .open(copy_file.path())
+            .unwrap();
+        use std::io::{Seek, Write};
+        wfile.seek(std::io::SeekFrom::Start(log_offset)).unwrap();
+        wfile.write_all(&record).unwrap();
+        wfile.sync_all().unwrap();
+        drop(wfile);
+
+        // Now read back with LogWalker using a fresh file handle
+        let mut readback = std::io::BufReader::new(std::fs::File::open(copy_file.path()).unwrap());
+        let mut walker = crate::libxfuse::log::LogWalker::new(&mut readback, &sb);
+        let rec = walker.by_ref().next().unwrap();
+        assert!(!rec.ops.is_empty(), "no ops in record");
+
+        let op = &rec.ops[0];
+        assert_eq!(op.item_kind, Some(crate::libxfuse::log::XlogItemKind::Buf));
+
+        // Use extract_buf_item to verify the payload
+        let device = crate::libxfuse::block_device::BlockDevice::open(
+            copy_file.path(),
+            crate::libxfuse::block_device::Access::ReadOnly,
+        )
+        .unwrap();
+        let replayer = crate::libxfuse::log::LogReplayer::new(&device, &sb);
+        let item = replayer.extract_buf_item(op).unwrap();
+        assert_eq!(item.fsbno, fsbno);
+        assert_eq!(item.len, test_data.len() as u32);
+        assert_eq!(item.data, test_data);
     }
 }

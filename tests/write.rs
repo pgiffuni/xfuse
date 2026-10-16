@@ -104,7 +104,7 @@ fn serialize() -> std::sync::MutexGuard<'static, ()> {
 /// running keeps its mount *and* the test harness's output pipe open, which is
 /// enough to make the whole run look like it has hung.
 struct Mounted {
-    mnt:     PathBuf,
+    mnt: PathBuf,
     process: Child,
 }
 
@@ -1612,7 +1612,72 @@ fn journal_write_produces_data_changes() {
         !changed.is_empty(),
         "journal write produced no changes outside the log region"
     );
-    eprintln!("journal write changed {} blocks outside the log", changed.len());
+    eprintln!(
+        "journal write changed {} blocks outside the log",
+        changed.len()
+    );
+}
+
+/// When mounted with --journal, a metadata write should be recorded in the log
+/// with the proper XFS_LI_BUF item type code (0x0002).
+#[test]
+fn journal_records_have_buf_item_kind() {
+    require_fusefs!();
+    use util::changed_blocks_excluding_log;
+
+    let image = writable_copy(&GOLDENV4, "journal_buf_kind");
+    let before_data = std::fs::read(&*image).unwrap();
+
+    // Write through FUSE with journal mode
+    with_rw_journal_mount_at(&image, "journal_buf_kind", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(b"WORLD").unwrap();
+    });
+
+    // Read the modified image
+    let after_data = std::fs::read(&*image).unwrap();
+
+    // Parse the superblock from the image to find the log range
+    let blocksize = u32::from_be_bytes(after_data[4..8].try_into().unwrap()) as usize;
+    let logstart = u64::from_be_bytes(after_data[48..56].try_into().unwrap());
+    let logblocks = u32::from_be_bytes(after_data[96..100].try_into().unwrap()) as u64;
+    let log_range = (logstart as u64)..(logstart + logblocks as u64);
+
+    // The log region must have changed (log records were written)
+    let changed_in_log: Vec<_> = {
+        let log_start_byte = logstart as usize * blocksize;
+        let log_end_byte = log_start_byte + (logblocks as usize * blocksize);
+        let log_before = &before_data[log_start_byte..log_end_byte];
+        let log_after = &after_data[log_start_byte..log_end_byte];
+
+        let mut changed = Vec::new();
+        for i in 0..blocksize {
+            // Check if this block in the log differs
+            let blk_start = i * blocksize;
+            if blk_start < log_before.len() && blk_start + blocksize <= log_before.len() {
+                if &log_before[blk_start..blk_start + blocksize]
+                    != &log_after[blk_start..blk_start + blocksize]
+                {
+                    changed.push((logstart + i as u64, 0, blocksize - 1));
+                }
+            }
+        }
+        changed
+    };
+
+    assert!(
+        !changed_in_log.is_empty(),
+        "journal did not modify the log region (no log records written)"
+    );
+
+    // Verify data changes also appear outside the log
+    let changed = changed_blocks_excluding_log(&before_data, &after_data, blocksize, log_range);
+    assert!(
+        !changed.is_empty(),
+        "journal write produced no changes outside the log region"
+    );
 }
 
 fn run_concurrency_benchmark(mnt: &Path, fuse_threads: usize) {

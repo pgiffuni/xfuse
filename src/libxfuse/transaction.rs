@@ -85,7 +85,7 @@ use super::{
     block_cache::BlockCache,
     block_device::BlockDevice,
     error::{FsError, FsResult},
-    log::LogWriter,
+    log::{LogWriter, XFS_LI_BUF, XFS_TRANSACTION, XLOG_COMMIT_TRANS},
     sb::Sb,
 };
 
@@ -125,11 +125,11 @@ impl CommitMode {
 #[derive(Debug, Clone, Copy)]
 pub struct DeferredFree {
     /// The allocation group number
-    pub agno:  u32,
+    pub agno: u32,
     /// The starting block number within the allocation group
     pub agbno: u32,
     /// The number of contiguous blocks freed
-    pub len:   u32,
+    pub len: u32,
 }
 
 /// What a transaction is allowed to touch.
@@ -140,19 +140,19 @@ pub struct DeferredFree {
 /// its transactions rather than interleaving them, and it is much easier to
 /// prove correct.
 pub struct Transaction<'a> {
-    device:         &'a BlockDevice,
-    cache:          &'a mut BlockCache,
-    sb:             &'a Sb,
-    mode:           CommitMode,
+    device: &'a BlockDevice,
+    cache: &'a mut BlockCache,
+    sb: &'a Sb,
+    mode: CommitMode,
     /// Whether the device in use is the real-time device.  Real-time blocks
     /// live on a separate image, so a transaction has to know which one it is
     /// writing to.
-    realtime:       bool,
+    realtime: bool,
     /// Blocks freed during this transaction, deferred until after commit.
     /// This prevents use-after-free of freed blocks if the system crashes
     /// between the freeing transaction and the reallocation.
     deferred_frees: Vec<DeferredFree>,
-    done:           bool,
+    done: bool,
 }
 
 impl<'a> Transaction<'a> {
@@ -387,23 +387,23 @@ impl<'a> Transaction<'a> {
         for offset in self.cache.dirty_blocks() {
             let block = self.cache.read_block(self.device, offset)?;
             let data_len = block.len() as u32;
-            // Encode the buffer item payload: fsbno (8 bytes) + len (4 bytes) + data
+            // Encode the buffer item payload:
+            // - 2 bytes: item type code (XFS_LI_BUF)
+            // - 8 bytes: target block number (fsbno, big-endian)
+            // - 4 bytes: length in bytes (big-endian)
+            // - remaining: the block data
             let mut payload = Vec::new();
             let fsbno = offset / u64::from(self.sb.sb_blocksize);
+            payload.extend_from_slice(&XFS_LI_BUF.to_be_bytes());
             payload.extend_from_slice(&fsbno.to_be_bytes());
             payload.extend_from_slice(&data_len.to_be_bytes());
             payload.extend_from_slice(block);
-            writer.append_op(tid, crate::libxfuse::log::XFS_TRANSACTION, 0, &payload);
+            writer.append_op(tid, XFS_TRANSACTION, 0, &payload);
         }
 
         // Write the COMMIT record to the log
         let commit_payload: Vec<u8> = Vec::new();
-        writer.append_op(
-            tid,
-            crate::libxfuse::log::XFS_TRANSACTION,
-            crate::libxfuse::log::XLOG_COMMIT_TRANS,
-            &commit_payload,
-        );
+        writer.append_op(tid, XFS_TRANSACTION, XLOG_COMMIT_TRANS, &commit_payload);
 
         // Flush the log record
         writer.flush(tid)?;
@@ -469,9 +469,9 @@ impl Drop for Transaction<'_> {
 #[derive(Debug)]
 pub struct TransactionContext {
     device: Arc<BlockDevice>,
-    cache:  BlockCache,
-    sb:     Sb,
-    mode:   CommitMode,
+    cache: BlockCache,
+    sb: Sb,
+    mode: CommitMode,
 }
 
 impl TransactionContext {
@@ -539,10 +539,10 @@ mod t {
     }
 
     struct Harness {
-        _f:    tempfile::NamedTempFile,
-        dev:   BlockDevice,
+        _f: tempfile::NamedTempFile,
+        dev: BlockDevice,
         cache: BlockCache,
-        sb:    Sb,
+        sb: Sb,
     }
 
     fn harness(writable: bool) -> Harness {
@@ -554,10 +554,10 @@ mod t {
             Access::ReadOnly
         };
         Harness {
-            dev:   BlockDevice::open(f.path(), access).unwrap(),
+            dev: BlockDevice::open(f.path(), access).unwrap(),
             cache: BlockCache::new(512, 64),
-            sb:    sb(),
-            _f:    f,
+            sb: sb(),
+            _f: f,
         }
     }
 

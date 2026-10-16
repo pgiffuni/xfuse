@@ -333,3 +333,26 @@ Write path must serialize initially; add parallelism only after correctness prov
 | Recovery | Not started | Post-write-support |
 | Delayed allocation | Not started | Post-recovery |
 | Allocation reservations | Surveyed | See reservation accounting |
+
+## Phase 19-20: Journal write-read round-trip verification
+
+These phases verify that log records written by the journal commit path can be
+read back correctly:
+
+- **Format alignment**: The `commit_journal()` method in `Transaction` prepends
+  the `XFS_LI_BUF` (0x0002) item type code to each buffer item payload, matching
+  what `LogWalker` and `LogReplayer::extract_buf_item` expect. The payload format
+  is: `[type code (2B)] [fsbno (8B)] [length (4B)] [data]`.
+
+- **Round-trip unit test** (`roundtrip_writer_output_is_parsable`): Writes a log
+  record with a buf item payload, reads it back with `LogWalker`, and verifies
+  `extract_buf_item` correctly parses the fsbno, length, and data fields.
+
+- **Integration test** (`journal_records_have_buf_item_kind`): Mounts with
+  `--journal`, writes data through FUSE, and verifies that the log region is
+  modified and data changes appear outside the log region.
+
+## Phase 22: Documentation
+
+All phases documented in this file with implementation details, test coverage,
+and format specifications.
