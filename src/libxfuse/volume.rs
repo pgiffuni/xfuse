@@ -287,7 +287,7 @@ impl Volume {
         }
 
         let mut root_inode = Dinode::from(device.by_ref(), &superblock, superblock.sb_rootino);
-        if (root_inode.di_core.di_mode as u32) & S_IFMT == S_IFDIR {
+        if (root_inode.di_core.di_mode as u32) & (S_IFMT as u32) == (S_IFDIR as u32) {
             let _ = root_inode.get_dir(device.by_ref(), &superblock);
         }
         let mut open_files = HashMap::new();
@@ -435,9 +435,9 @@ impl State {
                 self.device.set_bufsize(sb.inode_size());
                 let mut dinode = Dinode::from(self.device.by_ref(), sb, xfs_ino);
                 let mode = dinode.di_core.di_mode as u32;
-                if mode & S_IFMT == S_IFDIR {
+                if mode & (S_IFMT as u32) == (S_IFDIR as u32) {
                     let _ = dinode.get_dir(self.device.by_ref(), sb);
-                } else if mode & S_IFMT == S_IFREG {
+                } else if mode & (S_IFMT as u32) == (S_IFREG as u32) {
                     let _ = dinode.get_file();
                 }
                 OpenInode { dinode, count: 1 }
@@ -454,9 +454,9 @@ impl State {
         self.device.set_bufsize(sb.inode_size());
         let mut dinode = Dinode::from(self.device.by_ref(), sb, xfs_ino);
         let mode = dinode.di_core.di_mode as u32;
-        if mode & S_IFMT == S_IFDIR {
+        if mode & (S_IFMT as u32) == (S_IFDIR as u32) {
             let _ = dinode.get_dir(self.device.by_ref(), sb);
-        } else if mode & S_IFMT == S_IFREG {
+        } else if mode & (S_IFMT as u32) == (S_IFREG as u32) {
             let _ = dinode.get_file();
         }
         if let Some(oi) = self.open_files.get_mut(&ino) {
@@ -1716,7 +1716,7 @@ impl Filesystem for Volume {
         let mut dev = BlockReader::from_device(s.device.device());
         let oi = s.open_inode(new_ino);
         oi.dinode = Dinode::from_bytes(raw.as_bytes(), &sb, new_xfs_ino);
-        if (oi.dinode.di_core.di_mode as u32) & S_IFMT == S_IFDIR {
+        if (oi.dinode.di_core.di_mode as u32) & (S_IFMT as u32) == (S_IFDIR as u32) {
             dev.set_bufsize((sb.sb_blocksize << sb.sb_dirblklog) as usize);
             let _ = oi.dinode.get_dir(dev.by_ref(), &sb);
         }
@@ -1896,7 +1896,7 @@ impl Filesystem for Volume {
         let mut dev = BlockReader::from_device(s.device.device());
         let oi = s.open_inode(new_ino);
         oi.dinode = Dinode::from_bytes(raw.as_bytes(), &sb, new_xfs_ino);
-        if (oi.dinode.di_core.di_mode as u32) & S_IFMT == S_IFDIR {
+        if (oi.dinode.di_core.di_mode as u32) & (S_IFMT as u32) == (S_IFDIR as u32) {
             dev.set_bufsize((sb.sb_blocksize << sb.sb_dirblklog) as usize);
             let _ = oi.dinode.get_dir(dev.by_ref(), &sb);
         }
@@ -2315,7 +2315,7 @@ impl Filesystem for Volume {
         let mut dev = BlockReader::from_device(s.device.device());
         let oi = s.open_inode(new_ino);
         oi.dinode = Dinode::from_bytes(raw.as_bytes(), &sb, new_xfs_ino);
-        if (oi.dinode.di_core.di_mode as u32) & S_IFMT == S_IFDIR {
+        if (oi.dinode.di_core.di_mode as u32) & (S_IFMT as u32) == (S_IFDIR as u32) {
             dev.set_bufsize((sb.sb_blocksize << sb.sb_dirblklog) as usize);
             let _ = oi.dinode.get_dir(dev.by_ref(), &sb);
         }
@@ -3079,7 +3079,7 @@ impl Filesystem for Volume {
         let mut dev = BlockReader::from_device(s.device.device());
         let oi = s.open_inode(new_ino);
         oi.dinode = Dinode::from_bytes(raw.as_bytes(), &sb, new_xfs_ino);
-        if (oi.dinode.di_core.di_mode as u32) & S_IFMT == S_IFDIR {
+        if (oi.dinode.di_core.di_mode as u32) & (S_IFMT as u32) == (S_IFDIR as u32) {
             dev.set_bufsize((sb.sb_blocksize << sb.sb_dirblklog) as usize);
             let _ = oi.dinode.get_dir(dev.by_ref(), &sb);
         }
