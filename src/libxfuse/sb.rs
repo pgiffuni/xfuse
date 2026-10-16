@@ -205,6 +205,7 @@ pub struct Sb {
     /// This tracks the oldest log record that may still need to be replayed.
     /// After a clean unmount, this is set to the current log head so that
     /// recovery at mount time knows the log is empty.
+    #[allow(dead_code)] // Read on FreeBSD journal mounts.
     pub sb_logtail:          u32,
     sb_versionnum:         u16,
     // sb_sectsize: u16,
@@ -260,6 +261,7 @@ impl Sb {
     ///
     /// This is used to update fields like `sb_fdblocks` (free block count)
     /// and `sb_logtail` after a journal commit.
+    #[allow(dead_code)] // Used on FreeBSD journal mounts.
     pub fn write_to_device(&self, device: &BlockDevice, bs: u32) -> FsResult<()> {
         let mut buf = Vec::with_capacity(bs as usize);
         self.encode(&mut buf);
@@ -267,6 +269,7 @@ impl Sb {
     }
 
     /// Encode the superblock into a byte buffer.
+    #[allow(dead_code)] // Used on FreeBSD journal mounts.
     fn encode(&self, _buf: &mut Vec<u8>) {
         // This is a simplified encoder: only writes fields that change in
         // journal mode.  A full encoder would need to match the on-disk layout.
@@ -279,6 +282,7 @@ impl Sb {
     /// After committing all pending transactions to the data device,
     /// call this to advance the log tail so that recovery at mount time
     /// knows those records are no longer needed.
+    #[allow(dead_code)] // Used on FreeBSD journal mounts.
     pub fn update_log_tail_on_disk(
         &mut self,
         device: &BlockDevice,

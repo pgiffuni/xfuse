@@ -25,6 +25,8 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#![allow(clippy::unnecessary_cast)]
+
 use std::{
     collections::HashMap,
     ffi::OsStr,
@@ -185,6 +187,7 @@ struct OpenFile {
 struct State {
     device:      BlockReader,
     rt_device:   Option<Arc<BlockDevice>>,
+    #[allow(dead_code)] // Used on FreeBSD with --journal-device
     log_device:  Option<Arc<BlockDevice>>,
     sb:          Sb,
     open_files:  HashMap<u64, OpenInode>,
@@ -338,6 +341,7 @@ impl Volume {
     /// This scans the log region for committed transactions and applies
     /// any buffer items to the device.  A crash-consistent image has an
     /// empty (or already-replayed) log, so this is a no-op for most mounts.
+    #[allow(dead_code)] // Superseded by recover_log_with_device; kept for API completeness.
     fn recover_log(device_name: &Path, device: &BlockDevice, sb: &Sb) -> FsResult<()> {
         // Open the device from the path for the BlockReader
         let mut reader = BlockReader::open(device_name)?;
