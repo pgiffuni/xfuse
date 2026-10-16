@@ -769,4 +769,35 @@ mod t {
         assert_eq!(tx.deferred_frees.len(), 1);
         tx.commit().unwrap();
     }
+    /// An aborted transaction in journal mode must not write anything to
+    /// the log region: the WAL protocol requires that a crash at any
+    /// point before the COMMIT record cannot produce a replayable record.
+    #[test]
+    fn journal_abort_writes_no_log_records() {
+        let mut h = harness(true);
+
+        // Record the log region state before the aborted transaction
+        let log_start = h.sb.log_start_bytes();
+        let log_size = h.sb.log_blocks_len() * u64::from(h.sb.sb_blocksize);
+        let mut before_log = vec![0u8; log_size as usize];
+        h.dev.read_at(&mut before_log, log_start).unwrap();
+
+        // Start a journal transaction, write data, but abort
+        let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::Journal);
+        tx.write_bytes(0, b"should not persist").unwrap();
+        tx.abort();
+
+        // The log region must be unchanged -- no log records were written
+        let mut after_log = vec![0u8; log_size as usize];
+        h.dev.read_at(&mut after_log, log_start).unwrap();
+        assert_eq!(
+            &before_log[..], &after_log[..],
+            "aborted journal transaction wrote records to the log"
+        );
+
+        // The data region must also be unchanged
+        let mut data = vec![0u8; 512];
+        h.dev.read_at(&mut data, 0).unwrap();
+        assert!(data.iter().all(|b| *b == 0), "aborted transaction modified data");
+    }
 }
