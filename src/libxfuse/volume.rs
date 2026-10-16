@@ -185,6 +185,7 @@ struct OpenFile {
 struct State {
     device:      BlockReader,
     rt_device:   Option<Arc<BlockDevice>>,
+    log_device:  Option<Arc<BlockDevice>>,
     sb:          Sb,
     open_files:  HashMap<u64, OpenInode>,
     handles:     HashMap<u64, OpenFile>,
@@ -227,6 +228,7 @@ impl Volume {
     pub fn new(
         device_name: &Path,
         rt_device_name: Option<&PathBuf>,
+        log_device_name: Option<&PathBuf>,
         writable: bool,
         journal: bool,
     ) -> FsResult<Volume> {
@@ -239,6 +241,10 @@ impl Volume {
         let mut device = BlockReader::from_device(Arc::clone(&block_device));
         let rt_device = rt_device_name
             .map(|n| BlockDevice::open(n, Access::ReadOnly).map(Arc::new))
+            .transpose()?;
+
+        let log_device = log_device_name
+            .map(|n| BlockDevice::open(n, Access::ReadWrite).map(Arc::new))
             .transpose()?;
 
         let superblock = Sb::from(device.by_ref());
@@ -273,7 +279,11 @@ impl Volume {
 
         // If mounting read-write with journaling, replay the log first
         if writable {
-            Self::recover_log(device_name, &block_device, &superblock)?;
+            Self::recover_log_with_device(
+                Arc::clone(&block_device),
+                log_device.as_ref().map(Arc::clone),
+                &superblock,
+            )?;
         }
 
         let mut root_inode = Dinode::from(device.by_ref(), &superblock, superblock.sb_rootino);
@@ -304,12 +314,13 @@ impl Volume {
         } else {
             CommitMode::ReadOnly
         };
-        let tx = TransactionContext::new(block_device, &superblock, mode);
+        let tx = TransactionContext::new(block_device, log_device.as_ref().map(Arc::clone), &superblock, mode);
 
         Ok(Volume {
             state:      RwLock::new(State {
                 device,
                 rt_device,
+                log_device,
                 sb: superblock,
                 open_files,
                 handles: HashMap::new(),
@@ -328,6 +339,7 @@ impl Volume {
     /// any buffer items to the device.  A crash-consistent image has an
     /// empty (or already-replayed) log, so this is a no-op for most mounts.
     fn recover_log(device_name: &Path, device: &BlockDevice, sb: &Sb) -> FsResult<()> {
+        // Open the device from the path for the BlockReader
         let mut reader = BlockReader::open(device_name)?;
         let recovery = LogRecovery::analyze(&mut reader, sb)?;
         if recovery.committed_count() > 0 {
@@ -338,6 +350,24 @@ impl Volume {
         Ok(())
     }
 
+    /// Replay the log, optionally from an external log device.
+    fn recover_log_with_device(
+        device: Arc<BlockDevice>,
+        log_device: Option<Arc<BlockDevice>>,
+        sb: &Sb,
+    ) -> FsResult<()> {
+        let log_dev = log_device.unwrap_or_else(|| Arc::clone(&device));
+        let mut reader = BlockReader::from_device(log_dev);
+        let recovery = LogRecovery::analyze(&mut reader, sb)?;
+        if recovery.committed_count() > 0 {
+            let mut replayer = LogReplayer::new(&device, sb);
+            let blocks = replayer.replay(&recovery)?;
+            debug!("recovered {} blocks from log", blocks);
+        }
+        Ok(())
+    }
+
+    /// Replay the log, optionally from an external log device.
     /// Test-only accessor: delegates to `State::add_dirent`.
     #[allow(dead_code)]
     pub fn add_dirent(&self, parent: u64, name: &[u8], ino: u64, ftype: u8) -> FsResult<()> {
@@ -4513,7 +4543,7 @@ mod dirent_tests {
             std::io::copy(&mut src, &mut copy).ok()?;
         }
         copy.flush().ok()?;
-        let v = Volume::new(copy.path(), None, true, false).ok()?;
+        let v = Volume::new(copy.path(), None, None, true, false).ok()?;
         Some((copy, v))
     }
 

@@ -1656,13 +1656,12 @@ fn journal_records_have_buf_item_kind() {
         for i in 0..blocksize {
             // Check if this block in the log differs
             let blk_start = i * blocksize;
-            if blk_start < log_before.len() && blk_start + blocksize <= log_before.len() {
-                if &log_before[blk_start..blk_start + blocksize]
-                    != &log_after[blk_start..blk_start + blocksize]
+            if blk_start < log_before.len() && blk_start + blocksize <= log_before.len()
+                && log_before[blk_start..blk_start + blocksize]
+                    != log_after[blk_start..blk_start + blocksize]
                 {
                     changed.push((logstart + i as u64, 0, blocksize - 1));
                 }
-            }
         }
         changed
     };
@@ -1710,7 +1709,7 @@ fn journal_write_passes_xfs_repair() {
 #[test]
 fn journal_survives_crash() {
     require_fusefs!();
-    use std::os::unix::process::CommandExt;
+    
 
     let image = writable_copy(&GOLDENV4, "journal_crash");
 

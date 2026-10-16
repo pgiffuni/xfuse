@@ -1754,7 +1754,7 @@ pub(crate) mod t {
         device.flush().unwrap();
         let mut cache = BlockCache::new(BS, 256);
         {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             super::free_in_group(
                 &mut tx,
                 &sb,
@@ -1877,7 +1877,7 @@ pub(crate) mod t {
 
         // Take some blocks the way a write does, in one transaction.
         let taken = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let run = allocate(&mut tx, &sb, agno, 2).expect("the group can spare two blocks");
             assert_eq!(run.len, 2);
             tx.commit().unwrap();
@@ -1886,7 +1886,7 @@ pub(crate) mod t {
 
         // And hand the same blocks back, in another.
         {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             // Nothing here needs a new block: the run is joined to its
             // neighbours or added beside them, so the group's free list being
             // empty does not come up.
@@ -1938,7 +1938,7 @@ pub(crate) mod t {
 
         // A run the tree already has, and two blocks from the middle of it.
         let victim = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let agf = read_agf(&mut tx, &sb, agno).expect("a group header");
             let geometry = GroupGeometry::new(sb.sb_agblocks, sb.has_crc(), true);
             let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
@@ -1958,7 +1958,7 @@ pub(crate) mod t {
             len:   2,
         };
         {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             free_in_group(&mut tx, &sb, agno, already).expect("free");
             tx.commit().unwrap();
         }
@@ -1999,7 +1999,7 @@ pub(crate) mod t {
         {
             let device = Arc::new(BlockDevice::open(f.path(), Access::ReadWrite).unwrap());
             let mut cache = BlockCache::new(BS, 256);
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let mut agf = read_agf(&mut tx, &sb, 0).unwrap();
             agf.set_free_list_window(0, want.len() as u32 - 1, want.len() as u32);
             super::write_agf(&mut tx, &sb, 0, &mut agf).unwrap();
@@ -2010,7 +2010,7 @@ pub(crate) mod t {
         let mut cache = BlockCache::new(BS, 256);
         let mut taken = Vec::new();
         {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let mut store = TransactionBlocks::new(&mut tx, &sb, 0);
             for _ in 0..3 {
                 taken.push(store.take_btree_block().expect("the free list has a block"));
@@ -2025,7 +2025,7 @@ pub(crate) mod t {
         // And the header's window moved with them.
         let device = Arc::new(BlockDevice::open(f.path(), Access::ReadWrite).unwrap());
         let mut cache = BlockCache::new(BS, 256);
-        let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+        let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
         let agf = read_agf(&mut tx, &sb, 0).unwrap();
         assert_eq!(
             (
@@ -2106,7 +2106,7 @@ pub(crate) mod t {
 
         // Clear the window, which is the state under test.
         {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let mut agf = read_agf(&mut tx, &sb, agno).expect("a group header");
             agf.set_free_list_window(0, 0, 0);
             super::write_agf(&mut tx, &sb, agno, &mut agf).expect("write the header");
@@ -2129,7 +2129,7 @@ pub(crate) mod t {
         // Take one, write it as a node, read it back, and go on to need a second
         // one, all inside the one transaction.
         let (taken, second) = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
             let taken = store
                 .take_btree_block()
@@ -2248,7 +2248,7 @@ pub(crate) mod t {
         //    to say what each counter should become, and which is the next piece
         //    of work.  Asserting the current numbers here would freeze the bug.
         {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let agf = read_agf(&mut tx, &sb, agno).expect("a group header after the take");
             assert_eq!(
                 (
@@ -2272,7 +2272,7 @@ pub(crate) mod t {
         //    up to what they added up to before -- which is the whole of what "back
         //    where it started" means for a block that has changed hands twice.
         for block in [taken, second] {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
             store
                 .give_back_btree_block(block)
@@ -2449,7 +2449,7 @@ pub(crate) mod t {
                     .unwrap();
             }
             {
-                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
                 let mut agf = read_agf(&mut tx, &sb, 0).expect("a group header");
                 agf.set_free_list_window(first, last, count);
                 super::write_agf(&mut tx, &sb, 0, &mut agf).expect("write the header");
@@ -2457,7 +2457,7 @@ pub(crate) mod t {
             }
             let before = std::fs::read(f.path()).unwrap();
             {
-                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
                 let mut store = TransactionBlocks::new(&mut tx, &sb, 0);
                 let err = store
                     .take_btree_block()
@@ -2520,7 +2520,7 @@ pub(crate) mod t {
         let mut cache = BlockCache::new(sb.sb_blocksize as usize, 256);
 
         let before = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let agf = read_agf(&mut tx, &sb, agno).expect("a group header");
             (
                 agf.free_list_first(),
@@ -2538,7 +2538,7 @@ pub(crate) mod t {
         let fdblocks_before = sb.sb_fdblocks;
 
         let taken = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
             let taken = store.take_btree_block().expect("the list has an entry");
             // It becomes a node.  The point is not that this parses but that the
@@ -2580,7 +2580,7 @@ pub(crate) mod t {
         );
 
         let after = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let agf = read_agf(&mut tx, &sb, agno).expect("a group header after the take");
             (agf.free_blocks(), agf.btree_blocks())
         };
@@ -2691,7 +2691,7 @@ pub(crate) mod t {
                 "the tree never merged a leaf, so nothing was tested"
             );
             {
-                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
                 let run = allocate(&mut tx, &sb, agno, 1).expect("the group can spare a block");
                 assert_eq!(run.len, 1);
                 tx.commit().expect("commit");
@@ -2964,7 +2964,7 @@ pub(crate) mod t {
         // 1. A run for a file, and back again: the allocation and its reverse,
         //    on a file system where every rewritten block carries a checksum.
         let run = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let run = allocate(&mut tx, &sb, agno, 8).expect("the group can spare eight blocks");
             tx.commit().expect("commit");
             run
@@ -2973,7 +2973,7 @@ pub(crate) mod t {
         coherent("after allocating eight blocks");
 
         {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             free_in_group(&mut tx, &sb, agno, run).expect("give the run back");
             tx.commit().expect("commit");
         }
@@ -2987,7 +2987,7 @@ pub(crate) mod t {
         //    not a file system: `xfs_repair` says `agf_btreeblks 1, counted 0`, the
         //    header charging for a block no tree holds.
         {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
             let block = store.take_btree_block().expect("the list has an entry");
             store
@@ -3000,7 +3000,7 @@ pub(crate) mod t {
             device.flush().unwrap();
             coherent("with a b-tree node taken and not yet linked");
 
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
             let went = store
                 .give_back_btree_block(block)
@@ -3018,10 +3018,10 @@ pub(crate) mod t {
         // 3. Cut a hole in a run, which is the operation most likely to split a
         //    leaf and so the most likely to write a block whose checksum matters.
         {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let block = allocate(&mut tx, &sb, agno, 1).expect("a block to free");
             tx.commit().expect("commit");
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             free_in_group(&mut tx, &sb, agno, block).expect("free it again");
             tx.commit().expect("commit");
             eprintln!("freed {block:?} back out of the run it came from");
@@ -3160,7 +3160,7 @@ pub(crate) mod t {
         // The existing rule, unchanged: a group with no free inode declines rather
         // than going looking for a slot that happens to be unused.
         {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             assert_eq!(
                 allocate_ino(&mut tx, &sb, agno, 0o100644, 0, 0).expect("the tree is walked"),
                 None,
@@ -3177,7 +3177,7 @@ pub(crate) mod t {
 
         // The chunk.
         let startino = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let ino =
                 allocate_new_chunk(&mut tx, &sb, agno).expect("the group has room for a chunk");
             tx.commit().expect("commit");
@@ -3328,7 +3328,7 @@ pub(crate) mod t {
 
         // The point of the exercise: the group can now hand out an inode.
         let allocated = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let got = allocate_ino(&mut tx, &sb, agno, 0o100644, 0, 0)
                 .expect("the tree is walked")
                 .expect("the new chunk has a free inode");
@@ -3457,7 +3457,7 @@ pub(crate) mod t {
             added += 1;
             assert!(added < 200, "the tree never split, so nothing was tested");
             {
-                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
                 allocate_new_chunk(&mut tx, &sb, agno).expect("the group has room for a chunk");
                 tx.commit().expect("commit");
             }
@@ -3695,7 +3695,7 @@ pub(crate) mod t {
         let mut cache = BlockCache::new(sb.sb_blocksize as usize, 256);
 
         let before = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let raw =
                 RawDinode::from_bytes(tx.read_bytes(at, inode_size).expect("reading the inode"))
                     .expect("decoding the inode");
@@ -3710,7 +3710,7 @@ pub(crate) mod t {
         assert_ne!(before, 0, "the inode has no mode to begin with");
 
         {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let mut raw = RawDinode::from_bytes(
                 tx.read_bytes(at, inode_size)
                     .expect("reading the inode again"),
@@ -3728,7 +3728,7 @@ pub(crate) mod t {
         cache.invalidate();
 
         let after = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let bytes = tx
                 .read_bytes(at, inode_size)
                 .expect("reading it back from the image");
@@ -4542,7 +4542,7 @@ pub(crate) mod t {
             rounds += 1;
             assert!(rounds < 200, "the list never filled");
             let run = {
-                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
                 match allocate(&mut tx, &sb, agno, 32) {
                     Ok(run) => {
                         free_in_group(&mut tx, &sb, agno, run).expect("free it back");
@@ -4577,7 +4577,7 @@ pub(crate) mod t {
         let mut pushed = 0;
         for _ in 0..4 {
             let block = {
-                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
                 let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
                 let taken = store.take_btree_block().expect("the list has an entry");
                 store
@@ -4956,7 +4956,7 @@ pub(crate) mod t {
         );
 
         let startino = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let ino = allocate_new_chunk(&mut tx, &sb, agno).expect("room for a chunk");
             tx.commit().expect("commit");
             ino
@@ -5468,7 +5468,7 @@ pub(crate) mod t {
             "the image's list is empty, so there is nothing to take"
         );
         let taken = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
             let block = store.take_btree_block().expect("the list has an entry");
             store
@@ -5495,7 +5495,7 @@ pub(crate) mod t {
         );
 
         let where_to = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
             let where_to = store
                 .give_back_btree_block(taken)
@@ -5587,13 +5587,13 @@ pub(crate) mod t {
             // really are allocated when they are freed: a free of a run that is
             // already free is a no-op and stocks nothing.
             let run = {
-                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
                 let run = allocate(&mut tx, &sb, agno, want)
                     .expect("the group can spare that many blocks");
                 tx.commit().expect("commit");
                 run
             };
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             free_in_group(&mut tx, &sb, agno, run).expect("give the run back");
             tx.commit().expect("commit");
             device.flush().unwrap();
@@ -5625,7 +5625,7 @@ pub(crate) mod t {
         let mut went = Vec::new();
         for _ in 0..3 {
             let taken = {
-                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
                 let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
                 let block = store
                     .take_btree_block()
@@ -5642,7 +5642,7 @@ pub(crate) mod t {
             device.flush().unwrap();
             let before = terms("with the list full and a node taken");
             let where_to = {
-                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
                 let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
                 let where_to = store
                     .give_back_btree_block(taken)
@@ -6033,7 +6033,7 @@ pub(crate) mod t {
 
         // 1. Take a run for a file.
         let allocated = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let run = allocate(&mut tx, &sb, agno, 4).expect("the group can spare four blocks");
             tx.commit().expect("commit");
             eprintln!("allocated {run:?}");
@@ -6050,7 +6050,7 @@ pub(crate) mod t {
         //    list and the rest into the trees, and the two branches move different
         //    terms, so this is the step where the identity has the most to say.
         {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             free_in_group(&mut tx, &sb, agno, allocated).expect("give the run back");
             tx.commit().expect("commit");
         }
@@ -6070,7 +6070,7 @@ pub(crate) mod t {
             (run.start + 2, run.len)
         };
         {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             free_in_group(
                 &mut tx,
                 &sb,
@@ -6113,7 +6113,7 @@ pub(crate) mod t {
         //    between taking a node and linking it, and it is the next thing the
         //    write path has to finish.
         {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
             let block = store.take_btree_block().expect("the list has an entry");
             store
@@ -6240,7 +6240,7 @@ pub(crate) mod t {
         // enough of them, spread out, that the group's single free-space leaf
         // overflows and has to split.
         let (before_free, occupied) = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let agf = read_agf(&mut tx, &sb, agno).expect("a group header");
             let mut store = TransactionBlocks::new(&mut tx, &sb, agno);
             let runs = crate::libxfuse::alloc::free_space::walk(
@@ -6267,20 +6267,20 @@ pub(crate) mod t {
         );
 
         let before_treeblks = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             read_agf(&mut tx, &sb, agno)
                 .expect("a group header")
                 .btree_blocks()
         };
         for b in occupied {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             free_in_group(&mut tx, &sb, agno, FreeRun { start: b, len: 1 }).expect("free");
             tx.commit().unwrap();
         }
         device.flush().unwrap();
 
         let (after_free, after_treeblks) = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let agf = read_agf(&mut tx, &sb, agno).expect("a group header");
             (agf.free_blocks(), agf.btree_blocks())
         };
@@ -6411,7 +6411,7 @@ pub(crate) mod t {
     ) {
         let mut ok = 0usize;
         for _ in 0..200 {
-            let mut tx = Transaction::begin(device, cache, sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(device, None, cache, sb, CommitMode::Direct);
             match allocate(&mut tx, sb, agno, 1) {
                 Ok(run) => {
                     assert_eq!(run.len, 1, "the allocation was not a single block");
@@ -6491,7 +6491,7 @@ pub(crate) mod t {
         // The longest free run the group has, so the allocations below land in the
         // middle of something real rather than at a boundary.
         let target = {
-            let mut tx = Transaction::begin(device, cache, sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(device, None, cache, sb, CommitMode::Direct);
             let agf = read_agf(&mut tx, sb, agno).expect("a group header");
             let mut store = TransactionBlocks::new(&mut tx, sb, agno);
             let runs = crate::libxfuse::alloc::free_space::walk(
@@ -6517,7 +6517,7 @@ pub(crate) mod t {
         // then the pieces are split again.
         let mut taken: Vec<u32> = Vec::new();
         for _ in 0..6 {
-            let mut tx = Transaction::begin(device, cache, sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(device, None, cache, sb, CommitMode::Direct);
             // `allocate`, not `allocate_in_group`: the wrapper is what tells the
             // **superblock** how many blocks the filesystem has given up, and
             // skipping it leaves `sb_fdblocks` short by exactly the number taken --
@@ -6579,7 +6579,7 @@ pub(crate) mod t {
         let mut cache = BlockCache::new(BS, 256);
 
         let taken = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let run = allocate_in_group(&mut tx, &sb, 0, 8)
                 .expect("allocate")
                 .expect("the group can spare eight blocks");
@@ -6625,7 +6625,7 @@ pub(crate) mod t {
         let device = Arc::new(BlockDevice::open(f.path(), Access::ReadWrite).unwrap());
         let mut cache = BlockCache::new(BS, 256);
         {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             assert!(allocate_in_group(&mut tx, &sb, 0, 8)
                 .expect("allocate")
                 .is_some());
@@ -6647,7 +6647,7 @@ pub(crate) mod t {
         let device = Arc::new(BlockDevice::open(f.path(), Access::ReadWrite).unwrap());
         let mut cache = BlockCache::new(BS, 256);
         let total: u32 = runs.iter().map(|(_, l)| l).sum();
-        let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+        let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
         assert!(
             allocate_in_group(&mut tx, &sb, 0, total + 1)
                 .expect("allocate")
@@ -6763,7 +6763,7 @@ pub(crate) mod t {
         let device = Arc::new(BlockDevice::open(copy.path(), Access::ReadWrite).unwrap());
         let mut cache = BlockCache::new(bs, 256);
         {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             free_in_group(&mut tx, &sb, 0, freed).expect("free");
             tx.commit().unwrap();
         }
@@ -6836,13 +6836,13 @@ pub(crate) mod t {
         let mut last = start;
         for _ in 0..400u32 {
             let taken = {
-                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
                 let r = allocate(&mut tx, &sb, 0, 1).expect("the group can spare a block");
                 tx.commit().unwrap();
                 r
             };
             {
-                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
                 free_in_group(&mut tx, &sb, 0, taken).expect("free");
                 tx.commit().unwrap();
             }
@@ -6948,7 +6948,7 @@ pub(crate) mod t {
         let mut borrowed = Vec::new();
         for round in 0..200u32 {
             let taken = {
-                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
                 let r = allocate(&mut tx, &sb, 0, 24).expect("the group can spare a run");
                 tx.commit().unwrap();
                 r
@@ -6962,7 +6962,7 @@ pub(crate) mod t {
                     start: taken.start + offset,
                     len:   1,
                 };
-                let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+                let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
                 free_in_group(&mut tx, &sb, 0, block).expect("free");
                 tx.commit().unwrap();
                 offset += 2;
@@ -6975,7 +6975,7 @@ pub(crate) mod t {
         }
         // Put back whatever is still borrowed, so the image is coherent.
         for run in borrowed {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let _ = free_in_group(&mut tx, &sb, 0, run);
             tx.commit().unwrap();
         }
@@ -7031,7 +7031,7 @@ pub(crate) mod t {
         // and the slot still empty, or the reverse -- is ruled out too.
         let before_ifree = sb.sb_ifree;
         let taken: Vec<u64> = {
-            let mut tx = Transaction::begin(&device, &mut cache, &sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&device, None, &mut cache, &sb, CommitMode::Direct);
             let mut taken = Vec::new();
             for _ in 0..3 {
                 taken.push(
@@ -7103,7 +7103,7 @@ pub(crate) mod t {
         );
         let device2 = Arc::new(BlockDevice::open(copy2.path(), Access::ReadWrite).unwrap());
         let mut cache2 = BlockCache::new(BS, 256);
-        let mut tx2 = Transaction::begin(&device2, &mut cache2, &sb, CommitMode::Direct);
+        let mut tx2 = Transaction::begin(&device2, None, &mut cache2, &sb, CommitMode::Direct);
         let got = super::allocate_ino(&mut tx2, &sb, 0, 0o100_644, 0, 0).expect("asking the group");
         assert!(
             got.is_none(),

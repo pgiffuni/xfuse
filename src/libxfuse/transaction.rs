@@ -141,6 +141,7 @@ pub struct DeferredFree {
 /// prove correct.
 pub struct Transaction<'a> {
     device: &'a BlockDevice,
+    log_device: Option<&'a BlockDevice>,
     cache: &'a mut BlockCache,
     sb: &'a Sb,
     mode: CommitMode,
@@ -159,12 +160,14 @@ impl<'a> Transaction<'a> {
     /// Begin a transaction.
     pub fn begin(
         device: &'a BlockDevice,
+        log_device: Option<&'a BlockDevice>,
         cache: &'a mut BlockCache,
         sb: &'a Sb,
         mode: CommitMode,
     ) -> Self {
         Self {
             device,
+            log_device,
             cache,
             sb,
             mode,
@@ -183,7 +186,7 @@ impl<'a> Transaction<'a> {
         sb: &'a Sb,
         mode: CommitMode,
     ) -> Self {
-        let mut tx = Self::begin(device, cache, sb, mode);
+        let mut tx = Self::begin(device, None, cache, sb, mode);
         tx.realtime = true;
         tx
     }
@@ -380,7 +383,10 @@ impl<'a> Transaction<'a> {
     /// to restore consistency. If it crashes before step 2, the transaction
     /// is discarded (rolled back) during recovery.
     fn commit_journal(&mut self) -> FsResult<()> {
-        let mut writer = LogWriter::new(self.device, self.sb);
+        // Use the external log device if one was configured; otherwise
+        // fall back to the main device (internal log).
+        let log_dev: &BlockDevice = self.log_device.unwrap_or(self.device);
+        let mut writer = LogWriter::new(log_dev, self.sb);
         let tid = writer.begin_transaction();
 
         // Write each dirty block to the log as a Buf item
@@ -475,6 +481,7 @@ impl Drop for Transaction<'_> {
 #[derive(Debug)]
 pub struct TransactionContext {
     device: Arc<BlockDevice>,
+    log_device: Option<Arc<BlockDevice>>,
     cache: BlockCache,
     sb: Sb,
     mode: CommitMode,
@@ -482,10 +489,11 @@ pub struct TransactionContext {
 
 impl TransactionContext {
     /// Build a context for one image.
-    pub fn new(device: Arc<BlockDevice>, sb: &Sb, mode: CommitMode) -> Self {
+    pub fn new(device: Arc<BlockDevice>, log_device: Option<Arc<BlockDevice>>, sb: &Sb, mode: CommitMode) -> Self {
         let limit = default_cache_limit(sb.sb_blocksize);
         Self {
             device,
+            log_device,
             cache: BlockCache::new(sb.sb_blocksize as usize, limit),
             sb: *sb,
             mode,
@@ -501,7 +509,7 @@ impl TransactionContext {
 
     /// Start a transaction.
     pub fn begin(&mut self) -> Transaction<'_> {
-        Transaction::begin(&self.device, &mut self.cache, &self.sb, self.mode)
+        Transaction::begin(&self.device, self.log_device.as_deref(), &mut self.cache, &self.sb, self.mode)
     }
 
     /// The block cache, for tests and for the invalidation that a commit needs.
@@ -515,6 +523,12 @@ impl TransactionContext {
     /// data out to the underlying storage.
     pub fn device(&self) -> &BlockDevice {
         &self.device
+    }
+
+    /// The external log device, if one was configured.
+    #[allow(dead_code)]
+    pub fn log_device(&self) -> Option<&BlockDevice> {
+        self.log_device.as_deref()
     }
 }
 
@@ -571,7 +585,7 @@ mod t {
     #[test]
     fn whole_block_write() {
         let mut h = harness(true);
-        let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::Direct);
+        let mut tx = Transaction::begin(&h.dev, None, &mut h.cache, &h.sb, CommitMode::Direct);
         tx.write_bytes(0, &vec![0xa5u8; 1024]).unwrap();
         tx.commit().unwrap();
 
@@ -589,7 +603,7 @@ mod t {
         h.dev.write_at(&original, 0).unwrap();
         h.dev.flush().unwrap();
 
-        let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::Direct);
+        let mut tx = Transaction::begin(&h.dev, None, &mut h.cache, &h.sb, CommitMode::Direct);
         tx.write_bytes(500, b"hello world").unwrap();
         tx.commit().unwrap();
 
@@ -605,7 +619,7 @@ mod t {
     #[test]
     fn repeated_writes_are_serialized() {
         let mut h = harness(true);
-        let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::Direct);
+        let mut tx = Transaction::begin(&h.dev, None, &mut h.cache, &h.sb, CommitMode::Direct);
         tx.write_bytes(0, b"aaaa").unwrap();
         tx.write_bytes(0, b"bbbb").unwrap();
         tx.commit().unwrap();
@@ -619,7 +633,7 @@ mod t {
     #[test]
     fn read_only_refuses() {
         let mut h = harness(false);
-        let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::ReadOnly);
+        let mut tx = Transaction::begin(&h.dev, None, &mut h.cache, &h.sb, CommitMode::ReadOnly);
         let err = tx.write_bytes(0, b"nope").unwrap_err();
         assert_eq!(err.errno(), libc::EROFS);
         assert!(tx.read_block(0).is_ok());
@@ -635,7 +649,7 @@ mod t {
         h.dev.write_at(&original, 0).unwrap();
         h.dev.flush().unwrap();
 
-        let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::Direct);
+        let mut tx = Transaction::begin(&h.dev, None, &mut h.cache, &h.sb, CommitMode::Direct);
         tx.write_bytes(0, b"junkjunk").unwrap();
         tx.abort();
 
@@ -654,7 +668,7 @@ mod t {
         h.dev.write_at(&original, 0).unwrap();
         h.dev.flush().unwrap();
 
-        let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::Journal);
+        let mut tx = Transaction::begin(&h.dev, None, &mut h.cache, &h.sb, CommitMode::Journal);
         tx.write_bytes(0, b"junkjunk").unwrap();
         tx.abort();
 
@@ -674,7 +688,7 @@ mod t {
         h.dev.flush().unwrap();
 
         {
-            let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::Direct);
+            let mut tx = Transaction::begin(&h.dev, None, &mut h.cache, &h.sb, CommitMode::Direct);
             tx.write_bytes(0, b"junkjunk").unwrap();
         }
         let mut buf = vec![0u8; 512];
@@ -688,7 +702,7 @@ mod t {
     #[test]
     fn block_addressing_matches_read_path() {
         let mut h = harness(true);
-        let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::Direct);
+        let mut tx = Transaction::begin(&h.dev, None, &mut h.cache, &h.sb, CommitMode::Direct);
         // Block 1024 is the first block of allocation group 1.
         assert_eq!(tx.block_offset(1024), h.sb.fsb_to_offset(1024));
         assert_eq!(tx.block_offset(0), 0);
@@ -704,7 +718,7 @@ mod t {
     #[test]
     fn write_past_end_refused() {
         let mut h = harness(true);
-        let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::Direct);
+        let mut tx = Transaction::begin(&h.dev, None, &mut h.cache, &h.sb, CommitMode::Direct);
         let err = tx.write_bytes(h.dev.size(), b"x").unwrap_err();
         assert_eq!(err.errno(), libc::EFBIG);
     }
@@ -740,7 +754,7 @@ mod t {
     #[test]
     fn journal_commit_writes_to_device() {
         let mut h = harness(true);
-        let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::Journal);
+        let mut tx = Transaction::begin(&h.dev, None, &mut h.cache, &h.sb, CommitMode::Journal);
         tx.write_bytes(0, b"journal").unwrap();
         tx.commit().unwrap();
 
@@ -753,7 +767,7 @@ mod t {
     #[test]
     fn deferred_frees_cleared_on_abort() {
         let mut h = harness(true);
-        let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::Direct);
+        let mut tx = Transaction::begin(&h.dev, None, &mut h.cache, &h.sb, CommitMode::Direct);
         tx.defer_free(0, 100, 4);
         tx.abort();
         // After abort, the deferred frees are discarded (no panics)
@@ -763,7 +777,7 @@ mod t {
     #[test]
     fn deferred_frees_present_before_commit() {
         let mut h = harness(true);
-        let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::Direct);
+        let mut tx = Transaction::begin(&h.dev, None, &mut h.cache, &h.sb, CommitMode::Direct);
         tx.defer_free(0, 200, 8);
         // The deferred free is tracked internally
         assert_eq!(tx.deferred_frees.len(), 1);
@@ -783,7 +797,7 @@ mod t {
         h.dev.read_at(&mut before_log, log_start).unwrap();
 
         // Start a journal transaction, write data, but abort
-        let mut tx = Transaction::begin(&h.dev, &mut h.cache, &h.sb, CommitMode::Journal);
+        let mut tx = Transaction::begin(&h.dev, None, &mut h.cache, &h.sb, CommitMode::Journal);
         tx.write_bytes(0, b"should not persist").unwrap();
         tx.abort();
 

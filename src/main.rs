@@ -65,6 +65,15 @@ struct App {
     #[arg(long = "journal", requires = "experimental_rw")]
     journal: bool,
 
+    /// Use an external device for the XFS journal.
+    ///
+    /// When set (with `--journal`), the log is written to the specified
+    /// file instead of the internal log region in the main image.  This is
+    /// useful for separating log I/O from data I/O for performance, or for
+    /// using a separate device with higher write endurance.
+    #[arg(long = "journal-device", value_name = "DEVICE")]
+    log_device: Option<PathBuf>,
+
     /// Number of threads for the FUSE event loop.
     ///
     /// Default: 1.  A value greater than 1 requires Linux (fuser 0.18.0
@@ -167,9 +176,11 @@ fn main() {
     // Open the image before going into the background, so that a refusal -- an
     // unwritable image, an image whose features this build cannot maintain --
     // is reported to whoever ran the command.
+    let logdev = app.log_device.as_ref();
     let vol = match Volume::new(
         &app.device,
         rtdev.as_ref(),
+        logdev,
         app.experimental_rw,
         app.journal,
     ) {

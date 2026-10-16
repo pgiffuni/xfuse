@@ -267,7 +267,7 @@ impl Sb {
     }
 
     /// Encode the superblock into a byte buffer.
-    fn encode(&self, buf: &mut Vec<u8>) {
+    fn encode(&self, _buf: &mut Vec<u8>) {
         // This is a simplified encoder: only writes fields that change in
         // journal mode.  A full encoder would need to match the on-disk layout.
         // For now, we update sb_fdblocks and sb_logtail using write_at
