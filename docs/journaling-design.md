@@ -356,3 +356,15 @@ read back correctly:
 
 All phases documented in this file with implementation details, test coverage,
 and format specifications.
+
+## Phase 21-24: Validation and recovery verification
+
+These phases add tests that validate the journal implementation end-to-end:
+
+- **`journal_records_have_buf_item_kind`**: Verifies that journal-mode writes
+  modify the log region (buffer items are written) and data changes appear
+  outside the log region (data is committed to final locations).
+
+- **`journal_write_passes_xfs_repair`**: Runs `xfs_repair -n` on an image after
+  journal-mode writes to verify the resulting filesystem image is consistent
+  according to the reference XFS implementation.

@@ -1680,6 +1680,31 @@ fn journal_records_have_buf_item_kind() {
     );
 }
 
+/// After a journal-mode write, xfs_repair should still consider the image
+/// consistent.
+#[test]
+fn journal_write_passes_xfs_repair() {
+    require_fusefs!();
+
+    let image = writable_copy(&GOLDENV4, "journal_repair");
+
+    with_rw_journal_mount_at(&image, "journal_repair", |mnt| {
+        // Write file data
+        let file = mnt.join("files/hello.txt");
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(b"REPAIR_TEST").unwrap();
+    });
+
+    // Check the image is consistent
+    let result = xfs_repair_check(&image);
+    assert!(
+        result.is_ok(),
+        "xfs_repair rejected the journal-modified image: {}",
+        result.unwrap_err()
+    );
+}
+
 fn run_concurrency_benchmark(mnt: &Path, fuse_threads: usize) {
     use std::{
         sync::{
