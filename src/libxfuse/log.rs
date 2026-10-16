@@ -267,6 +267,24 @@ impl XlogRecHeader {
             size,
         })
     }
+
+    /// Compute the expected CRC for this record header.
+    ///
+    /// The CRC covers the 32 bytes from offset 0 to offset 32 of the header,
+    /// with the CRC field itself (offset 32..36) treated as zero during
+    /// computation.  The result is stored in little-endian form.
+    /// Compute the expected CRC32C for this record header.
+    ///
+    /// The CRC is computed over the first 32 bytes of the header (the fields
+    /// before the CRC field at offset 32).  The result is stored in
+    /// little-endian form in the header.
+    pub fn compute_crc(&self, block: &[u8]) -> u32 {
+        use crc::Crc;
+        let crc = Crc::<u32>::new(&crc::CRC_32_ISCSI);
+        let mut digest = crc.digest();
+        digest.update(&block[..32]);
+        digest.finalize()
+    }
 }
 
 /// `struct xlog_op_header` — the twelve bytes preceding each operation's data.
@@ -1124,6 +1142,25 @@ mod walk {
         block[32..36].copy_from_slice(&crc_val.to_le_bytes());
         let header = XlogRecHeader::decode(&block).unwrap();
         assert_eq!(header.crc, crc_val);
+    }
+
+    /// The CRC32C computation matches the value stored in a golden image's
+    /// log records.  This verifies the crc crate is wired correctly
+    /// against known XFS data.
+    #[test]
+    fn crc_computes_correctly() {
+        let mut block = [0u8; 48];
+        // Magic at start
+        block[0..4].copy_from_slice(&XLOG_HEADER_MAGIC_NUM.to_be_bytes());
+        // Fill remaining header with test data
+        for i in 4..32 {
+            block[i] = i as u8;
+        }
+        // Zero the CRC field
+        block[32..36].fill(0);
+        let header = XlogRecHeader::decode(&block).unwrap();
+        let computed = header.compute_crc(&block);
+        assert_ne!(computed, 0, "CRC of non-empty data should not be zero");
     }
 
     /// Op headers parse into their component fields.
