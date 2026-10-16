@@ -81,6 +81,10 @@ pub const XLOG_START_TRANS: u8 = 0x01;
 pub const XLOG_COMMIT_TRANS: u8 = 0x02;
 /// `XFS_LI_BUF` — the log item type code for a buffer item.
 pub const XFS_LI_BUF: u16 = 0x0002;
+/// `XFS_LI_EFI` — the log item type code for an extent-freeing intent item.
+pub const XFS_LI_EFI: u16 = 0x000d;
+/// `XFS_LI_EFD` — the log item type code for an extent-freeing done item.
+pub const XFS_LI_EFD: u16 = 0x000e;
 /// `XLOG_CONTINUE_TRANS` — this region is a partial, continued into the next.
 pub const XLOG_CONTINUE_TRANS: u8 = 0x04;
 /// `XLOG_WAS_CONT_TRANS` — as `XLOG_CONTINUE_TRANS`, and superseded by it.
@@ -343,6 +347,8 @@ pub enum XlogItemKind {
     Agf,
     Agi,
     Btree,
+    Efi,
+    Efd,
 }
 
 impl XlogItemKind {
@@ -355,6 +361,8 @@ impl XlogItemKind {
             0x0004 => XlogItemKind::Agf,            // XFS_LI_AGF
             0x0005 => XlogItemKind::Agi,            // XFS_LI_AGI
             0x0006 => XlogItemKind::Btree,          // XFS_LI_BTREE
+            0x000d => XlogItemKind::Efi,              // XFS_LI_EFI
+            0x000e => XlogItemKind::Efd,              // XFS_LI_EFD
             _ => XlogItemKind::Unknown(code),
         }
     }

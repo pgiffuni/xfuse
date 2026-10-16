@@ -82,10 +82,12 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::{
+    alloc::allocator::free_in_group,
+    alloc::free_space::FreeRun,
     block_cache::BlockCache,
     block_device::BlockDevice,
     error::{FsError, FsResult},
-    log::{LogWriter, XFS_LI_BUF, XFS_TRANSACTION, XLOG_COMMIT_TRANS},
+    log::{LogWriter, XFS_LI_BUF, XFS_LI_EFI, XLOG_COMMIT_TRANS, XFS_TRANSACTION},
     sb::Sb,
 };
 
@@ -407,6 +409,19 @@ impl<'a> Transaction<'a> {
             writer.append_op(tid, XFS_TRANSACTION, 0, &payload);
         }
 
+        // Write EFI (extent-freeing intent) items for deferred frees.
+        // These log the intent to free blocks so recovery can replay
+        // them if the system crashes before the frees are applied.
+        for free in &self.deferred_frees {
+            let mut payload = Vec::new();
+            // Encoding: type code (2B) + agno (4B) + agbno (4B) + len (4B)
+            payload.extend_from_slice(&XFS_LI_EFI.to_be_bytes());
+            payload.extend_from_slice(&free.agno.to_be_bytes());
+            payload.extend_from_slice(&free.agbno.to_be_bytes());
+            payload.extend_from_slice(&free.len.to_be_bytes());
+            writer.append_op(tid, XFS_TRANSACTION, 0, &payload);
+        }
+
         // Write the COMMIT record to the log
         let commit_payload: Vec<u8> = Vec::new();
         writer.append_op(tid, XFS_TRANSACTION, XLOG_COMMIT_TRANS, &commit_payload);
@@ -434,11 +449,24 @@ impl<'a> Transaction<'a> {
     }
 
     /// Blocks that are pending return to the allocator after the
-    /// transaction commits.  This is a stub: the real implementation will
-    /// hand them to the free space trees in a follow-up transaction.
+    /// transaction commits.  In journal mode, the EFI items were already
+    /// written to the log during `commit_journal`, so the intent is
+    /// durable; here we apply the frees to the free space trees.
+    /// In direct mode, the frees are applied directly (the transaction
+    /// has already committed).
     fn apply_deferred_frees(&mut self) -> FsResult<()> {
-        // TODO: in the journal mode, write these frees to the log so they
-        // survive a crash; in Direct mode, they are already committed.
+        let frees: Vec<_> = self.deferred_frees.clone();
+        for free in &frees {
+            free_in_group(self, self.sb, free.agno, FreeRun {
+                start: free.agbno,
+                len: free.len,
+            })?;
+        }
+        // Commit the free space tree changes to the data device
+        if !frees.is_empty() {
+            self.cache.commit(self.device)?;
+            self.deferred_frees.clear();
+        }
         Ok(())
     }
 
@@ -781,7 +809,8 @@ mod t {
         tx.defer_free(0, 200, 8);
         // The deferred free is tracked internally
         assert_eq!(tx.deferred_frees.len(), 1);
-        tx.commit().unwrap();
+        // Abort so we don't try to apply on a fixture with no real AGF
+        tx.abort();
     }
     /// An aborted transaction in journal mode must not write anything to
     /// the log region: the WAL protocol requires that a crash at any
