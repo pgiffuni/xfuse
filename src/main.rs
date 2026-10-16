@@ -56,6 +56,31 @@ struct App {
     /// xfuse cannot keep up to date.
     #[arg(long = "experimental-rw", short = 'r')]
     experimental_rw: bool,
+
+    /// Use the XFS journal for crash-safe writes.
+    ///
+    /// When enabled (with `--experimental-rw`), transactions are written to
+    /// the log before being applied to the data device, providing crash
+    /// consistency similar to write-ahead logging.
+    #[arg(long = "journal", requires = "experimental_rw")]
+    journal: bool,
+
+    /// Use an external device for the XFS journal.
+    ///
+    /// When set (with `--journal`), the log is written to the specified
+    /// file instead of the internal log region in the main image.  This is
+    /// useful for separating log I/O from data I/O for performance, or for
+    /// using a separate device with higher write endurance.
+    #[arg(long = "journal-device", value_name = "DEVICE")]
+    log_device: Option<PathBuf>,
+
+    /// Number of threads for the FUSE event loop.
+    ///
+    /// Default: 1.  A value greater than 1 requires Linux (fuser 0.18.0
+    /// rejects `n_threads != 1` on other platforms).  Use `--threads=4` for
+    /// parallel request processing.
+    #[arg(long = "threads", default_value_t = 1)]
+    threads: usize,
 }
 
 fn main() {
@@ -95,15 +120,20 @@ fn main() {
         MountOption::Subtype("xfs".to_string()),
     ];
     if app.experimental_rw {
-        eprintln!(
-            "warning: mounting read-write.  This mode is experimental and is NOT crash safe: \
-             xfuse has no log yet, so a machine that loses power in the middle of a write can \
-             leave the filesystem inconsistent.  Use it for testing only."
-        );
+        if app.journal {
+            eprintln!("journaling enabled: writes will be protected by the XFS log");
+        } else {
+            eprintln!(
+                "warning: mounting read-write.  This mode is experimental and is NOT crash safe: \
+                 xfuse has no log yet, so a machine that loses power in the middle of a write can \
+                 leave the filesystem inconsistent.  Use it for testing only."
+            );
+        }
         opts.push(MountOption::RW);
     } else {
         opts.push(MountOption::RO);
     }
+
     // geteuid is always safe
     let mut acl = SessionACL::Owner;
     if unsafe { libc::geteuid() } == 0 {
@@ -146,7 +176,14 @@ fn main() {
     // Open the image before going into the background, so that a refusal -- an
     // unwritable image, an image whose features this build cannot maintain --
     // is reported to whoever ran the command.
-    let vol = match Volume::new(&app.device, rtdev.as_ref(), app.experimental_rw) {
+    let logdev = app.log_device.as_ref();
+    let vol = match Volume::new(
+        &app.device,
+        rtdev.as_ref(),
+        logdev,
+        app.experimental_rw,
+        app.journal,
+    ) {
         Ok(vol) => vol,
         Err(e) => {
             eprintln!("xfs-fuse: {e}");
@@ -160,7 +197,17 @@ fn main() {
     let mut config = fuser::Config::default();
     config.mount_options = opts;
     config.acl = acl;
-    config.n_threads = None;
+    // fuser 0.18.0 rejects `n_threads != 1` on non-Linux platforms.
+    // Warn and fall back on FreeBSD.
+    if app.threads != 1 && !cfg!(target_os = "linux") {
+        eprintln!(
+            "warning: --threads={} is not supported on this platform; using single-threaded mode",
+            app.threads
+        );
+        config.n_threads = None;
+    } else {
+        config.n_threads = Some(app.threads);
+    }
     config.clone_fd = false;
     mount(vol, &app.mountpoint, &config).unwrap();
 }

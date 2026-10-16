@@ -34,8 +34,8 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
-        Mutex,
         OnceLock,
+        RwLock,
     },
     time::Duration,
 };
@@ -117,6 +117,7 @@ use crate::libxfuse::{
         BtreeRoot,
         BMBT_NULL_PTR,
     },
+    log::{LogRecovery, LogReplayer},
 };
 
 /// We must store the Superblock in a global variable.  This is unfortunate, and limits us to only
@@ -174,13 +175,17 @@ struct OpenFile {
 ///
 /// This is kept inside a `Mutex` so that `Volume` can implement
 /// `Filesystem` with `&self` methods (required by fuser 0.18).  Locking
-/// `state` serializes FUSE operations; the read-only fields (`sb`,
-/// `writable`, `no_open`, `no_opendir`) are outside the lock to avoid
-/// holding it when the value is not needed.
+/// `state` is protected by an `RwLock` so that read-only FUSE operations
+/// (`getattr`, `read`, `readdir`, `readlink`, `bmap`, `getxattr`, `listxattr`)
+/// can run concurrently via shared read locks, while mutating operations
+/// (`lookup`, `open`, `create`, `write`, etc.) acquire exclusive write locks.
+/// Read-only fields (`sb`, `writable`, `no_open`, `no_opendir`) are outside the
+/// lock to avoid holding it when the value is not needed.
 #[derive(Debug)]
 struct State {
     device:      BlockReader,
-    rt_device:   Option<BlockReader>,
+    rt_device:   Option<Arc<BlockDevice>>,
+    log_device:  Option<Arc<BlockDevice>>,
     sb:          Sb,
     open_files:  HashMap<u64, OpenInode>,
     handles:     HashMap<u64, OpenFile>,
@@ -192,7 +197,7 @@ struct State {
 /// All the state a mounted XFS image needs to answer FUSE requests.
 #[derive(Debug)]
 pub struct Volume {
-    state:      Mutex<State>,
+    state:      RwLock<State>,
     no_open:    AtomicBool,
     no_opendir: AtomicBool,
 }
@@ -223,7 +228,9 @@ impl Volume {
     pub fn new(
         device_name: &Path,
         rt_device_name: Option<&PathBuf>,
+        log_device_name: Option<&PathBuf>,
         writable: bool,
+        journal: bool,
     ) -> FsResult<Volume> {
         let access = if writable {
             Access::ReadWrite
@@ -232,7 +239,13 @@ impl Volume {
         };
         let block_device = Arc::new(BlockDevice::open(device_name, access)?);
         let mut device = BlockReader::from_device(Arc::clone(&block_device));
-        let rt_device = rt_device_name.map(|n| BlockReader::open(n)).transpose()?;
+        let rt_device = rt_device_name
+            .map(|n| BlockDevice::open(n, Access::ReadOnly).map(Arc::new))
+            .transpose()?;
+
+        let log_device = log_device_name
+            .map(|n| BlockDevice::open(n, Access::ReadWrite).map(Arc::new))
+            .transpose()?;
 
         let superblock = Sb::from(device.by_ref());
         let capabilities = FsCapabilities::inspect(&superblock, rt_device.is_some());
@@ -249,7 +262,7 @@ impl Volume {
         })?;
 
         if let Some(rtdev) = &rt_device {
-            let rtdev_blocks = rtdev.size / u64::from(superblock.sb_blocksize);
+            let rtdev_blocks = rtdev.size() / u64::from(superblock.sb_blocksize);
             if rtdev_blocks != superblock.sb_rblocks {
                 warn!(
                     "realtime device size mismatch.  Expected {} blocks; found {}",
@@ -263,7 +276,20 @@ impl Volume {
                 what: "the superblock has no root inode".into(),
             });
         }
-        let root_inode = Dinode::from(device.by_ref(), &superblock, superblock.sb_rootino);
+
+        // If mounting read-write with journaling, replay the log first
+        if writable {
+            Self::recover_log_with_device(
+                Arc::clone(&block_device),
+                log_device.as_ref().map(Arc::clone),
+                &superblock,
+            )?;
+        }
+
+        let mut root_inode = Dinode::from(device.by_ref(), &superblock, superblock.sb_rootino);
+        if root_inode.di_core.di_mode as u32 & S_IFMT == S_IFDIR {
+            let _ = root_inode.get_dir(device.by_ref(), &superblock);
+        }
         let mut open_files = HashMap::new();
         open_files.insert(
             1,
@@ -281,17 +307,20 @@ impl Volume {
             superblock.sb_blocksize
         );
 
-        let mode = if writable {
+        let mode = if journal {
+            CommitMode::Journal
+        } else if writable {
             CommitMode::Direct
         } else {
             CommitMode::ReadOnly
         };
-        let tx = TransactionContext::new(block_device, &superblock, mode);
+        let tx = TransactionContext::new(block_device, log_device.as_ref().map(Arc::clone), &superblock, mode);
 
         Ok(Volume {
-            state:      Mutex::new(State {
+            state:      RwLock::new(State {
                 device,
                 rt_device,
+                log_device,
                 sb: superblock,
                 open_files,
                 handles: HashMap::new(),
@@ -304,11 +333,46 @@ impl Volume {
         })
     }
 
+    /// Replay the log if it contains committed transactions.
+    ///
+    /// This scans the log region for committed transactions and applies
+    /// any buffer items to the device.  A crash-consistent image has an
+    /// empty (or already-replayed) log, so this is a no-op for most mounts.
+    fn recover_log(device_name: &Path, device: &BlockDevice, sb: &Sb) -> FsResult<()> {
+        // Open the device from the path for the BlockReader
+        let mut reader = BlockReader::open(device_name)?;
+        let recovery = LogRecovery::analyze(&mut reader, sb)?;
+        if recovery.committed_count() > 0 {
+            let mut replayer = LogReplayer::new(device, sb);
+            let blocks = replayer.replay(&recovery)?;
+            debug!("recovered {} blocks from log", blocks);
+        }
+        Ok(())
+    }
+
+    /// Replay the log, optionally from an external log device.
+    fn recover_log_with_device(
+        device: Arc<BlockDevice>,
+        log_device: Option<Arc<BlockDevice>>,
+        sb: &Sb,
+    ) -> FsResult<()> {
+        let log_dev = log_device.unwrap_or_else(|| Arc::clone(&device));
+        let mut reader = BlockReader::from_device(log_dev);
+        let recovery = LogRecovery::analyze(&mut reader, sb)?;
+        if recovery.committed_count() > 0 {
+            let mut replayer = LogReplayer::new(&device, sb);
+            let blocks = replayer.replay(&recovery)?;
+            debug!("recovered {} blocks from log", blocks);
+        }
+        Ok(())
+    }
+
+    /// Replay the log, optionally from an external log device.
     /// Test-only accessor: delegates to `State::add_dirent`.
     #[allow(dead_code)]
     pub fn add_dirent(&self, parent: u64, name: &[u8], ino: u64, ftype: u8) -> FsResult<()> {
         self.state
-            .lock()
+            .write()
             .unwrap()
             .add_dirent(parent, name, ino, ftype)
     }
@@ -316,7 +380,7 @@ impl Volume {
     /// Test-only accessor: delegates to `State::remove_dirent`.
     #[allow(dead_code)]
     pub fn remove_dirent(&self, parent: u64, name: &[u8]) -> FsResult<()> {
-        self.state.lock().unwrap().remove_dirent(parent, name)
+        self.state.write().unwrap().remove_dirent(parent, name)
     }
 }
 
@@ -369,9 +433,35 @@ impl State {
             .and_modify(|e| e.count += 1)
             .or_insert_with(|| {
                 self.device.set_bufsize(sb.inode_size());
-                let dinode = Dinode::from(self.device.by_ref(), sb, xfs_ino);
+                let mut dinode = Dinode::from(self.device.by_ref(), sb, xfs_ino);
+                let mode = dinode.di_core.di_mode as u32;
+                if mode & S_IFMT == S_IFDIR {
+                    let _ = dinode.get_dir(self.device.by_ref(), sb);
+                } else if mode & S_IFMT == S_IFREG {
+                    let _ = dinode.get_file();
+                }
                 OpenInode { dinode, count: 1 }
             })
+    }
+
+    /// Re-read an inode from disk after a transaction and restore its cached
+    /// extent map / directory data fork, so that read-only FUSE operations (which
+    /// use `read()` locks) can use the cached accessors.
+    fn refresh_inode(&mut self, ino: u64) {
+        let sb = &self.sb;
+        let xfs_ino = self.xfs_ino(ino);
+        self.device.invalidate();
+        self.device.set_bufsize(sb.inode_size());
+        let mut dinode = Dinode::from(self.device.by_ref(), sb, xfs_ino);
+        let mode = dinode.di_core.di_mode as u32;
+        if mode & S_IFMT == S_IFDIR {
+            let _ = dinode.get_dir(self.device.by_ref(), sb);
+        } else if mode & S_IFMT == S_IFREG {
+            let _ = dinode.get_file();
+        }
+        if let Some(oi) = self.open_files.get_mut(&ino) {
+            oi.dinode = dinode;
+        }
     }
 
     /// Begin a transaction on the data device.
@@ -627,6 +717,7 @@ impl State {
         let into_old = first_fsb
             .map(|_| (first_new * blocksize - offset) as usize)
             .unwrap_or(0);
+        let into_old = into_old.min(data.len());
         if into_old > 0 {
             let fsb = first_fsb.expect("the old block, when part of the write is in it");
             let at = sb.fsb_to_offset(fsb) + (offset % blocksize);
@@ -828,11 +919,7 @@ impl State {
                 raw.finalise();
                 tx.write_bytes(inode_offset, raw.as_bytes())?;
                 tx.commit()?;
-                self.device.invalidate();
-                let dinode = Dinode::from(self.device.by_ref(), &sb, xfs_ino);
-                if let Some(oi) = self.open_files.get_mut(&ino) {
-                    oi.dinode = dinode;
-                }
+                self.refresh_inode(ino);
                 return Ok(data.len() as u32);
             }
 
@@ -930,12 +1017,7 @@ impl State {
 
         // The read side may be holding a copy of something that just changed, and
         // the cached inode is now behind the image.
-        self.device.invalidate();
-        self.device.set_bufsize(inode_size);
-        let dinode = Dinode::from(self.device.by_ref(), &sb, xfs_ino);
-        if let Some(oi) = self.open_files.get_mut(&ino) {
-            oi.dinode = dinode;
-        }
+        self.refresh_inode(ino);
         Ok(data.len() as u32)
     }
 
@@ -1125,11 +1207,7 @@ impl State {
             raw.finalise();
             tx.write_bytes(inode_offset, raw.as_bytes())?;
             tx.commit()?;
-            self.device.invalidate();
-            let dinode = Dinode::from(self.device.by_ref(), &sb, xfs_ino);
-            if let Some(oi) = self.open_files.get_mut(&ino) {
-                oi.dinode = dinode;
-            }
+            self.refresh_inode(ino);
             return Ok(0);
         }
         // A file whose extents are in a B+tree is read out of the tree here,
@@ -1239,12 +1317,7 @@ impl State {
         tx.write_bytes(inode_offset, raw.as_bytes())?;
         tx.commit()?;
 
-        self.device.invalidate();
-        self.device.set_bufsize(inode_size);
-        let dinode = Dinode::from(self.device.by_ref(), &sb, xfs_ino);
-        if let Some(oi) = self.open_files.get_mut(&ino) {
-            oi.dinode = dinode;
-        }
+        self.refresh_inode(ino);
         Ok(0)
     }
 
@@ -1388,21 +1461,14 @@ impl State {
         // The read side may be holding a copy of a block that has just
         // changed, and the cached inode holds timestamps that have just
         // changed.  Both are replaced with what is now on the image.
-        self.device.invalidate();
-        self.device.set_bufsize(self.sb.inode_size());
-        let xfs_ino = self.xfs_ino(ino);
-        let sb = &self.sb;
-        let dinode = Dinode::from(self.device.by_ref(), sb, xfs_ino);
-        if let Some(oi) = self.open_files.get_mut(&ino) {
-            oi.dinode = dinode;
-        }
+        self.refresh_inode(ino);
         Ok(written as u32)
     }
 }
 
 impl Filesystem for Volume {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         let parent_oi = &mut s.open_files.get_mut(&u64::from(parent)).unwrap();
         let dirsize = s.sb.sb_blocksize << s.sb.sb_dirblklog;
         s.device.set_bufsize(dirsize as usize);
@@ -1433,7 +1499,7 @@ impl Filesystem for Volume {
         whence: i32,
         reply: ReplyLseek,
     ) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         let uoffset = if let Ok(offs) = u64::try_from(offset) {
             offs
         } else {
@@ -1454,7 +1520,7 @@ impl Filesystem for Volume {
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         if ino == INodeNo::ROOT {
             // Special case: since fusefs never does a lookup for the root
             // inode, its FORGETs may be "unmatched"
@@ -1476,7 +1542,7 @@ impl Filesystem for Volume {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = self.state.read().unwrap();
         let ttl = s.ttl();
         let attr = s
             .open_files
@@ -1501,7 +1567,7 @@ impl Filesystem for Volume {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         if !s.writable {
             reply.error(Errno::EROFS);
             return;
@@ -1647,8 +1713,13 @@ impl Filesystem for Volume {
         let ttl = s.ttl();
 
         // 4. Add inode to open files (after commit, so we can borrow self again)
+        let mut dev = BlockReader::from_device(s.device.device());
         let oi = s.open_inode(new_ino);
         oi.dinode = Dinode::from_bytes(raw.as_bytes(), &sb, new_xfs_ino);
+        if oi.dinode.di_core.di_mode as u32 & S_IFMT == S_IFDIR {
+            dev.set_bufsize((sb.sb_blocksize << sb.sb_dirblklog) as usize);
+            let _ = oi.dinode.get_dir(dev.by_ref(), &sb);
+        }
 
         let attr = oi.dinode.di_core.stat(new_ino).expect("new inode stat");
         reply.created(
@@ -1671,7 +1742,7 @@ impl Filesystem for Volume {
         rdev: u32,
         reply: ReplyEntry,
     ) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         if !s.writable {
             reply.error(Errno::EROFS);
             return;
@@ -1822,14 +1893,19 @@ impl Filesystem for Volume {
         }
 
         let ttl = s.ttl();
+        let mut dev = BlockReader::from_device(s.device.device());
         let oi = s.open_inode(new_ino);
         oi.dinode = Dinode::from_bytes(raw.as_bytes(), &sb, new_xfs_ino);
+        if oi.dinode.di_core.di_mode as u32 & S_IFMT == S_IFDIR {
+            dev.set_bufsize((sb.sb_blocksize << sb.sb_dirblklog) as usize);
+            let _ = oi.dinode.get_dir(dev.by_ref(), &sb);
+        }
         let attr = oi.dinode.di_core.stat(new_ino).expect("new inode stat");
         reply.entry(&ttl, &attr, Generation(0));
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         if !s.writable {
             reply.error(Errno::EROFS);
             return;
@@ -2080,7 +2156,7 @@ impl Filesystem for Volume {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         if !s.writable {
             reply.error(Errno::EROFS);
             return;
@@ -2236,14 +2312,19 @@ impl Filesystem for Volume {
         }
 
         let ttl = s.ttl();
+        let mut dev = BlockReader::from_device(s.device.device());
         let oi = s.open_inode(new_ino);
         oi.dinode = Dinode::from_bytes(raw.as_bytes(), &sb, new_xfs_ino);
+        if oi.dinode.di_core.di_mode as u32 & S_IFMT == S_IFDIR {
+            dev.set_bufsize((sb.sb_blocksize << sb.sb_dirblklog) as usize);
+            let _ = oi.dinode.get_dir(dev.by_ref(), &sb);
+        }
         let attr = oi.dinode.di_core.stat(new_ino).expect("new inode stat");
         reply.entry(&ttl, &attr, Generation(0));
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         if !s.writable {
             reply.error(Errno::EROFS);
             return;
@@ -2470,7 +2551,7 @@ impl Filesystem for Volume {
         _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         if !s.writable {
             reply.error(Errno::EROFS);
             return;
@@ -2658,7 +2739,7 @@ impl Filesystem for Volume {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         if !s.writable {
             reply.error(Errno::EROFS);
             return;
@@ -2851,7 +2932,7 @@ impl Filesystem for Volume {
         target: &Path,
         reply: ReplyEntry,
     ) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         if !s.writable {
             reply.error(Errno::EROFS);
             return;
@@ -2995,9 +3076,14 @@ impl Filesystem for Volume {
         }
 
         let ttl = s.ttl();
+        let mut dev = BlockReader::from_device(s.device.device());
         let oi = s.open_inode(new_ino);
         oi.dinode = Dinode::from_bytes(raw.as_bytes(), &sb, new_xfs_ino);
-        let attr = oi.dinode.di_core.stat(new_ino).expect("new symlink stat");
+        if oi.dinode.di_core.di_mode as u32 & S_IFMT == S_IFDIR {
+            dev.set_bufsize((sb.sb_blocksize << sb.sb_dirblklog) as usize);
+            let _ = oi.dinode.get_dir(dev.by_ref(), &sb);
+        }
+        let attr = oi.dinode.di_core.stat(new_ino).expect("new inode stat");
         reply.entry(&ttl, &attr, Generation(0));
     }
 
@@ -3005,7 +3091,7 @@ impl Filesystem for Volume {
         // Open handles are only useful, and only correct, if the kernel sends
         // them.  A read-only mount has no reason to keep any, so it still asks
         // for the zero-message form and gets out of the open call entirely.
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         if !s.writable {
             if config
                 .add_capabilities(InitFlags::FUSE_NO_OPEN_SUPPORT)
@@ -3026,21 +3112,22 @@ impl Filesystem for Volume {
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: fuser::ReplyData) {
-        let s = &mut *self.state.lock().unwrap();
-        s.device.set_bufsize(s.sb.sb_blocksize as usize);
+        let s = self.state.read().unwrap();
+        let mut device = BlockReader::from_device(s.device.device());
+        device.set_bufsize(s.sb.sb_blocksize as usize);
         reply.data(
             s.open_files
                 .get(&u64::from(ino))
                 .expect("readlink before lookup")
                 .dinode
-                .get_link_data(s.device.by_ref(), &s.sb)
+                .get_link_data(device.by_ref(), &s.sb)
                 .as_bytes(),
         );
     }
 
     /// Open a file, handing back a handle that later operations use.
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         if self.no_open.load(Ordering::Acquire) {
             reply.error(Errno::ENOSYS);
             return;
@@ -3070,7 +3157,7 @@ impl Filesystem for Volume {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         // A write has to be against a file the kernel actually opened for
         // writing.  Anything else is a request that does not make sense, and
         // answering it would mean writing to a file nobody asked us to write.
@@ -3131,7 +3218,7 @@ impl Filesystem for Volume {
         flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         let _ = fh;
         // The kernel sends only the fields the caller actually asked to change, so
         // a request that mentions one of them is a request for it.  What this file
@@ -3248,12 +3335,7 @@ impl Filesystem for Volume {
                 warn!("inode {ino}: committing the change failed: {e}");
                 return reply.error(e.to_errno());
             }
-            s.device.invalidate();
-            s.device.set_bufsize(inode_size);
-            let fresh = Dinode::from(s.device.by_ref(), &s.sb, xfs_ino);
-            if let Some(oi) = s.open_files.get_mut(&u64::from(ino)) {
-                oi.dinode = fresh;
-            }
+            s.refresh_inode(u64::from(ino));
         }
         s.reply_attr_of(u64::from(ino), reply)
     }
@@ -3282,7 +3364,7 @@ impl Filesystem for Volume {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         let result = s.tx.device().flush();
         match result {
             Ok(()) => reply.ok(),
@@ -3300,7 +3382,7 @@ impl Filesystem for Volume {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         let result = s.tx.device().flush();
         match result {
             Ok(()) => reply.ok(),
@@ -3320,7 +3402,7 @@ impl Filesystem for Volume {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         s.handles.remove(&u64::from(fh));
         reply.ok()
     }
@@ -3336,14 +3418,31 @@ impl Filesystem for Volume {
         _lock_owner: Option<LockOwner>,
         reply: fuser::ReplyData,
     ) {
-        let s = &mut *self.state.lock().unwrap();
-        let oi = &mut s.open_files.get_mut(&u64::from(ino)).unwrap();
-        s.device.set_bufsize(s.sb.sb_blocksize as usize);
+        let s = self.state.read().unwrap();
+        let oi = s.open_files.get(&u64::from(ino)).unwrap();
 
+        let file = match oi.dinode.file() {
+            Some(f) => f,
+            None => {
+                warn!("Extent map cache not populated for inode {}", ino);
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        };
+
+        let mut device = BlockReader::from_device(s.device.device());
+        device.set_bufsize(s.sb.sb_blocksize as usize);
+
+        let mut rt_reader = s
+            .rt_device
+            .as_ref()
+            .map(|rtd| BlockReader::from_device(Arc::clone(rtd)));
+        if let Some(rtd) = rt_reader.as_mut() {
+            rtd.set_bufsize(s.sb.sb_blocksize as usize);
+        }
         let rtdev = if oi.dinode.is_realtime() {
-            if let Some(rtd) = &mut s.rt_device {
-                rtd.set_bufsize(s.sb.sb_blocksize as usize);
-                Some(rtd.by_ref())
+            if rt_reader.is_some() {
+                rt_reader.as_mut().map(|r| r.by_ref())
             } else {
                 warn!("Realtime device not mounted");
                 reply.error(Errno::ENXIO);
@@ -3352,9 +3451,10 @@ impl Filesystem for Volume {
         } else {
             None
         };
+
         match oi
             .dinode
-            .read(s.device.by_ref(), rtdev, offset as i64, size)
+            .read_cached(file, device.by_ref(), rtdev, offset as i64, size)
         {
             Ok((v, ignore)) => reply.data(&v[ignore..]),
             Err(e) => reply.error(Errno::from_i32(e)),
@@ -3377,16 +3477,25 @@ impl Filesystem for Volume {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = self.state.read().unwrap();
         let dirsize = s.sb.sb_blocksize << s.sb.sb_dirblklog;
-        s.device.set_bufsize(dirsize as usize);
-        let oi = &mut s.open_files.get_mut(&u64::from(ino)).unwrap();
+        let oi = s.open_files.get(&u64::from(ino)).unwrap();
 
-        let dir = oi.dinode.get_dir(s.device.by_ref(), &s.sb);
+        let dir = match oi.dinode.dir() {
+            Some(d) => d,
+            None => {
+                warn!("Directory cache not populated for inode {}", ino);
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        };
+
+        let mut device = BlockReader::from_device(s.device.device());
+        device.set_bufsize(dirsize as usize);
 
         let mut off = offset as i64;
         loop {
-            let res = dir.next(s.device.by_ref(), &s.sb, off);
+            let res = dir.next(device.by_ref(), &s.sb, off);
             match res {
                 Ok((ino, offset, kind, name)) => {
                     // FUSE requires the file system's root directory to have a
@@ -3399,9 +3508,9 @@ impl Filesystem for Volume {
                             // every entry returned by readdir.  In such cases, this code will read
                             // the inode twice.  The best solution is for everybody to use the
                             // ftype option in their XFS format.
-                            s.device.set_bufsize(s.sb.inode_size());
+                            device.set_bufsize(s.sb.inode_size());
                             let dinode = Dinode::from(
-                                s.device.by_ref(),
+                                device.by_ref(),
                                 &s.sb,
                                 if ino == 1 {
                                     s.sb.sb_rootino
@@ -3439,7 +3548,7 @@ impl Filesystem for Volume {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = self.state.read().unwrap();
         reply.statfs(
             s.sb.sb_dblocks - u64::from(s.sb.sb_logblocks),
             s.sb.sb_fdblocks,
@@ -3453,7 +3562,7 @@ impl Filesystem for Volume {
     }
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         let mut nameparts = name.as_bytes().splitn(2, |c| *c == b'.');
         let _namespace = nameparts.next().unwrap();
         let name = OsStr::from_bytes(nameparts.next().unwrap());
@@ -3481,7 +3590,7 @@ impl Filesystem for Volume {
     }
 
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         let oi = &mut s
             .open_files
             .get_mut(&u64::from(ino))
@@ -3539,7 +3648,7 @@ impl Filesystem for Volume {
         mode: i32,
         reply: ReplyEmpty,
     ) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         if !s.writable {
             reply.error(Errno::EROFS);
             return;
@@ -3708,12 +3817,7 @@ impl Filesystem for Volume {
                     reply.error(e.to_errno());
                     return;
                 }
-                s.device.invalidate();
-                s.device.set_bufsize(inode_size);
-                let dinode = Dinode::from(s.device.by_ref(), &sb, xfs_ino);
-                if let Some(oi) = s.open_files.get_mut(&u64::from(ino)) {
-                    oi.dinode = dinode;
-                }
+                s.refresh_inode(u64::from(ino));
                 reply.ok();
             } else if dinode.di_core.di_format == XfsDinodeFmt::Extents {
                 // Extents format: punch hole by modifying extent list in inode
@@ -3783,12 +3887,7 @@ impl Filesystem for Volume {
                     reply.error(e.to_errno());
                     return;
                 }
-                s.device.invalidate();
-                s.device.set_bufsize(inode_size);
-                let dinode = Dinode::from(s.device.by_ref(), &sb, xfs_ino);
-                if let Some(oi) = s.open_files.get_mut(&u64::from(ino)) {
-                    oi.dinode = dinode;
-                }
+                s.refresh_inode(u64::from(ino));
                 reply.ok();
             } else {
                 reply.error(Errno::ENOTSUP);
@@ -3880,6 +3979,29 @@ impl Filesystem for Volume {
                 }
             }
 
+            // ZERO_RANGE: for each block, write zeros to disk
+            if zero_range {
+                let zero_buf = vec![0u8; sb.sb_blocksize as usize];
+                for fblock in startoff..endoff {
+                    match btree_root.map_block(&mut buf_reader, fblock, false) {
+                        Ok((Some(fsblock), _)) => {
+                            let offset = sb.fsb_to_offset(fsblock);
+                            if let Err(e) = tx.write_bytes(offset, &zero_buf) {
+                                tx.abort();
+                                reply.error(e.to_errno());
+                                return;
+                            }
+                        }
+                        Ok((None, _)) => continue,
+                        Err(e) => {
+                            tx.abort();
+                            reply.error(Errno::from_i32(e));
+                            return;
+                        }
+                    }
+                }
+            }
+
             // Update inode
             // Recalculate blocks from the btree extent map (through tx to see uncommitted writes)
             let (bmx, nodes) = match btree_root.all_extents_tx(&mut tx) {
@@ -3907,12 +4029,7 @@ impl Filesystem for Volume {
                 reply.error(e.to_errno());
                 return;
             }
-            s.device.invalidate();
-            s.device.set_bufsize(inode_size);
-            let dinode = Dinode::from(s.device.by_ref(), &sb, xfs_ino);
-            if let Some(oi) = s.open_files.get_mut(&u64::from(ino)) {
-                oi.dinode = dinode;
-            }
+            s.refresh_inode(u64::from(ino));
             reply.ok();
         } else if dinode.di_core.di_format == XfsDinodeFmt::Extents {
             // Extents format: allocate blocks by adding to extent list in inode
@@ -4005,6 +4122,50 @@ impl Filesystem for Volume {
                 extents_idx += 1;
             }
 
+            // ZERO_RANGE: write zeros to all blocks in the range
+            if zero_range {
+                let zero_buf = vec![0u8; sb.sb_blocksize as usize];
+                for fblock in startoff..endoff {
+                    let mut found = false;
+                    for e in &new_extents {
+                        if e.br_startoff <= fblock && fblock < e.br_startoff + e.br_blockcount {
+                            let skip = fblock - e.br_startoff;
+                            let fsblock = e.br_startblock + skip;
+                            let offset = sb.fsb_to_offset(fsblock);
+                            if let Err(e) = tx.write_bytes(offset, &zero_buf) {
+                                tx.abort();
+                                reply.error(e.to_errno());
+                                return;
+                            }
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        // Block is still a hole - allocate and zero
+                        let agno = sb.locate_ino(xfs_ino).agno;
+                        let run = match crate::libxfuse::alloc::allocator::allocate(
+                            &mut tx, &sb, agno, 1,
+                        ) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tx.abort();
+                                reply.error(e.to_errno());
+                                return;
+                            }
+                        };
+                        let ag_base = u64::from(agno) * u64::from(sb.sb_agblocks);
+                        let fsblock = ag_base + run.start as u64;
+                        let offset = sb.fsb_to_offset(fsblock);
+                        if let Err(e) = tx.write_bytes(offset, &zero_buf) {
+                            tx.abort();
+                            reply.error(e.to_errno());
+                            return;
+                        }
+                    }
+                }
+            }
+
             // Write new extent list back to inode
             if let Err(e) = raw_inode.set_core_extents(&new_extents) {
                 tx.abort();
@@ -4027,12 +4188,7 @@ impl Filesystem for Volume {
                 reply.error(e.to_errno());
                 return;
             }
-            s.device.invalidate();
-            s.device.set_bufsize(inode_size);
-            let dinode = Dinode::from(s.device.by_ref(), &sb, xfs_ino);
-            if let Some(oi) = s.open_files.get_mut(&u64::from(ino)) {
-                oi.dinode = dinode;
-            }
+            s.refresh_inode(u64::from(ino));
             reply.ok();
         } else {
             reply.error(Errno::ENOTSUP);
@@ -4040,7 +4196,7 @@ impl Filesystem for Volume {
     }
 
     fn bmap(&self, _req: &Request, ino: INodeNo, blocksize: u32, idx: u64, reply: ReplyBmap) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = self.state.read().unwrap();
         if blocksize == 0 {
             reply.error(Errno::EINVAL);
             return;
@@ -4078,6 +4234,7 @@ impl Filesystem for Volume {
 
         let phys_block: Result<Option<XfsFsblock>, i32> = {
             let mut result = Err(libc::ENOTSUP);
+            let mut device = BlockReader::from_device(s.device.device());
             match dinode.di_core.di_format {
                 XfsDinodeFmt::Extents => {
                     let mut peek = vec![0u8; inode_size];
@@ -4087,7 +4244,7 @@ impl Filesystem for Volume {
                         let mut dinode = Dinode::from_bytes(&peek, &sb, xfs_ino);
                         let file = dinode.get_file();
                         if let Ok(file) = file {
-                            result = match file.lookup(s.device.by_ref(), &sb, file_block, false) {
+                            result = match file.lookup(device.by_ref(), &sb, file_block, false) {
                                 Ok((Some(block), _)) => Ok(Some(block)),
                                 Ok((None, _)) => Ok(None),
                                 Err(errno) => Err(errno),
@@ -4172,7 +4329,7 @@ impl Filesystem for Volume {
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         if !s.writable {
             reply.error(Errno::EROFS);
             return;
@@ -4268,7 +4425,7 @@ impl Filesystem for Volume {
     }
 
     fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let s = &mut *self.state.lock().unwrap();
+        let s = &mut *self.state.write().unwrap();
         if !s.writable {
             reply.error(Errno::EROFS);
             return;
@@ -4386,7 +4543,7 @@ mod dirent_tests {
             std::io::copy(&mut src, &mut copy).ok()?;
         }
         copy.flush().ok()?;
-        let v = Volume::new(copy.path(), None, true).ok()?;
+        let v = Volume::new(copy.path(), None, None, true, false).ok()?;
         Some((copy, v))
     }
 

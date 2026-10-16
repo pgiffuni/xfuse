@@ -26,11 +26,11 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use std::{
-    cell::{Ref, RefCell},
-    collections::{btree_map::Entry, BTreeMap},
+    collections::BTreeMap,
     ffi::OsStr,
     io::{BufRead, Seek, SeekFrom},
     os::unix::ffi::OsStrExt,
+    sync::Mutex,
 };
 
 use bincode_next::{
@@ -141,7 +141,7 @@ impl<Ctx> Decode<Ctx> for XfsDa3NodeHdr {
 }
 impl_borrow_decode!(XfsDa3NodeHdr);
 
-#[derive(Debug, Decode)]
+#[derive(Debug, Clone, Decode)]
 pub struct XfsDa3NodeEntry {
     pub hashval: XfsDahash,
     pub before:  XfsDablk,
@@ -164,7 +164,18 @@ pub struct XfsDa3Intnode {
     level:     u16,
     //hdr: XfsDa3NodeHdr,
     pub btree: Vec<XfsDa3NodeEntry>,
-    children:  RefCell<BTreeMap<XfsDablk, Self>>,
+    children:  Mutex<BTreeMap<XfsDablk, Self>>,
+}
+
+impl Clone for XfsDa3Intnode {
+    fn clone(&self) -> Self {
+        Self {
+            magic:    self.magic,
+            level:    self.level,
+            btree:    self.btree.clone(),
+            children: Mutex::new(BTreeMap::new()),
+        }
+    }
 }
 
 impl XfsDa3Intnode {
@@ -237,31 +248,28 @@ impl XfsDa3Intnode {
         }
     }
 
-    fn read_child<'a, R, F>(
-        &'a self,
+    fn read_child<R, F>(
+        &self,
         buf_reader: &mut R,
         super_block: &Sb,
         dblock: XfsDablk,
         map_dblock: &F,
-    ) -> Result<impl std::ops::Deref<Target = Self> + 'a, i32>
+    ) -> Result<Self, i32>
     where
         R: BufRead + Reader + Seek,
         F: Fn(XfsDablk, &mut R) -> XfsFsblock,
     {
-        let mut cache_guard = self.children.borrow_mut();
-        let entry = cache_guard.entry(dblock);
-        if matches!(entry, Entry::Vacant(_)) {
+        let mut cache_guard = self.children.lock().unwrap();
+        #[allow(clippy::map_entry)]
+        if !cache_guard.contains_key(&dblock) {
             let fsblock = map_dblock(dblock, buf_reader.by_ref());
             let offset = super_block.fsb_to_offset(fsblock);
             buf_reader.seek(SeekFrom::Start(offset)).unwrap();
             buf_reader.fill_buf().unwrap();
             let node = XfsDa3Intnode::from(buf_reader.by_ref());
-            entry.or_insert(node);
+            cache_guard.insert(dblock, node);
         }
-        // Annoyingly, there's no function to downgrade a RefMut into a Ref.
-        drop(cache_guard);
-        let cache_guard = self.children.borrow();
-        Ok(Ref::map(cache_guard, |v| &v[&dblock]))
+        Ok(cache_guard.get(&dblock).unwrap().clone())
     }
 }
 

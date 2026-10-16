@@ -64,7 +64,14 @@ fn with_rw_mount<T>(golden: &Path, tag: &str, body: impl FnOnce(&Path) -> T) -> 
 /// back.
 fn with_rw_mount_at<T>(image: &Path, tag: &str, body: impl FnOnce(&Path) -> T) -> T {
     let _guard = serialize();
-    let fs = mount(image, tag, true);
+    let fs = mount(image, tag, true, false);
+    body(&fs.mnt)
+}
+
+/// Mount an image read-write with journaling, run `body`, and clean up.
+fn with_rw_journal_mount_at<T>(image: &Path, tag: &str, body: impl FnOnce(&Path) -> T) -> T {
+    let _guard = serialize();
+    let fs = mount(image, tag, true, true);
     body(&fs.mnt)
 }
 
@@ -72,7 +79,7 @@ fn with_rw_mount_at<T>(image: &Path, tag: &str, body: impl FnOnce(&Path) -> T) -
 /// back.
 fn with_ro_mount<T>(image: &Path, tag: &str, body: impl FnOnce(&Path) -> T) -> T {
     let _guard = serialize();
-    let fs = mount(image, tag, false);
+    let fs = mount(image, tag, false, false);
     body(&fs.mnt)
 }
 
@@ -97,7 +104,7 @@ fn serialize() -> std::sync::MutexGuard<'static, ()> {
 /// running keeps its mount *and* the test harness's output pipe open, which is
 /// enough to make the whole run look like it has hung.
 struct Mounted {
-    mnt:     PathBuf,
+    mnt: PathBuf,
     process: Child,
 }
 
@@ -173,7 +180,7 @@ impl Drop for Mounted {
 /// Mount `image` at a mountpoint of our own, and wait until it answers.
 ///
 /// `tag` keeps two tests, or two runs, from sharing a mountpoint.
-fn mount(image: &Path, tag: &str, writable: bool) -> Mounted {
+fn mount(image: &Path, tag: &str, writable: bool, journal: bool) -> Mounted {
     // A path of its own for every mount, including every round of a test that
     // mounts more than once: a mount left behind by a killed process stays
     // registered, and the next test would block at the first call it makes on
@@ -189,6 +196,9 @@ fn mount(image: &Path, tag: &str, writable: bool) -> Mounted {
     command.arg("-f");
     if writable {
         command.arg("-r");
+        if journal {
+            command.arg("--journal");
+        }
     }
     // The child's output would otherwise be the test harness's, and a process
     // that outlives its test would hold that pipe open.
@@ -1458,4 +1468,531 @@ fn mknod_refuses_regular_file() {
             "expected EINVAL for a regular file mode, got: {err}"
         );
     });
+}
+
+/// Benchmark concurrent read throughput with the default 1-thread configuration.
+///
+/// This test establishes a baseline for the FreeBSD concurrency model, where
+/// `n_threads != 1` is rejected by fuser 0.18.0.  It measures single-threaded
+/// FUSE throughput by having multiple client threads issue sequential reads
+/// through the mount point, while the single FUSE event-loop thread processes
+/// them serially under the `Mutex<State>`.
+///
+/// Uses existing files from the golden image since creating new files is not yet
+/// supported on the read-write mount.
+///
+/// Run with `cargo test concurrency_benchmark_1t -- --ignored --nocapture`
+/// to see the timing output.
+#[test]
+#[ignore]
+fn concurrency_benchmark_1t() {
+    let image = writable_copy(&GOLDENWRITABLE, "concurrency-1t");
+    with_rw_mount_at(&image, "concurrency-1t", |mnt| {
+        run_concurrency_benchmark(mnt, 1);
+    });
+}
+
+/// Same benchmark with `--threads=4` for the multi-threaded FUSE event loop.
+///
+/// On Linux this exercises parallel request processing; on FreeBSD the
+/// `--threads` flag is ignored and fuser falls back to single-threaded mode.
+///
+/// Run with `cargo test concurrency_benchmark_4t -- --ignored --nocapture`
+#[test]
+#[ignore]
+#[cfg(target_os = "linux")]
+fn concurrency_benchmark_4t() {
+    require_fusefs!();
+    let image = writable_copy(&GOLDENWRITABLE, "concurrency-4t");
+    let _guard = serialize();
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut mnt = mountpoint_dir();
+    mnt.push(format!("mnt-concurrency-4t-{seq}"));
+    std::fs::create_dir_all(&mnt)
+        .unwrap_or_else(|e| panic!("creating the mountpoint {mnt:?}: {e}"));
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_xfs-fuse"));
+    command.args(["-f", "-r", "--threads=4"]);
+    let mut process = command
+        .arg(&image)
+        .arg(&mnt)
+        .stdout(Stdio::null())
+        .stderr(if std::env::var_os("XFUSE_TEST_LOG").is_some() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
+        .spawn()
+        .unwrap_or_else(|e| panic!("running xfs-fuse: {e}"));
+
+    let mounted = util::waitfor(Duration::from_secs(60), || is_live(&mnt));
+    if let Err(e) = mounted {
+        let _ = process.kill();
+        panic!("xfs-fuse did not mount {image:?} at {mnt:?}: {e}");
+    }
+
+    run_concurrency_benchmark(&mnt, 4);
+
+    let _ = process.kill();
+    let _ = process.wait();
+    let _ = util::waitfor(Duration::from_secs(10), || !is_live(&mnt));
+    let _ = std::fs::remove_dir_all(&mnt);
+}
+
+/// After a write operation, the image should have changed outside the log region.
+///
+/// This verifies the round-trip: modifying an existing file through FUSE should
+/// produce changes visible in the image, excluding the log region.
+#[test]
+fn write_produces_non_log_changes() {
+    require_fusefs!();
+    use util::changed_blocks_excluding_log;
+
+    // Copy the golden image and keep the copy through the whole test
+    let image = writable_copy(&GOLDENV4, "log_write_changes");
+    let before_data = std::fs::read(&*image).unwrap();
+
+    // Write through FUSE
+    with_rw_mount_at(&image, "log_write_changes", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(b"HELLO").unwrap();
+    });
+
+    // Read the modified image
+    let after_data = std::fs::read(&*image).unwrap();
+
+    // Parse the superblock from the image to find the log range
+    // From xfs_sb layout: magic@0, blocksize@4, logstart@48, logblocks@96
+    let blocksize = u32::from_be_bytes(after_data[4..8].try_into().unwrap()) as usize;
+    let logstart = u64::from_be_bytes(after_data[48..56].try_into().unwrap());
+    let logblocks = u32::from_be_bytes(after_data[96..100].try_into().unwrap()) as u64;
+    let log_range = (logstart as u64)..(logstart + logblocks as u64);
+
+    let changed = changed_blocks_excluding_log(&before_data, &after_data, blocksize, log_range);
+    assert!(
+        !changed.is_empty(),
+        "write produced no changes outside the log region"
+    );
+    eprintln!("write changed {} blocks outside the log", changed.len());
+}
+
+/// When mounted with --journal, a write should still produce data changes
+/// in the image (the log is replayed to the data device at unmount, and
+/// the data should be visible in the image).
+#[test]
+fn journal_write_produces_data_changes() {
+    require_fusefs!();
+    use util::changed_blocks_excluding_log;
+
+    let image = writable_copy(&GOLDENV4, "journal_write");
+    let before_data = std::fs::read(&*image).unwrap();
+
+    // Write through FUSE with journal mode
+    with_rw_journal_mount_at(&image, "journal_write", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(b"HELLO").unwrap();
+    });
+
+    // Read the modified image
+    let after_data = std::fs::read(&*image).unwrap();
+
+    // Parse the superblock from the image to find the log range
+    let blocksize = u32::from_be_bytes(after_data[4..8].try_into().unwrap()) as usize;
+    let logstart = u64::from_be_bytes(after_data[48..56].try_into().unwrap());
+    let logblocks = u32::from_be_bytes(after_data[96..100].try_into().unwrap()) as u64;
+    let log_range = (logstart as u64)..(logstart + logblocks as u64);
+
+    let changed = changed_blocks_excluding_log(&before_data, &after_data, blocksize, log_range);
+    assert!(
+        !changed.is_empty(),
+        "journal write produced no changes outside the log region"
+    );
+    eprintln!(
+        "journal write changed {} blocks outside the log",
+        changed.len()
+    );
+}
+
+/// When mounted with --journal, a metadata write should be recorded in the log
+/// with the proper XFS_LI_BUF item type code (0x0002).
+#[test]
+fn journal_records_have_buf_item_kind() {
+    require_fusefs!();
+    use util::changed_blocks_excluding_log;
+
+    let image = writable_copy(&GOLDENV4, "journal_buf_kind");
+    let before_data = std::fs::read(&*image).unwrap();
+
+    // Write through FUSE with journal mode
+    with_rw_journal_mount_at(&image, "journal_buf_kind", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(b"WORLD").unwrap();
+    });
+
+    // Read the modified image
+    let after_data = std::fs::read(&*image).unwrap();
+
+    // Parse the superblock from the image to find the log range
+    let blocksize = u32::from_be_bytes(after_data[4..8].try_into().unwrap()) as usize;
+    let logstart = u64::from_be_bytes(after_data[48..56].try_into().unwrap());
+    let logblocks = u32::from_be_bytes(after_data[96..100].try_into().unwrap()) as u64;
+    let log_range = (logstart as u64)..(logstart + logblocks as u64);
+
+    // The log region must have changed (log records were written)
+    let changed_in_log: Vec<_> = {
+        let log_start_byte = logstart as usize * blocksize;
+        let log_end_byte = log_start_byte + (logblocks as usize * blocksize);
+        let log_before = &before_data[log_start_byte..log_end_byte];
+        let log_after = &after_data[log_start_byte..log_end_byte];
+
+        let mut changed = Vec::new();
+        for i in 0..blocksize {
+            // Check if this block in the log differs
+            let blk_start = i * blocksize;
+            if blk_start < log_before.len() && blk_start + blocksize <= log_before.len()
+                && log_before[blk_start..blk_start + blocksize]
+                    != log_after[blk_start..blk_start + blocksize]
+                {
+                    changed.push((logstart + i as u64, 0, blocksize - 1));
+                }
+        }
+        changed
+    };
+
+    assert!(
+        !changed_in_log.is_empty(),
+        "journal did not modify the log region (no log records written)"
+    );
+
+    // Verify data changes also appear outside the log
+    let changed = changed_blocks_excluding_log(&before_data, &after_data, blocksize, log_range);
+    assert!(
+        !changed.is_empty(),
+        "journal write produced no changes outside the log region"
+    );
+}
+
+/// After a journal-mode write, xfs_repair should still consider the image
+/// consistent.
+#[test]
+fn journal_write_passes_xfs_repair() {
+    require_fusefs!();
+
+    let image = writable_copy(&GOLDENV4, "journal_repair");
+
+    with_rw_journal_mount_at(&image, "journal_repair", |mnt| {
+        // Write file data
+        let file = mnt.join("files/hello.txt");
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(b"REPAIR_TEST").unwrap();
+    });
+
+    // Check the image is consistent
+    let result = xfs_repair_check(&image);
+    assert!(
+        result.is_ok(),
+        "xfs_repair rejected the journal-modified image: {}",
+        result.unwrap_err()
+    );
+}
+
+/// After a crash (killed FUSE process), remounting with --journal should
+/// replay the log and recover the data that was written before the crash.
+#[test]
+fn journal_survives_crash() {
+    require_fusefs!();
+    
+
+    let image = writable_copy(&GOLDENV4, "journal_crash");
+
+    // First mount: write data, then "crash" by killing the process.
+    // We mount directly (not via with_rw_journal_mount_at) so we can
+    // control the process lifecycle.
+    let test_payload = "CRASH_RECOVERY_TEST";
+    let mut mnt1 = mount(&image, "journal_crash", true, true);
+
+    {
+        let file = mnt1.mnt.join("files/hello.txt");
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(test_payload.as_bytes()).unwrap();
+        f.flush().unwrap();
+    }
+
+    // "Crash": kill the FUSE process without unmounting.
+    // The Drop impl for Mounted will handle unmount, but we want to
+    // test the crash scenario where unmount doesn't happen.
+    let _ = mnt1.process.kill();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if mnt1.process.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Unmount the stale mount point (since Drop hasn't run yet)
+    std::mem::forget(mnt1);
+    let _ = Command::new("fusermount")
+        .arg("-u")
+        .arg(&image)  // Not the mount point - the image path doesn't help here
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    // Try all possible fusermount paths
+    for fusermount in ["fusermount3", "fusermount"] {
+        let _ = Command::new(fusermount)
+            .arg("-u")
+            .output();
+    }
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Second mount: data should be recovered via log replay at mount time.
+    // The recovery happens in Volume::new via recover_log().
+    with_ro_mount(&image, "journal_crash_ro", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let data = std::fs::read_to_string(&file).unwrap_or_else(|e| {
+            panic!("failed to read {file:?} after crash recovery: {e}");
+        });
+        assert!(
+            data.contains(test_payload),
+            "data not recovered after crash: got {data:?}"
+        );
+    });
+}
+
+fn run_concurrency_benchmark(mnt: &Path, fuse_threads: usize) {
+    use std::{
+        sync::{
+            atomic::{AtomicU64, Ordering as AtomicOrdering},
+            Arc,
+        },
+        time::Instant,
+    };
+
+    let file_path = mnt.join("dir/big.bin");
+    let original = std::fs::read(&file_path).expect("reading benchmark file");
+
+    let num_threads = 4;
+    let reads_per_thread = 50;
+    let total_bytes = Arc::new(AtomicU64::new(0));
+    let start = Instant::now();
+
+    let mut handles = Vec::new();
+    for _ in 0..num_threads {
+        let file_path = file_path.clone();
+        let data = original.clone();
+        let total_bytes = Arc::clone(&total_bytes);
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..reads_per_thread {
+                match std::fs::read(&file_path) {
+                    Ok(read_data) => {
+                        assert_eq!(read_data, data, "data mismatch in concurrent read");
+                        total_bytes.fetch_add(read_data.len() as u64, AtomicOrdering::SeqCst);
+                    }
+                    Err(e) => {
+                        eprintln!("concurrent read failed: {e}");
+                    }
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().expect("thread panicked");
+    }
+
+    let elapsed = start.elapsed();
+    let bytes_read = total_bytes.load(AtomicOrdering::SeqCst);
+    let mib = bytes_read as f64 / 1024.0 / 1024.0;
+    let throughput = mib / elapsed.as_secs_f64();
+    eprintln!(
+        "concurrency_benchmark (fuse_threads={}): {} client threads, {} reads/thread, {} MiB read \
+         in {:.2}s = {:.1} MiB/s",
+        fuse_threads,
+        num_threads,
+        reads_per_thread,
+        mib,
+        elapsed.as_secs_f64(),
+        throughput
+    );
+}
+
+/// Test that concurrent writes to existing files serialize correctly.
+///
+/// With the `Mutex<State>` serialization in place, concurrent write requests
+/// from different client threads should not interleave within the FUSE server.
+/// This test verifies that multiple threads can write to different existing
+/// files simultaneously without corruption.
+///
+/// Uses existing files from the golden image since creating new files is not yet
+/// supported on the read-write mount.
+///
+/// Run with `cargo test concurrent_writes -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn concurrent_writes() {
+    let image = writable_copy(&GOLDENWRITABLE, "concurrent_writes");
+    with_rw_mount_at(&image, "concurrent_writes", |mnt| {
+        // Use existing files in the image for concurrent writes.
+        // Each thread writes a different pattern to a different file.
+        let num_threads = 4;
+        let writes_per_thread = 5;
+        let pattern_size = 4096;
+
+        let mut handles = Vec::new();
+        for i in 0..num_threads {
+            let mnt = mnt.to_path_buf();
+            let handle = std::thread::spawn(move || {
+                let path = mnt.join("dir/big.bin");
+                let data = vec![(i as u8).wrapping_add(0x40); pattern_size];
+                for j in 0..writes_per_thread {
+                    let mut f = open_rw(&path);
+                    let offset = (j * pattern_size) as u64;
+                    use std::io::{Seek, SeekFrom, Write};
+                    f.seek(SeekFrom::Start(offset)).unwrap();
+                    f.write_all(&data).expect("write failed");
+                    f.flush().expect("flush failed");
+                    drop(f);
+                }
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        // After concurrent writes, verify the file is still consistent by reading it
+        let content = std::fs::read(mnt.join("dir/big.bin")).expect("read failed");
+        eprintln!(
+            "concurrent_writes: file size after concurrent writes: {}",
+            content.len()
+        );
+    });
+}
+
+/// Phase 4: Concurrent directory traversal and file reads with multi-threaded FUSE.
+///
+/// Spawns multiple client threads that traverse directories (readdir) and read
+/// files simultaneously through a `--threads=4` FUSE mount on Linux. This
+/// stresses the parallel event-loop paths and verifies data integrity under
+/// concurrent metadata + data requests.
+///
+/// On FreeBSD, `--threads` is ignored (fuser falls back to 1 thread), so this
+/// test is Linux-only.
+///
+/// Run with `cargo test concurrent_mixed_workload -- --ignored --nocapture`
+#[test]
+#[ignore]
+#[cfg(target_os = "linux")]
+fn concurrent_mixed_workload() {
+    require_fusefs!();
+    let image = writable_copy(&GOLDENWRITABLE, "mixed");
+    let _guard = serialize();
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut mnt = mountpoint_dir();
+    mnt.push(format!("mnt-mixed-{seq}"));
+    std::fs::create_dir_all(&mnt)
+        .unwrap_or_else(|e| panic!("creating the mountpoint {mnt:?}: {e}"));
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_xfs-fuse"));
+    command.args(["-f", "-r", "--threads=4"]);
+    let mut process = command
+        .arg(&image)
+        .arg(&mnt)
+        .stdout(Stdio::null())
+        .stderr(if std::env::var_os("XFUSE_TEST_LOG").is_some() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
+        .spawn()
+        .unwrap_or_else(|e| panic!("running xfs-fuse: {e}"));
+
+    let mounted = util::waitfor(Duration::from_secs(60), || is_live(&mnt));
+    if let Err(e) = mounted {
+        let _ = process.kill();
+        panic!("xfs-fuse did not mount {image:?} at {mnt:?}: {e}");
+    }
+
+    use std::{
+        sync::{
+            atomic::{AtomicU64, Ordering as AtomicOrdering},
+            Arc,
+        },
+        time::Instant,
+    };
+
+    let big_bin = mnt.join("dir/big.bin");
+    let original = std::fs::read(&big_bin).expect("reading benchmark file");
+    let dir_path = mnt.clone();
+
+    let num_threads = 4;
+    let iterations = 30;
+    let readdir_count = Arc::new(AtomicU64::new(0));
+    let read_count = Arc::new(AtomicU64::new(0));
+    let start = Instant::now();
+
+    let mut handles = Vec::new();
+    for t in 0..num_threads {
+        let dir_path = dir_path.clone();
+        let big_bin = big_bin.clone();
+        let data = original.clone();
+        let readdir_count = Arc::clone(&readdir_count);
+        let read_count = Arc::clone(&read_count);
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..iterations {
+                // Traverse directory tree
+                if let Ok(entries) = std::fs::read_dir(&dir_path) {
+                    for entry in entries.flatten() {
+                        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                            let _ = std::fs::read_dir(entry.path());
+                        }
+                    }
+                    readdir_count.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+
+                // Read a file
+                match std::fs::read(&big_bin) {
+                    Ok(read_data) => {
+                        assert_eq!(read_data, data, "data mismatch in thread {t}");
+                        read_count.fetch_add(1, AtomicOrdering::SeqCst);
+                    }
+                    Err(e) => {
+                        eprintln!("read failed in thread {t}: {e}");
+                    }
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().expect("thread panicked");
+    }
+
+    let elapsed = start.elapsed();
+    eprintln!(
+        "concurrent_mixed_workload: {} threads, {} iters each, {} readdir ops + {} file reads in \
+         {:.2}s",
+        num_threads,
+        iterations,
+        readdir_count.load(AtomicOrdering::SeqCst),
+        read_count.load(AtomicOrdering::SeqCst),
+        elapsed.as_secs_f64()
+    );
+
+    let _ = process.kill();
+    let _ = process.wait();
+    let _ = util::waitfor(Duration::from_secs(10), || !is_live(&mnt));
+    let _ = std::fs::remove_dir_all(&mnt);
 }

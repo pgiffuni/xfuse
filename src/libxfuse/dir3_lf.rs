@@ -26,11 +26,12 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use std::{
-    cell::{Ref, RefCell},
-    collections::{btree_map::Entry, BTreeMap},
+    cell::RefCell,
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     io::{BufRead, Seek, SeekFrom},
-    ops::{Deref, Range},
+    ops::Range,
+    sync::Mutex,
 };
 
 use bincode_next::{
@@ -210,7 +211,7 @@ impl<'a, R: Reader + BufRead + Seek + 'a> NodeLikeAddressIterator<'a, R> {
         let mut buf_reader = brrc.borrow_mut();
         let leaf_btree = {
             let raw = dir.read_dblock(buf_reader.by_ref(), sb, dblock)?;
-            Leaf::open(raw.deref())
+            Leaf::open(raw.as_slice())
         };
         let leaf = leaf_btree.lookup_leaf_blk(buf_reader.by_ref(), sb, dir, hash)?;
 
@@ -254,7 +255,7 @@ impl<'a, R: Reader + BufRead + Seek + 'a> Iterator for NodeLikeAddressIterator<'
                             return None;
                         }
                     };
-                    self.leaf = decode(raw.deref()).unwrap().0;
+                    self.leaf = decode(raw.as_slice()).unwrap().0;
                     self.leaf_range = self.leaf.get_address_range(self.hash);
                 } else {
                     return None;
@@ -280,7 +281,7 @@ pub struct Dir2Lf {
     dfork: ExtentMap,
 
     /// A cache of directory blocks, indexed by directory block number
-    blocks: RefCell<BTreeMap<XfsDablk, Vec<u8>>>,
+    blocks: Mutex<BTreeMap<XfsDablk, Vec<u8>>>,
 }
 
 impl Dir2Lf {
@@ -315,26 +316,18 @@ impl Dir2Lf {
         NodeLikeAddressIterator::new(self, buf_reader, hash, sb).map(|ai| Box::new(ai) as _)
     }
 
-    fn read_dblock<'a, R>(
-        &'a self,
-        mut buf_reader: R,
-        sb: &Sb,
-        dblock: XfsDablk,
-    ) -> Result<impl Deref<Target = [u8]> + 'a, i32>
+    fn read_dblock<R>(&self, mut buf_reader: R, sb: &Sb, dblock: XfsDablk) -> Result<Vec<u8>, i32>
     where
         R: Reader + BufRead + Seek,
     {
-        let mut cache_guard = self.blocks.borrow_mut();
-        let entry = cache_guard.entry(dblock);
-        if matches!(entry, Entry::Vacant(_)) {
+        let mut cache_guard = self.blocks.lock().unwrap();
+        #[allow(clippy::map_entry)]
+        if !cache_guard.contains_key(&dblock) {
             let fsblock = self.dfork.map_dblock(buf_reader.by_ref(), dblock)?;
             let buf = self.read_fsblock(buf_reader.by_ref(), sb, fsblock)?;
-            entry.or_insert(buf);
+            cache_guard.insert(dblock, buf);
         }
-        // Annoyingly, there's no function to downgrade a RefMut into a Ref.
-        drop(cache_guard);
-        let cache_guard = self.blocks.borrow();
-        Ok(Ref::map(cache_guard, |v| &v[&dblock][..]))
+        Ok(cache_guard.get(&dblock).unwrap().clone())
     }
 
     // NB: this code could be combined with File::read_sectors.  However, the latter must contend
