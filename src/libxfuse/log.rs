@@ -811,6 +811,18 @@ pub struct BufItem {
     pub data: Vec<u8>,
 }
 
+/// An EFI (Extent Freeing Intent) item extracted from the log.
+///
+/// Records the intent to free `len` blocks starting at `agbno` in
+/// allocation group `agno`.  On recovery, the replayer applies
+/// the free to the free space trees.
+#[derive(Debug, Clone)]
+pub struct EfiItem {
+    pub agno: u32,
+    pub agbno: u32,
+    pub len: u32,
+}
+
 /// Replay committed transactions from the log to the data device.
 ///
 /// `LogReplayer` reads through a `LogRecovery` plan and writes each
@@ -884,6 +896,26 @@ impl<'a> LogReplayer<'a> {
         }
         let data = op.payload[14..].to_vec();
         Some(BufItem { fsbno, len, data })
+    }
+
+    /// Extract an `EfiItem` from a log operation payload.
+    ///
+    /// The payload format for an EFI item is:
+    /// - 2 bytes: item type code (XFS_LI_EFI)
+    /// - 4 bytes: allocation group number (big-endian)
+    /// - 4 bytes: starting block within AG (big-endian)
+    /// - 4 bytes: number of blocks (big-endian)
+    pub fn extract_efi_item(&self, op: &LogOp) -> Option<EfiItem> {
+        if op.item_kind != Some(XlogItemKind::Efi) {
+            return None;
+        }
+        if op.payload.len() < 14 {
+            return None;
+        }
+        let agno = u32::from_be_bytes(op.payload[2..6].try_into().unwrap());
+        let agbno = u32::from_be_bytes(op.payload[6..10].try_into().unwrap());
+        let len = u32::from_be_bytes(op.payload[10..14].try_into().unwrap());
+        Some(EfiItem { agno, agbno, len })
     }
 }
 
@@ -1515,5 +1547,97 @@ mod replay {
         assert_eq!(item.fsbno, fsbno);
         assert_eq!(item.len, test_data.len() as u32);
         assert_eq!(item.data, test_data);
+    }
+
+    /// Verify that an EFI (extent-freeing intent) item can be written to the log,
+    /// read back by LogWalker, and decoded by LogReplayer::extract_efi_item.
+    #[test]
+    fn roundtrip_efi_item_is_parsable() {
+        let Some(path) = crate::libxfuse::alloc::golden("xfsv4.img") else {
+            eprintln!("skipping: no unpacked xfsv4.img");
+            return;
+        };
+
+        let mut copy_file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut src = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+            std::io::copy(&mut src, &mut copy_file).unwrap();
+        }
+        copy_file.as_file().sync_all().unwrap();
+
+        let mut reader = std::io::BufReader::new(std::fs::File::open(copy_file.path()).unwrap());
+        let sb = crate::libxfuse::sb::Sb::from(&mut reader);
+        let log_offset = sb.log_start_bytes();
+        assert!(log_offset > 0, "image must have a configured log");
+
+        // Build an EFI item payload:
+        // - 2 bytes: type code (XFS_LI_EFI = 0x000d)
+        // - 4 bytes: agno (big-endian)
+        // - 4 bytes: agbno (big-endian)
+        // - 4 bytes: len (big-endian)
+        let tid = 1u32;
+        let test_agno: u32 = 3;
+        let test_agbno: u32 = 100;
+        let test_len: u32 = 8;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&crate::libxfuse::log::XFS_LI_EFI.to_be_bytes());
+        payload.extend_from_slice(&test_agno.to_be_bytes());
+        payload.extend_from_slice(&test_agbno.to_be_bytes());
+        payload.extend_from_slice(&test_len.to_be_bytes());
+
+        let op_header = crate::libxfuse::log::XlogOpHeader::encode(
+            tid,
+            payload.len() as u32,
+            crate::libxfuse::log::XFS_TRANSACTION,
+            0,
+            0,
+        );
+
+        let lsn = crate::libxfuse::log::XlogLsn::new(1, 0);
+        let rec_header = crate::libxfuse::log::XlogRecHeader::encode(
+            1,
+            2,
+            (op_header.len() + payload.len()) as u32,
+            lsn,
+            crate::libxfuse::log::XlogLsn::new(0, 0),
+            0,
+            0,
+            1,
+            0,
+        );
+
+        let record = [&rec_header[..], &op_header[..], &payload[..]].concat();
+
+        let mut wfile = std::fs::OpenOptions::new()
+            .write(true)
+            .open(copy_file.path())
+            .unwrap();
+        use std::io::{Seek, Write};
+        wfile.seek(std::io::SeekFrom::Start(log_offset)).unwrap();
+        wfile.write_all(&record).unwrap();
+        wfile.sync_all().unwrap();
+        drop(wfile);
+
+        // Read back with LogWalker
+        let mut readback = std::io::BufReader::new(std::fs::File::open(copy_file.path()).unwrap());
+        let mut walker = crate::libxfuse::log::LogWalker::new(&mut readback, &sb);
+        let rec = walker.by_ref().next().unwrap();
+        assert!(!rec.ops.is_empty(), "no ops in record");
+
+        let op = &rec.ops[0];
+        assert_eq!(op.item_kind, Some(crate::libxfuse::log::XlogItemKind::Efi),
+            "op should be identified as an EFI item");
+
+        // Verify the payload decodes correctly
+        let device = crate::libxfuse::block_device::BlockDevice::open(
+            copy_file.path(),
+            crate::libxfuse::block_device::Access::ReadOnly,
+        )
+        .unwrap();
+        let replayer = crate::libxfuse::log::LogReplayer::new(&device, &sb);
+        let item = replayer.extract_efi_item(op).unwrap();
+        assert_eq!(item.agno, test_agno);
+        assert_eq!(item.agbno, test_agbno);
+        assert_eq!(item.len, test_len);
     }
 }
