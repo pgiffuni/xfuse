@@ -311,22 +311,27 @@ Write path must serialize initially; add parallelism only after correctness prov
 
 ## Known limitations
 
-1. **No external log support**: External logs (separate device for journal) are refused at mount
-2. **No log format 5 checksums on items**: Version 5 logs have CRC on records but item-level CRCs are more complex
-3. **No log resize**: Log cannot grow or shrink
-4. **No log recovery on read-only mount**: Recovery requires write access to the image
-5. **Delayed allocation only sequential**: Random writes may still use immediate allocation
-6. **No real-time device writes**: RT device writes are refused
+1. **No log format 5 checksums on items**: Version 5 logs have CRC on records but item-level CRCs are more complex
+2. **No log resize**: Log cannot grow or shrink
+3. **No log recovery on read-only mount**: Recovery requires write access to the image
+4. **Delayed allocation only sequential**: Random writes may still use immediate allocation
+5. **No real-time device writes**: RT device writes are refused
 
 ## Feature matrix (proposed)
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Log format 1 (v4) | Documented | Parsing in log.rs |
+| Log format 1 (v4) | Implemented | Parsing in log.rs |
 | Log format 2 (v5) | Documented | Larger IClogs, explicit log unit |
-| Internal log | Planned | In-filesystem log area |
-| External log | Planned | Separate device — mount-time detection |
+| Internal log | Implemented | In-filesystem log area |
+| External log | Implemented | Separate device via --journal-device |
 | Log record CRC | Documented | Little-endian CRC32C |
+| Transaction commit records | Implemented | Op header flags |
+| Intent/done items (EFI/EFD) | Implemented | Deferred extent freeing |
+| Metadata item types | Surveyed | See table above |
+| Recovery | Implemented | Crash recovery on mount |
+| Delayed allocation | Planned | Post-recovery |
+| Allocation reservations | Surveyed | See reservation accounting |
 | Transaction commit records | Not started | Op header flags |
 | Intent/done items (EFI/EFD) | Not started | Deferred extent freeing |
 | Metadata item types | Surveyed | See table above |
@@ -385,3 +390,26 @@ following the write-ahead logging protocol:
 3. Flush log to device
 4. Write dirty blocks to their final locations on the data device
 5. Reclaim log space by advancing the tail pointer
+
+## Phase 31: External log device support
+
+Added `--journal-device` CLI option for specifying a separate external log device.
+
+- `main.rs`: New `--journal-device` option (`log_device: Option<PathBuf>`)
+- `Volume::new()`: Accepts `log_device_name`, opens external device, passes to `TransactionContext`
+- `TransactionContext`: Added `log_device: Option<Arc<BlockDevice>>` field and accessor
+- `Transaction::begin()`: Accepts `log_device: Option<&'a BlockDevice>` parameter
+- `commit_journal()`: Uses external log device if configured, otherwise internal
+- `recover_log_with_device()`: New `Volume` method for log recovery with external device
+
+## Phase 32: EFI/EFD intent items for deferred frees
+
+Implemented deferred freeing with log intent items:
+
+- `XFS_LI_EFI` (0x000d) and `XFS_LI_EFD` (0x000e) log item type constants
+- `Efi`/`Efd` variants in `XlogItemKind` enum
+- `EfiItem` struct and `extract_efi_item()` method in `LogReplayer`
+- `commit_journal()`: Writes EFI items for deferred frees before the COMMIT record
+- `apply_deferred_frees()`: Calls `free_in_group` for each deferred free, then commits
+  free space tree changes to the data device
+- Unit test `roundtrip_efi_item_is_parsable`: Verifies EFI item round-trip
