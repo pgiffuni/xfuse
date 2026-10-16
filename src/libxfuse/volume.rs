@@ -687,6 +687,7 @@ impl State {
         let into_old = first_fsb
             .map(|_| (first_new * blocksize - offset) as usize)
             .unwrap_or(0);
+        let into_old = into_old.min(data.len());
         if into_old > 0 {
             let fsb = first_fsb.expect("the old block, when part of the write is in it");
             let at = sb.fsb_to_offset(fsb) + (offset % blocksize);

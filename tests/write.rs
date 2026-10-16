@@ -1705,6 +1705,71 @@ fn journal_write_passes_xfs_repair() {
     );
 }
 
+/// After a crash (killed FUSE process), remounting with --journal should
+/// replay the log and recover the data that was written before the crash.
+#[test]
+fn journal_survives_crash() {
+    require_fusefs!();
+    use std::os::unix::process::CommandExt;
+
+    let image = writable_copy(&GOLDENV4, "journal_crash");
+
+    // First mount: write data, then "crash" by killing the process.
+    // We mount directly (not via with_rw_journal_mount_at) so we can
+    // control the process lifecycle.
+    let test_payload = "CRASH_RECOVERY_TEST";
+    let mut mnt1 = mount(&image, "journal_crash", true, true);
+
+    {
+        let file = mnt1.mnt.join("files/hello.txt");
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(test_payload.as_bytes()).unwrap();
+        f.flush().unwrap();
+    }
+
+    // "Crash": kill the FUSE process without unmounting.
+    // The Drop impl for Mounted will handle unmount, but we want to
+    // test the crash scenario where unmount doesn't happen.
+    let _ = mnt1.process.kill();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if mnt1.process.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Unmount the stale mount point (since Drop hasn't run yet)
+    std::mem::forget(mnt1);
+    let _ = Command::new("fusermount")
+        .arg("-u")
+        .arg(&image)  // Not the mount point - the image path doesn't help here
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    // Try all possible fusermount paths
+    for fusermount in ["fusermount3", "fusermount"] {
+        let _ = Command::new(fusermount)
+            .arg("-u")
+            .output();
+    }
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Second mount: data should be recovered via log replay at mount time.
+    // The recovery happens in Volume::new via recover_log().
+    with_ro_mount(&image, "journal_crash_ro", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let data = std::fs::read_to_string(&file).unwrap_or_else(|e| {
+            panic!("failed to read {file:?} after crash recovery: {e}");
+        });
+        assert!(
+            data.contains(test_payload),
+            "data not recovered after crash: got {data:?}"
+        );
+    });
+}
+
 fn run_concurrency_benchmark(mnt: &Path, fuse_threads: usize) {
     use std::{
         sync::{
