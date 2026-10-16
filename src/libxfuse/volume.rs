@@ -228,6 +228,7 @@ impl Volume {
         device_name: &Path,
         rt_device_name: Option<&PathBuf>,
         writable: bool,
+        journal: bool,
     ) -> FsResult<Volume> {
         let access = if writable {
             Access::ReadWrite
@@ -296,7 +297,9 @@ impl Volume {
             superblock.sb_blocksize
         );
 
-        let mode = if writable {
+        let mode = if journal {
+            CommitMode::Journal
+        } else if writable {
             CommitMode::Direct
         } else {
             CommitMode::ReadOnly
@@ -4510,7 +4513,7 @@ mod dirent_tests {
             std::io::copy(&mut src, &mut copy).ok()?;
         }
         copy.flush().ok()?;
-        let v = Volume::new(copy.path(), None, true).ok()?;
+        let v = Volume::new(copy.path(), None, true, false).ok()?;
         Some((copy, v))
     }
 

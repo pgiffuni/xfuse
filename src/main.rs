@@ -57,6 +57,14 @@ struct App {
     #[arg(long = "experimental-rw", short = 'r')]
     experimental_rw: bool,
 
+    /// Use the XFS journal for crash-safe writes.
+    ///
+    /// When enabled (with `--experimental-rw`), transactions are written to
+    /// the log before being applied to the data device, providing crash
+    /// consistency similar to write-ahead logging.
+    #[arg(long = "journal", requires = "experimental_rw")]
+    journal: bool,
+
     /// Number of threads for the FUSE event loop.
     ///
     /// Default: 1.  A value greater than 1 requires Linux (fuser 0.18.0
@@ -103,15 +111,20 @@ fn main() {
         MountOption::Subtype("xfs".to_string()),
     ];
     if app.experimental_rw {
-        eprintln!(
-            "warning: mounting read-write.  This mode is experimental and is NOT crash safe: \
-             xfuse has no log yet, so a machine that loses power in the middle of a write can \
-             leave the filesystem inconsistent.  Use it for testing only."
-        );
+        if app.journal {
+            eprintln!("journaling enabled: writes will be protected by the XFS log");
+        } else {
+            eprintln!(
+                "warning: mounting read-write.  This mode is experimental and is NOT crash safe: \
+                 xfuse has no log yet, so a machine that loses power in the middle of a write can \
+                 leave the filesystem inconsistent.  Use it for testing only."
+            );
+        }
         opts.push(MountOption::RW);
     } else {
         opts.push(MountOption::RO);
     }
+
     // geteuid is always safe
     let mut acl = SessionACL::Owner;
     if unsafe { libc::geteuid() } == 0 {
@@ -154,7 +167,12 @@ fn main() {
     // Open the image before going into the background, so that a refusal -- an
     // unwritable image, an image whose features this build cannot maintain --
     // is reported to whoever ran the command.
-    let vol = match Volume::new(&app.device, rtdev.as_ref(), app.experimental_rw) {
+    let vol = match Volume::new(
+        &app.device,
+        rtdev.as_ref(),
+        app.experimental_rw,
+        app.journal,
+    ) {
         Ok(vol) => vol,
         Err(e) => {
             eprintln!("xfs-fuse: {e}");

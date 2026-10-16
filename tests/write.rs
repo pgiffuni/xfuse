@@ -64,7 +64,14 @@ fn with_rw_mount<T>(golden: &Path, tag: &str, body: impl FnOnce(&Path) -> T) -> 
 /// back.
 fn with_rw_mount_at<T>(image: &Path, tag: &str, body: impl FnOnce(&Path) -> T) -> T {
     let _guard = serialize();
-    let fs = mount(image, tag, true);
+    let fs = mount(image, tag, true, false);
+    body(&fs.mnt)
+}
+
+/// Mount an image read-write with journaling, run `body`, and clean up.
+fn with_rw_journal_mount_at<T>(image: &Path, tag: &str, body: impl FnOnce(&Path) -> T) -> T {
+    let _guard = serialize();
+    let fs = mount(image, tag, true, true);
     body(&fs.mnt)
 }
 
@@ -72,7 +79,7 @@ fn with_rw_mount_at<T>(image: &Path, tag: &str, body: impl FnOnce(&Path) -> T) -
 /// back.
 fn with_ro_mount<T>(image: &Path, tag: &str, body: impl FnOnce(&Path) -> T) -> T {
     let _guard = serialize();
-    let fs = mount(image, tag, false);
+    let fs = mount(image, tag, false, false);
     body(&fs.mnt)
 }
 
@@ -173,7 +180,7 @@ impl Drop for Mounted {
 /// Mount `image` at a mountpoint of our own, and wait until it answers.
 ///
 /// `tag` keeps two tests, or two runs, from sharing a mountpoint.
-fn mount(image: &Path, tag: &str, writable: bool) -> Mounted {
+fn mount(image: &Path, tag: &str, writable: bool, journal: bool) -> Mounted {
     // A path of its own for every mount, including every round of a test that
     // mounts more than once: a mount left behind by a killed process stays
     // registered, and the next test would block at the first call it makes on
@@ -189,6 +196,9 @@ fn mount(image: &Path, tag: &str, writable: bool) -> Mounted {
     command.arg("-f");
     if writable {
         command.arg("-r");
+        if journal {
+            command.arg("--journal");
+        }
     }
     // The child's output would otherwise be the test harness's, and a process
     // that outlives its test would hold that pipe open.
@@ -1567,6 +1577,42 @@ fn write_produces_non_log_changes() {
         "write produced no changes outside the log region"
     );
     eprintln!("write changed {} blocks outside the log", changed.len());
+}
+
+/// When mounted with --journal, a write should still produce data changes
+/// in the image (the log is replayed to the data device at unmount, and
+/// the data should be visible in the image).
+#[test]
+fn journal_write_produces_data_changes() {
+    require_fusefs!();
+    use util::changed_blocks_excluding_log;
+
+    let image = writable_copy(&GOLDENV4, "journal_write");
+    let before_data = std::fs::read(&*image).unwrap();
+
+    // Write through FUSE with journal mode
+    with_rw_journal_mount_at(&image, "journal_write", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(b"HELLO").unwrap();
+    });
+
+    // Read the modified image
+    let after_data = std::fs::read(&*image).unwrap();
+
+    // Parse the superblock from the image to find the log range
+    let blocksize = u32::from_be_bytes(after_data[4..8].try_into().unwrap()) as usize;
+    let logstart = u64::from_be_bytes(after_data[48..56].try_into().unwrap());
+    let logblocks = u32::from_be_bytes(after_data[96..100].try_into().unwrap()) as u64;
+    let log_range = (logstart as u64)..(logstart + logblocks as u64);
+
+    let changed = changed_blocks_excluding_log(&before_data, &after_data, blocksize, log_range);
+    assert!(
+        !changed.is_empty(),
+        "journal write produced no changes outside the log region"
+    );
+    eprintln!("journal write changed {} blocks outside the log", changed.len());
 }
 
 fn run_concurrency_benchmark(mnt: &Path, fuse_threads: usize) {
