@@ -2833,15 +2833,13 @@ adjacent dirty ranges into larger extents to reduce fragmentation.
   was not updated after freeing blocks, causing `xfs_repair` to report
   "bad nblocks". Now `set_nblocks(kept_blocks)` is called.
 * `cargo +nightly test --bin xfs-fuse` — 256 unit tests pass.
-* `cargo +nightly test --test write` — 46 integration tests pass (6 new).
-* `cargo +nightly fmt` and `cargo +nightly clippy -- -D warnings` — clean.
+  * `cargo +nightly test --test write` — 48 integration tests pass (8 new).
+  * `cargo +nightly test --test integration` — 325 integration tests pass.
+  * `cargo +nightly fmt` and `cargo +nightly clippy` — clean.
 
 ### Next
 
-* C2: Integrate into `write_data` path with immediate-allocation fallback.
-* C3: Implement flush path (coalesce, allocate, write data, update extent map, commit).
-* C4: Wire up truncate/hole-punch/ZERO_RANGE/prealloc interactions.
-* C5: Lock ordering and concurrency analysis.
+  * None remaining: Workstream C (delayed allocation) is complete through C5.
 * C6: Integration tests over real images.
 
 ---

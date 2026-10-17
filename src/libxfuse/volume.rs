@@ -3498,6 +3498,18 @@ impl Filesystem for Volume {
         // Check if there are staged writes that overlap the read range.
         // If so, flush them before reading, since the staged data is not
         // yet on disk.
+        //
+        // C5 (concurrency): the state lock is a single `RwLock<State>`.
+        // Read operations take a read lock; write operations take a write
+        // lock.  There are no lock-ordering hazards because there is only
+        // one lock.
+        //
+        // When staged data exists, we *upgrade* from a read lock to a write
+        // lock.  Rust's `RwLock` does not support upgrade, so we release the
+        // read guard first, acquire the write guard, flush, then re-acquire
+        // the read guard.  The state may change between the release and
+        // re-acquire (another writer could have flushed already), which is
+        // why we check `staged_writes.is_empty()` again inside `flush_inode`.
         {
             let s = self.state.read().unwrap();
             let needs_flush = s
