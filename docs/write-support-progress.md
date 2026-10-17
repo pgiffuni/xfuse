@@ -94,7 +94,7 @@ kernel usually does not send `open`/`opendir` at all.
 ### Limitations relevant to write support
 
 1. A read-write mount is experimental and not crash safe: it is reached only
-   behind `--experimental-rw` and commits blocks straight to the image with no
+   now the default and commits blocks straight to the image with no
    journal.  There is no recovery from a torn write.
 2. A file's data fork must be a list of extents in the inode.  A file whose
    fork is a B+tree is refused with a message that says so.

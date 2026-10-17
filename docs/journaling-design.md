@@ -33,7 +33,7 @@ This document records the design for implementing XFS journal logging and crash 
 - `CommitMode::Journal` selected when `--journal` flag is set
 
 ### CLI (`main.rs`)
-- `--journal` option (requires `--experimental-rw`)
+- `--journal` option for crash-safe writes
 - `Volume::new()` accepts journal flag
 
 ### Tests (`tests/write.rs`)

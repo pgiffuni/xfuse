@@ -5,13 +5,13 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
-* Experimental write support.  A read-write mount is now possible, and only
-  overwrites bytes that are already inside an allocated extent of an existing
-  file; everything else is refused with an explanation rather than guessed at.
-  It is behind `--experimental-rw` and is *not* crash safe, because the journal
-  does not exist yet.  A read-write mount of an image that uses a feature the
-  write path cannot maintain is refused, naming the feature.  See
-  `docs/write-support-progress.md`.
+* Read-write mounts are the default.  Writes are still limited to overwriting
+  bytes that are already inside an allocated extent of an existing file;
+  everything else is refused with an explanation rather than guessed at.
+  Read-write mounts are *not* crash safe unless `--journal` is passed, because
+  the journal is not used by default.  A read-write mount of an image that uses
+  a feature the write path cannot maintain is refused, naming the feature.
+  See `docs/write-support-progress.md`.
 * The group free list is read as what the group header says it is.  A window
   that claims entries the list does not hold is refused as a corrupt group
   rather than answered out of ordinary free space, which was handing out a block

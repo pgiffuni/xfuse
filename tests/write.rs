@@ -104,7 +104,7 @@ fn serialize() -> std::sync::MutexGuard<'static, ()> {
 /// running keeps its mount *and* the test harness's output pipe open, which is
 /// enough to make the whole run look like it has hung.
 struct Mounted {
-    mnt: PathBuf,
+    mnt:     PathBuf,
     process: Child,
 }
 
@@ -192,13 +192,17 @@ fn mount(image: &Path, tag: &str, writable: bool, journal: bool) -> Mounted {
     std::fs::create_dir_all(&mnt)
         .unwrap_or_else(|e| panic!("creating the mountpoint {mnt:?}: {e}"));
 
+    let mut opts = vec!["-f".to_string()];
+    if !writable {
+        opts.push("-o".to_string());
+        opts.push("ro".to_string());
+    }
+    if journal {
+        opts.push("--journal".to_string());
+    }
     let mut command = Command::new(env!("CARGO_BIN_EXE_xfs-fuse"));
-    command.arg("-f");
-    if writable {
-        command.arg("-r");
-        if journal {
-            command.arg("--journal");
-        }
+    for opt in &opts {
+        command.arg(opt);
     }
     // The child's output would otherwise be the test harness's, and a process
     // that outlives its test would hold that pipe open.
@@ -991,7 +995,7 @@ fn unsupported_features_refuse_rw_mount() {
     std::fs::create_dir_all(&mnt).unwrap();
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_xfs-fuse"));
-    command.args(["-f", "-r"]).arg(&image).arg(&mnt);
+    command.args(["-f"]).arg(&image).arg(&mnt);
     let (status, stdout, stderr) = run_bounded(&mut command, "refuse", Duration::from_secs(60));
     assert!(
         !status.map(|s| s.success()).unwrap_or(false),
@@ -1513,7 +1517,7 @@ fn concurrency_benchmark_4t() {
         .unwrap_or_else(|e| panic!("creating the mountpoint {mnt:?}: {e}"));
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_xfs-fuse"));
-    command.args(["-f", "-r", "--threads=4"]);
+    command.args(["-f", "--threads=4"]);
     let mut process = command
         .arg(&image)
         .arg(&mnt)
@@ -1904,7 +1908,7 @@ fn concurrent_mixed_workload() {
         .unwrap_or_else(|e| panic!("creating the mountpoint {mnt:?}: {e}"));
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_xfs-fuse"));
-    command.args(["-f", "-r", "--threads=4"]);
+    command.args(["-f", "--threads=4"]);
     let mut process = command
         .arg(&image)
         .arg(&mnt)

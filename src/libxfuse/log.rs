@@ -155,32 +155,32 @@ impl XlogLsn {
 #[derive(Debug, Clone)]
 pub struct XlogRecHeader {
     /// `h_magicno` — [XLOG_HEADER_MAGIC_NUM].
-    pub magicno: u32,
+    pub magicno:    u32,
     /// `h_cycle` — the write cycle of the log, or [XLOG_HEADER_MAGIC_NUM]'s
     /// invalid-cycle marker.
-    pub cycle: u32,
+    pub cycle:      u32,
     /// `h_version` — `XLOG_VERSION_1` (1) or `XLOG_VERSION_2` (2), the second
     /// naming a later layout with larger IClogs and an explicit log unit.
-    pub version: u32,
+    pub version:    u32,
     /// `h_len` — length of the data region in bytes, 64-bit aligned.
-    pub len: u32,
+    pub len:        u32,
     /// `h_lsn` — this record's LSN.
-    pub lsn: XlogLsn,
+    pub lsn:        XlogLsn,
     /// `h_tail_lsn` — the LSN of the first record with buffers not yet committed,
     /// which is where recovery resumes.
-    pub tail_lsn: XlogLsn,
+    pub tail_lsn:   XlogLsn,
     /// `h_crc` — **little-endian**, unlike everything around it.
-    pub crc: u32,
+    pub crc:        u32,
     /// `h_prev_block` — the block number of the previous log record.
     pub prev_block: u32,
     /// `h_num_logops` — how many operations this record carries.
     pub num_logops: u32,
     /// `h_fmt` — `XLOG_FMT_LINUX_LE` is 1, `XLOG_FMT_LINUX_BE` is 2.
-    pub fmt: u32,
+    pub fmt:        u32,
     /// `h_fs_uuid` — the file system's identifier.
-    pub fs_uuid: [u8; 16],
+    pub fs_uuid:    [u8; 16],
     /// `h_size` — iclog size, present only for log version 2.
-    pub size: u32,
+    pub size:       u32,
 }
 
 impl XlogRecHeader {
@@ -300,15 +300,15 @@ impl XlogRecHeader {
 #[derive(Debug, Clone)]
 pub struct XlogOpHeader {
     /// `oh_tid` — the transaction this operation belongs to.
-    pub tid: u32,
+    pub tid:      u32,
     /// `oh_len` — bytes of data that follow.
-    pub len: u32,
+    pub len:      u32,
     /// `oh_clientid` — [XFS_TRANSACTION] or [XFS_LOG].
     pub clientid: u8,
     /// `oh_flags` — any of the `XLOG_*_TRANS` flags.
-    pub flags: u8,
+    pub flags:    u8,
     /// `oh_res2` — padding, for alignment.
-    pub res2: u16,
+    pub res2:     u16,
 }
 
 impl XlogOpHeader {
@@ -320,11 +320,11 @@ impl XlogOpHeader {
             return Err(FsError::corrupt("a log operation header is truncated"));
         }
         Ok(Self {
-            tid: u32::from_be_bytes(b[0..4].try_into().unwrap()),
-            len: u32::from_be_bytes(b[4..8].try_into().unwrap()),
+            tid:      u32::from_be_bytes(b[0..4].try_into().unwrap()),
+            len:      u32::from_be_bytes(b[4..8].try_into().unwrap()),
             clientid: b[8],
-            flags: b[9],
-            res2: u16::from_be_bytes(b[10..12].try_into().unwrap()),
+            flags:    b[9],
+            res2:     u16::from_be_bytes(b[10..12].try_into().unwrap()),
         })
     }
 
@@ -371,19 +371,19 @@ impl XlogItemKind {
 /// A single log operation as it appears in the record.
 #[derive(Debug, Clone)]
 pub struct LogOp {
-    pub header: XlogOpHeader,
-    pub offset: u64, // byte offset of this op's header in the log region
+    pub header:    XlogOpHeader,
+    pub offset:    u64, // byte offset of this op's header in the log region
     pub item_kind: Option<XlogItemKind>, // decoded from the payload if possible
     /// The raw payload bytes after the op header (before the next op header).
-    pub payload: Vec<u8>,
+    pub payload:   Vec<u8>,
 }
 
 /// A complete log record with all its operations.
 #[derive(Debug, Clone)]
 pub struct LogRecord {
-    pub header: XlogRecHeader,
-    pub offset: u64, // byte offset of this record's header
-    pub ops: Vec<LogOp>,
+    pub header:    XlogRecHeader,
+    pub offset:    u64, // byte offset of this record's header
+    pub ops:       Vec<LogOp>,
     pub committed: bool, // has a COMMIT op been seen?
 }
 
@@ -411,13 +411,13 @@ pub struct LogRecord {
 /// }
 /// ```
 pub struct LogWalker<'r, R> {
-    reader: &'r mut R,
-    sb: &'r Sb,
+    reader:    &'r mut R,
+    sb:        &'r Sb,
     blocksize: usize,
     /// Current byte offset within the log region
-    pos: u64,
+    pos:       u64,
     /// Absolute end of log region in bytes
-    log_end: u64,
+    log_end:   u64,
 }
 
 impl<'r, R> LogWalker<'r, R>
@@ -587,16 +587,16 @@ impl XlogOpHeader {
 /// region starting at `sb_logstart`.
 #[derive(Debug)]
 pub struct LogWriter<'a> {
-    device: &'a BlockDevice,
-    sb: &'a Sb,
+    device:   &'a BlockDevice,
+    sb:       &'a Sb,
     /// Current byte position for the next write in the log
-    pos: u64,
+    pos:      u64,
     /// Current write cycle number
-    cycle: u32,
+    cycle:    u32,
     /// Next transaction ID to assign
     next_tid: u32,
     /// Buffer for the current transaction's operations
-    pending: Vec<u8>,
+    pending:  Vec<u8>,
 }
 
 impl<'a> LogWriter<'a> {
@@ -807,8 +807,8 @@ impl XlogOpHeader {
 #[derive(Debug, Clone)]
 pub struct BufItem {
     pub fsbno: u64,
-    pub len: u32,
-    pub data: Vec<u8>,
+    pub len:   u32,
+    pub data:  Vec<u8>,
 }
 
 /// An EFI (Extent Freeing Intent) item extracted from the log.
@@ -818,9 +818,9 @@ pub struct BufItem {
 /// the free to the free space trees.
 #[derive(Debug, Clone)]
 pub struct EfiItem {
-    pub agno: u32,
+    pub agno:  u32,
     pub agbno: u32,
-    pub len: u32,
+    pub len:   u32,
 }
 
 /// Replay committed transactions from the log to the data device.
@@ -833,7 +833,7 @@ pub struct EfiItem {
 #[derive(Debug)]
 pub struct LogReplayer<'a> {
     device: &'a BlockDevice,
-    sb: &'a Sb,
+    sb:     &'a Sb,
 }
 
 impl<'a> LogReplayer<'a> {
@@ -926,8 +926,8 @@ impl<'a> LogReplayer<'a> {
 /// records if the payload exceeds the log record size limit.
 #[derive(Debug, Clone)]
 pub struct LogTransaction {
-    pub tid: u32,
-    pub ops: Vec<LogOp>,
+    pub tid:       u32,
+    pub ops:       Vec<LogOp>,
     pub committed: bool,
 }
 
@@ -971,10 +971,10 @@ impl LogTransaction {
 /// transactions (those without a COMMIT record) are discarded during recovery.
 #[derive(Debug, Clone)]
 pub struct LogRecovery {
-    pub committed: Vec<LogTransaction>,
-    pub uncommitted: Vec<LogTransaction>,
+    pub committed:     Vec<LogTransaction>,
+    pub uncommitted:   Vec<LogTransaction>,
     pub total_records: usize,
-    pub total_ops: usize,
+    pub total_ops:     usize,
 }
 
 impl LogRecovery {
@@ -1203,8 +1203,16 @@ mod locate {
 #[cfg(test)]
 mod walk {
     use crate::libxfuse::log::{
-        LogRecovery, LogTransaction, LogWalker, XlogItemKind, XlogOpHeader, XlogRecHeader,
-        XFS_TRANSACTION, XLOG_COMMIT_TRANS, XLOG_HEADER_CYCLE_SIZE, XLOG_HEADER_MAGIC_NUM,
+        LogRecovery,
+        LogTransaction,
+        LogWalker,
+        XlogItemKind,
+        XlogOpHeader,
+        XlogRecHeader,
+        XFS_TRANSACTION,
+        XLOG_COMMIT_TRANS,
+        XLOG_HEADER_CYCLE_SIZE,
+        XLOG_HEADER_MAGIC_NUM,
     };
 
     /// The header's `h_cycle_data` array fills a 32KiB region, plus the fields after
@@ -1392,7 +1400,13 @@ mod walk {
 #[cfg(test)]
 mod replay {
     use crate::libxfuse::log::{
-        LogOp, LogRecovery, LogReplayer, XlogItemKind, XlogOpHeader, XFS_LI_BUF, XFS_TRANSACTION,
+        LogOp,
+        LogRecovery,
+        LogReplayer,
+        XlogItemKind,
+        XlogOpHeader,
+        XFS_LI_BUF,
+        XFS_TRANSACTION,
     };
 
     /// The replayer analyzes the golden image and accesses committed transactions.
@@ -1428,11 +1442,11 @@ mod replay {
 
         let op = LogOp {
             header: XlogOpHeader {
-                tid: 1,
-                len: 24,
+                tid:      1,
+                len:      24,
                 clientid: XFS_TRANSACTION,
-                flags: 0,
-                res2: 0,
+                flags:    0,
+                res2:     0,
             },
             offset: 0,
             item_kind: Some(XlogItemKind::Buf),

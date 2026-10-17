@@ -921,7 +921,7 @@ primitive.
   It is **not crash safe**: a power loss mid-commit leaves the image with
   some of the operation applied and the rest missing. It exists so the
   operations above it can be written and tested before the journal exists,
-  and is reachable only behind `--experimental-rw`.
+  and is the default.
 
 **missing — the distinctions that matter.**
 

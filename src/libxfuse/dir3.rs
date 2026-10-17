@@ -34,7 +34,8 @@ use std::{
 use bincode_next::{
     de::{read::Reader, Decoder},
     error::DecodeError,
-    Decode, Encode,
+    Decode,
+    Encode,
 };
 use fuser::FileType;
 use libc::c_int;
@@ -70,10 +71,10 @@ pub use super::dir3_block::Dir2BlockTail;
 #[derive(Debug, Decode, Encode, Default)]
 pub struct Dir3BlkHdr {
     pub magic: u32,
-    pub crc: u32,
+    pub crc:   u32,
     pub blkno: u64,
-    pub lsn: u64,
-    pub uuid: Uuid,
+    pub lsn:   u64,
+    pub uuid:  Uuid,
     pub owner: u64,
 }
 
@@ -92,7 +93,7 @@ impl Dir2DataFree {
 
 #[derive(Debug, Decode, Encode)]
 pub struct Dir2DataHdr {
-    pub magic: u32,
+    pub magic:     u32,
     pub best_free: [Dir2DataFree; constants::XFS_DIR2_DATA_FD_COUNT],
 }
 impl Dir2DataHdr {
@@ -101,9 +102,9 @@ impl Dir2DataHdr {
 
 #[derive(Debug, Decode, Encode, Default)]
 pub struct Dir3DataHdr {
-    pub hdr: Dir3BlkHdr,
+    pub hdr:       Dir3BlkHdr,
     pub best_free: [Dir2DataFree; constants::XFS_DIR2_DATA_FD_COUNT],
-    pub pad: u32,
+    pub pad:       u32,
 }
 
 impl Dir3DataHdr {
@@ -114,9 +115,9 @@ impl Dir3DataHdr {
 #[derive(Debug)]
 pub struct Dir2DataEntry {
     pub inumber: XfsIno,
-    pub name: OsString,
-    pub ftype: Option<u8>,
-    pub tag: XfsDir2DataOff,
+    pub name:    OsString,
+    pub ftype:   Option<u8>,
+    pub tag:     XfsDir2DataOff,
 }
 
 impl Dir2DataEntry {
@@ -178,8 +179,8 @@ impl<Ctx> Decode<Ctx> for Dir2DataEntry {
 #[derive(Debug, Encode)]
 pub struct Dir2DataUnused {
     pub freetag: u16,
-    pub length: XfsDir2DataOff,
-    pub tag: XfsDir2DataOff,
+    pub length:  XfsDir2DataOff,
+    pub tag:     XfsDir2DataOff,
 }
 
 impl<Ctx> Decode<Ctx> for Dir2DataUnused {

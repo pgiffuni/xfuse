@@ -40,29 +40,20 @@ mod libxfuse;
 struct App {
     /// Mount options, comma delimited.
     #[clap(short = 'o', long, value_delimiter(','))]
-    options: Vec<String>,
-    device: PathBuf,
+    options:    Vec<String>,
+    device:     PathBuf,
     mountpoint: String,
 
     /// Run in the foreground
     #[arg(short)]
     foreground: bool,
 
-    /// Mount read-write.
-    ///
-    /// Experimental: xfuse has no journal yet, so a machine that loses power
-    /// in the middle of a write can leave the filesystem inconsistent.  A
-    /// read-write mount is refused outright if the image uses a feature that
-    /// xfuse cannot keep up to date.
-    #[arg(long = "experimental-rw", short = 'r')]
-    experimental_rw: bool,
-
     /// Use the XFS journal for crash-safe writes.
     ///
-    /// When enabled (with `--experimental-rw`), transactions are written to
-    /// the log before being applied to the data device, providing crash
-    /// consistency similar to write-ahead logging.
-    #[arg(long = "journal", requires = "experimental_rw")]
+    /// xfuse mounts read-write by default.  Without a journal, a crash (power
+    /// loss, SIGKILL, etc.) mid-write can leave the filesystem inconsistent.
+    /// Pass `--journal` to enable write-ahead logging for crash-safe writes.
+    #[arg(long = "journal")]
     journal: bool,
 
     /// Use an external device for the XFS journal.
@@ -119,19 +110,14 @@ fn main() {
         MountOption::FSName("fusefs".to_string()),
         MountOption::Subtype("xfs".to_string()),
     ];
-    if app.experimental_rw {
-        if app.journal {
-            eprintln!("journaling enabled: writes will be protected by the XFS log");
-        } else {
-            eprintln!(
-                "warning: mounting read-write.  This mode is experimental and is NOT crash safe: \
-                 xfuse has no log yet, so a machine that loses power in the middle of a write can \
-                 leave the filesystem inconsistent.  Use it for testing only."
-            );
-        }
-        opts.push(MountOption::RW);
+
+    if app.journal {
+        eprintln!("journaling enabled: writes will be protected by the XFS log");
     } else {
-        opts.push(MountOption::RO);
+        eprintln!(
+            "warning: mounting read-write without --journal.  A crash (power loss, SIGKILL, etc.) \
+             mid-write can leave the filesystem inconsistent. Use --journal for crash-safe writes."
+        );
     }
 
     // geteuid is always safe
@@ -140,50 +126,54 @@ fn main() {
         acl = SessionACL::RootAndOwner;
         opts.push(MountOption::DefaultPermissions);
     }
+    let mut readonly = false;
     for o in app.options.iter() {
         if let Some((lhs, rhs)) = o.split_once('=') {
             if lhs == "rtdev" {
                 rtdev = Some(PathBuf::from(rhs))
             }
         } else {
-            opts.push(match o.as_str() {
-                "auto_unmount" => MountOption::AutoUnmount,
+            match o.as_str() {
+                "ro" => {
+                    readonly = true;
+                    opts.push(MountOption::RO);
+                }
+                "rw" => {
+                    readonly = false;
+                }
+                "auto_unmount" => opts.push(MountOption::AutoUnmount),
                 "allow_other" => {
                     acl = SessionACL::All;
-                    continue;
                 }
                 "allow_root" => {
                     acl = SessionACL::RootAndOwner;
-                    continue;
                 }
-                "default_permissions" => MountOption::DefaultPermissions,
-                "dev" => MountOption::Dev,
-                "nodev" => MountOption::NoDev,
-                "suid" => MountOption::Suid,
-                "nosuid" => MountOption::NoSuid,
-                "exec" => MountOption::Exec,
-                "noexec" => MountOption::NoExec,
-                "atime" => MountOption::Atime,
-                "noatime" => MountOption::NoAtime,
-                "dirsync" => MountOption::DirSync,
-                "sync" => MountOption::Sync,
-                "async" => MountOption::Async,
-                custom => MountOption::CUSTOM(custom.to_string()),
-            });
+                "default_permissions" => opts.push(MountOption::DefaultPermissions),
+                "dev" => opts.push(MountOption::Dev),
+                "nodev" => opts.push(MountOption::NoDev),
+                "suid" => opts.push(MountOption::Suid),
+                "nosuid" => opts.push(MountOption::NoSuid),
+                "exec" => opts.push(MountOption::Exec),
+                "noexec" => opts.push(MountOption::NoExec),
+                "atime" => opts.push(MountOption::Atime),
+                "noatime" => opts.push(MountOption::NoAtime),
+                "dirsync" => opts.push(MountOption::DirSync),
+                "sync" => opts.push(MountOption::Sync),
+                "async" => opts.push(MountOption::Async),
+                custom => opts.push(MountOption::CUSTOM(custom.to_string())),
+            }
         }
+    }
+
+    if !readonly {
+        opts.push(MountOption::RW);
     }
 
     // Open the image before going into the background, so that a refusal -- an
     // unwritable image, an image whose features this build cannot maintain --
     // is reported to whoever ran the command.
     let logdev = app.log_device.as_ref();
-    let vol = match Volume::new(
-        &app.device,
-        rtdev.as_ref(),
-        logdev,
-        app.experimental_rw,
-        app.journal,
-    ) {
+    let vol = match Volume::new(&app.device, rtdev.as_ref(), logdev, !readonly, app.journal) {
         Ok(vol) => vol,
         Err(e) => {
             eprintln!("xfs-fuse: {e}");

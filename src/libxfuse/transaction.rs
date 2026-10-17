@@ -57,7 +57,7 @@
 //!   image is left with some of the operation applied and the rest missing.  It
 //!   exists so that the operations above this layer can be written and tested
 //!   before the journal exists, and it is reachable only behind
-//!   `--experimental-rw`.
+//!   `--journal`.
 //!
 //! # Algorithm reference
 //!
@@ -82,8 +82,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::{
-    alloc::allocator::free_in_group,
-    alloc::free_space::FreeRun,
+    alloc::{allocator::free_in_group, free_space::FreeRun},
     block_cache::BlockCache,
     block_device::BlockDevice,
     error::{FsError, FsResult},
@@ -127,11 +126,11 @@ impl CommitMode {
 #[derive(Debug, Clone, Copy)]
 pub struct DeferredFree {
     /// The allocation group number
-    pub agno: u32,
+    pub agno:  u32,
     /// The starting block number within the allocation group
     pub agbno: u32,
     /// The number of contiguous blocks freed
-    pub len: u32,
+    pub len:   u32,
 }
 
 /// What a transaction is allowed to touch.
@@ -142,20 +141,20 @@ pub struct DeferredFree {
 /// its transactions rather than interleaving them, and it is much easier to
 /// prove correct.
 pub struct Transaction<'a> {
-    device: &'a BlockDevice,
-    log_device: Option<&'a BlockDevice>,
-    cache: &'a mut BlockCache,
-    sb: &'a Sb,
-    mode: CommitMode,
+    device:         &'a BlockDevice,
+    log_device:     Option<&'a BlockDevice>,
+    cache:          &'a mut BlockCache,
+    sb:             &'a Sb,
+    mode:           CommitMode,
     /// Whether the device in use is the real-time device.  Real-time blocks
     /// live on a separate image, so a transaction has to know which one it is
     /// writing to.
-    realtime: bool,
+    realtime:       bool,
     /// Blocks freed during this transaction, deferred until after commit.
     /// This prevents use-after-free of freed blocks if the system crashes
     /// between the freeing transaction and the reallocation.
     deferred_frees: Vec<DeferredFree>,
-    done: bool,
+    done:           bool,
 }
 
 impl<'a> Transaction<'a> {
@@ -463,7 +462,7 @@ impl<'a> Transaction<'a> {
                 free.agno,
                 FreeRun {
                     start: free.agbno,
-                    len: free.len,
+                    len:   free.len,
                 },
             )?;
         }
@@ -513,11 +512,11 @@ impl Drop for Transaction<'_> {
 /// existed, and the write path look at the same image.
 #[derive(Debug)]
 pub struct TransactionContext {
-    device: Arc<BlockDevice>,
+    device:     Arc<BlockDevice>,
     log_device: Option<Arc<BlockDevice>>,
-    cache: BlockCache,
-    sb: Sb,
-    mode: CommitMode,
+    cache:      BlockCache,
+    sb:         Sb,
+    mode:       CommitMode,
 }
 
 impl TransactionContext {
@@ -603,10 +602,10 @@ mod t {
     }
 
     struct Harness {
-        _f: tempfile::NamedTempFile,
-        dev: BlockDevice,
+        _f:    tempfile::NamedTempFile,
+        dev:   BlockDevice,
         cache: BlockCache,
-        sb: Sb,
+        sb:    Sb,
     }
 
     fn harness(writable: bool) -> Harness {
@@ -618,10 +617,10 @@ mod t {
             Access::ReadOnly
         };
         Harness {
-            dev: BlockDevice::open(f.path(), access).unwrap(),
+            dev:   BlockDevice::open(f.path(), access).unwrap(),
             cache: BlockCache::new(512, 64),
-            sb: sb(),
-            _f: f,
+            sb:    sb(),
+            _f:    f,
         }
     }
 
