@@ -1656,12 +1656,13 @@ fn journal_records_have_buf_item_kind() {
         for i in 0..blocksize {
             // Check if this block in the log differs
             let blk_start = i * blocksize;
-            if blk_start < log_before.len() && blk_start + blocksize <= log_before.len()
+            if blk_start < log_before.len()
+                && blk_start + blocksize <= log_before.len()
                 && log_before[blk_start..blk_start + blocksize]
                     != log_after[blk_start..blk_start + blocksize]
-                {
-                    changed.push((logstart + i as u64, 0, blocksize - 1));
-                }
+            {
+                changed.push((logstart + i as u64, 0, blocksize - 1));
+            }
         }
         changed
     };
@@ -1709,7 +1710,6 @@ fn journal_write_passes_xfs_repair() {
 #[test]
 fn journal_survives_crash() {
     require_fusefs!();
-    
 
     let image = writable_copy(&GOLDENV4, "journal_crash");
 
@@ -1743,15 +1743,13 @@ fn journal_survives_crash() {
     std::mem::forget(mnt1);
     let _ = Command::new("fusermount")
         .arg("-u")
-        .arg(&image)  // Not the mount point - the image path doesn't help here
+        .arg(&image) // Not the mount point - the image path doesn't help here
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
     // Try all possible fusermount paths
     for fusermount in ["fusermount3", "fusermount"] {
-        let _ = Command::new(fusermount)
-            .arg("-u")
-            .output();
+        let _ = Command::new(fusermount).arg("-u").output();
     }
     std::thread::sleep(std::time::Duration::from_secs(1));
 
@@ -1995,4 +1993,99 @@ fn concurrent_mixed_workload() {
     let _ = process.wait();
     let _ = util::waitfor(Duration::from_secs(10), || !is_live(&mnt));
     let _ = std::fs::remove_dir_all(&mnt);
+}
+
+/// Create a new directory inside a shortform parent, then verify it is
+/// there after a remount and that xfs_repair accepts the image.
+#[test]
+fn mkdir_in_shortform_directory() {
+    require_fusefs!();
+    eprintln!("=== mkdir_in_shortform_directory ===");
+    let image = writable_copy(&GOLDENV4, "mkdir");
+    with_rw_mount_at(&image, "mkdir", |mnt| {
+        std::fs::create_dir(mnt.join("sf/newdir")).unwrap();
+    });
+    with_ro_mount(&image, "mkdir-ro", |mnt| {
+        let paths: Vec<String> = std::fs::read_dir(mnt.join("sf"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            paths.contains(&"newdir".to_string()),
+            "newdir exists: {paths:?}"
+        );
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
+
+/// Remove a file from a shortform directory, then verify it is gone
+/// after remount and xfs_repair accepts the image.
+#[test]
+fn unlink_removes_file_from_shortform_dir() {
+    require_fusefs!();
+    eprintln!("=== unlink_removes_file_from_shortform_dir ===");
+    let image = writable_copy(&GOLDENV4, "unlink");
+    // Create a file first, then remove it.
+    with_rw_mount_at(&image, "unlink-create", |mnt| {
+        File::create(mnt.join("sf/target.txt")).unwrap();
+    });
+    with_rw_mount_at(&image, "unlink", |mnt| {
+        std::fs::remove_file(mnt.join("sf/target.txt")).unwrap();
+    });
+    with_ro_mount(&image, "unlink-ro", |mnt| {
+        assert!(
+            !std::path::Path::new(&mnt.join("sf/target.txt")).exists(),
+            "target.txt should be removed"
+        );
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
+
+/// Remove an empty directory, then verify it is gone after remount.
+#[test]
+fn rmdir_removes_empty_directory() {
+    require_fusefs!();
+    eprintln!("=== rmdir_removes_empty_directory ===");
+    let image = writable_copy(&GOLDENV4, "rmdir");
+    // Create a directory first, then remove it.
+    with_rw_mount_at(&image, "rmdir-create", |mnt| {
+        std::fs::create_dir(mnt.join("sf/newdir")).unwrap();
+    });
+    with_rw_mount_at(&image, "rmdir-remove", |mnt| {
+        std::fs::remove_dir(mnt.join("sf/newdir")).unwrap();
+    });
+    with_ro_mount(&image, "rmdir-ro", |mnt| {
+        assert!(
+            !std::path::Path::new(&mnt.join("sf/newdir")).exists(),
+            "newdir should be removed"
+        );
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
+
+/// Rename a file within the same shortform directory.
+#[test]
+fn rename_moves_file_within_directory() {
+    require_fusefs!();
+    eprintln!("=== rename_moves_file_within_directory ===");
+    let image = writable_copy(&GOLDENV4, "rename");
+    // Create a file first, then rename it.
+    with_rw_mount_at(&image, "rename-create", |mnt| {
+        File::create(mnt.join("sf/target.txt")).unwrap();
+    });
+    with_rw_mount_at(&image, "rename", |mnt| {
+        std::fs::rename(mnt.join("sf/target.txt"), mnt.join("sf/renamed.txt")).unwrap();
+    });
+    with_ro_mount(&image, "rename-ro", |mnt| {
+        assert!(
+            !std::path::Path::new(&mnt.join("sf/target.txt")).exists(),
+            "old name should not exist"
+        );
+        assert!(
+            std::path::Path::new(&mnt.join("sf/renamed.txt")).exists(),
+            "new name should exist"
+        );
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
 }

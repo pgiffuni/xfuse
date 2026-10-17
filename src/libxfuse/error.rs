@@ -213,7 +213,7 @@ impl From<TryFromIntError> for FsError {
     fn from(e: TryFromIntError) -> Self {
         FsError::Invalid {
             errno: libc::EINVAL,
-            msg:   e.to_string(),
+            msg: e.to_string(),
         }
     }
 }

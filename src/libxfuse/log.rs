@@ -361,8 +361,8 @@ impl XlogItemKind {
             0x0004 => XlogItemKind::Agf,            // XFS_LI_AGF
             0x0005 => XlogItemKind::Agi,            // XFS_LI_AGI
             0x0006 => XlogItemKind::Btree,          // XFS_LI_BTREE
-            0x000d => XlogItemKind::Efi,              // XFS_LI_EFI
-            0x000e => XlogItemKind::Efd,              // XFS_LI_EFD
+            0x000d => XlogItemKind::Efi,            // XFS_LI_EFI
+            0x000e => XlogItemKind::Efd,            // XFS_LI_EFD
             _ => XlogItemKind::Unknown(code),
         }
     }
@@ -1625,8 +1625,11 @@ mod replay {
         assert!(!rec.ops.is_empty(), "no ops in record");
 
         let op = &rec.ops[0];
-        assert_eq!(op.item_kind, Some(crate::libxfuse::log::XlogItemKind::Efi),
-            "op should be identified as an EFI item");
+        assert_eq!(
+            op.item_kind,
+            Some(crate::libxfuse::log::XlogItemKind::Efi),
+            "op should be identified as an EFI item"
+        );
 
         // Verify the payload decodes correctly
         let device = crate::libxfuse::block_device::BlockDevice::open(

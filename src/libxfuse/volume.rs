@@ -35,39 +35,16 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
-        OnceLock,
-        RwLock,
+        Arc, OnceLock, RwLock,
     },
     time::Duration,
 };
 
 use fuser::{
-    BsdFileFlags,
-    Errno,
-    FileHandle,
-    Filesystem,
-    FopenFlags,
-    Generation,
-    INodeNo,
-    InitFlags,
-    KernelConfig,
-    LockOwner,
-    OpenFlags,
-    RenameFlags,
-    ReplyAttr,
-    ReplyBmap,
-    ReplyCreate,
-    ReplyDirectory,
-    ReplyEmpty,
-    ReplyEntry,
-    ReplyLseek,
-    ReplyOpen,
-    ReplyStatfs,
-    ReplyWrite,
-    ReplyXattr,
-    Request,
-    WriteFlags,
+    BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
+    KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyBmap, ReplyCreate,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite,
+    ReplyXattr, Request, WriteFlags,
 };
 use libc::{ERANGE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK};
 // fallocate(2) mode flags (from linux/falloc.h)
@@ -89,15 +66,8 @@ use super::{
     dinode::Dinode,
     dinode_core::XfsDinodeFmt,
     dir3::{
-        Dir3,
-        XFS_DIR3_FT_BLKDEV,
-        XFS_DIR3_FT_CHRDEV,
-        XFS_DIR3_FT_DIR,
-        XFS_DIR3_FT_FIFO,
-        XFS_DIR3_FT_REG_FILE,
-        XFS_DIR3_FT_SOCK,
-        XFS_DIR3_FT_SYMLINK,
-        XFS_DIR3_FT_UNKNOWN,
+        Dir3, XFS_DIR3_FT_BLKDEV, XFS_DIR3_FT_CHRDEV, XFS_DIR3_FT_DIR, XFS_DIR3_FT_FIFO,
+        XFS_DIR3_FT_REG_FILE, XFS_DIR3_FT_SOCK, XFS_DIR3_FT_SYMLINK, XFS_DIR3_FT_UNKNOWN,
     },
     dir3_sf::{ShortformDirectory, SF_OFFSET_STEP},
     error::{no_entry, FsError, FsResult},
@@ -109,15 +79,8 @@ use crate::libxfuse::{
     alloc::free_space::FreeRun,
     bmbt_rec::BmbtRec,
     btree::{
-        BmbtInteriorBlock,
-        BmbtKey,
-        BmbtLeafBlock,
-        BmbtLeafRecord,
-        BmdrBlock,
-        Btree,
-        BtreeLblockHdr,
-        BtreeRoot,
-        BMBT_NULL_PTR,
+        BmbtInteriorBlock, BmbtKey, BmbtLeafBlock, BmbtLeafRecord, BmdrBlock, Btree,
+        BtreeLblockHdr, BtreeRoot, BMBT_NULL_PTR,
     },
     log::{LogRecovery, LogReplayer},
 };
@@ -154,7 +117,7 @@ pub const NO_IMAGE: &str = "no image has been opened in this process";
 #[derive(Debug)]
 struct OpenInode {
     dinode: Dinode,
-    count:  u64,
+    count: u64,
 }
 
 /// An open file, as FUSE sees it.
@@ -169,7 +132,7 @@ struct OpenInode {
 /// disagree with the first.
 #[derive(Debug)]
 struct OpenFile {
-    ino:   u64,
+    ino: u64,
     flags: i32,
 }
 
@@ -185,23 +148,23 @@ struct OpenFile {
 /// lock to avoid holding it when the value is not needed.
 #[derive(Debug)]
 struct State {
-    device:      BlockReader,
-    rt_device:   Option<Arc<BlockDevice>>,
+    device: BlockReader,
+    rt_device: Option<Arc<BlockDevice>>,
     #[allow(dead_code)] // Used on FreeBSD with --journal-device
-    log_device:  Option<Arc<BlockDevice>>,
-    sb:          Sb,
-    open_files:  HashMap<u64, OpenInode>,
-    handles:     HashMap<u64, OpenFile>,
+    log_device: Option<Arc<BlockDevice>>,
+    sb: Sb,
+    open_files: HashMap<u64, OpenInode>,
+    handles: HashMap<u64, OpenFile>,
     next_handle: u64,
-    tx:          TransactionContext,
-    writable:    bool,
+    tx: TransactionContext,
+    writable: bool,
 }
 
 /// All the state a mounted XFS image needs to answer FUSE requests.
 #[derive(Debug)]
 pub struct Volume {
-    state:      RwLock<State>,
-    no_open:    AtomicBool,
+    state: RwLock<State>,
+    no_open: AtomicBool,
     no_opendir: AtomicBool,
 }
 
@@ -298,7 +261,7 @@ impl Volume {
             1,
             OpenInode {
                 dinode: root_inode,
-                count:  1,
+                count: 1,
             },
         );
 
@@ -317,10 +280,15 @@ impl Volume {
         } else {
             CommitMode::ReadOnly
         };
-        let tx = TransactionContext::new(block_device, log_device.as_ref().map(Arc::clone), &superblock, mode);
+        let tx = TransactionContext::new(
+            block_device,
+            log_device.as_ref().map(Arc::clone),
+            &superblock,
+            mode,
+        );
 
         Ok(Volume {
-            state:      RwLock::new(State {
+            state: RwLock::new(State {
                 device,
                 rt_device,
                 log_device,
@@ -331,7 +299,7 @@ impl Volume {
                 tx,
                 writable,
             }),
-            no_open:    AtomicBool::new(false),
+            no_open: AtomicBool::new(false),
             no_opendir: AtomicBool::new(false),
         })
     }
@@ -759,10 +727,10 @@ impl State {
             if let Some((existing, blocks, _)) = tree {
                 let mut all = existing;
                 all.push(BmbtRec {
-                    br_startoff:   first_new,
+                    br_startoff: first_new,
                     br_startblock: fsb,
                     br_blockcount: u64::from(run.len),
-                    br_flag:       false,
+                    br_flag: false,
                 });
                 all.sort_by_key(|r| r.br_startoff);
                 // How the list is spread over leaves.  One leaf holds `room`; a
@@ -833,7 +801,7 @@ impl State {
                         leaf_fsb[i + 1]
                     };
                     let leaf = BmbtLeafBlock {
-                        level:   0,
+                        level: 0,
                         records: recs.iter().map(BmbtLeafRecord::from_extent).collect(),
                     };
                     let at = sb.fsb_to_offset(leaf_fsb[i]);
@@ -882,13 +850,13 @@ impl State {
                     let interior_fsb = sb.ag_block_to_fsb(agno, run.start);
                     let node = BmbtInteriorBlock {
                         level: 1,
-                        keys:  leaves
+                        keys: leaves
                             .iter()
                             .map(|l| BmbtKey {
                                 br_startoff: l[0].br_startoff,
                             })
                             .collect(),
-                        ptrs:  leaf_fsb.clone(),
+                        ptrs: leaf_fsb.clone(),
                     };
                     let block = if sb.has_crc() {
                         node.to_bytes(
@@ -944,10 +912,10 @@ impl State {
                             FsError::corrupt("a data fork reported itself full and cannot be read")
                         })?;
                         e.push(BmbtRec {
-                            br_startoff:   first_new,
+                            br_startoff: first_new,
                             br_startblock: fsb,
                             br_blockcount: u64::from(run.len),
-                            br_flag:       false,
+                            br_flag: false,
                         });
                         e.sort_by_key(|r| r.br_startoff);
                         e
@@ -974,7 +942,7 @@ impl State {
                         )));
                     }
                     let leaf = BmbtLeafBlock {
-                        level:   0,
+                        level: 0,
                         records: all.iter().map(BmbtLeafRecord::from_extent).collect(),
                     };
                     // A file system with checksums and one without have different
@@ -2048,7 +2016,7 @@ impl Filesystem for Volume {
                         }
                         let run = crate::libxfuse::alloc::free_space::FreeRun {
                             start: start as u32,
-                            len:   len as u32,
+                            len: len as u32,
                         };
                         if let Err(e) = crate::libxfuse::alloc::allocator::free_in_group(
                             &mut tx,
@@ -2064,53 +2032,9 @@ impl Filesystem for Volume {
                 }
             }
 
-            // Free the inode in the INOBT (update AGI counts)
-            let addr = sb.locate_ino(child_xfs_ino);
-            let agno = addr.agno;
-            let agi_offset = sb.ag_header_offset(agno, Sb::AGI_SECTOR);
-            let agi_bytes = match tx.read_bytes(agi_offset, sb.sb_blocksize as usize) {
-                Ok(b) => b,
-                Err(e) => {
-                    tx.abort();
-                    reply.error(e.to_errno());
-                    return;
-                }
-            };
-            let mut agi =
-                match crate::libxfuse::alloc::agi::Agi::from_bytes(agi_bytes, sb.has_crc()) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        tx.abort();
-                        reply.error(e.to_errno());
-                        return;
-                    }
-                };
-            if let Err(e) = agi.set_free_inodes(agi.free_inodes() + 1) {
-                tx.abort();
-                reply.error(e.to_errno());
-                return;
-            }
-            if let Err(e) = tx.write_bytes(agi_offset, agi.as_bytes()) {
-                tx.abort();
-                reply.error(e.to_errno());
-                return;
-            }
-
-            // Update superblock ifree count
-            let mut sector = match tx.read_bytes(0, sb.sb_blocksize as usize) {
-                Ok(b) => b,
-                Err(e) => {
-                    tx.abort();
-                    reply.error(e.to_errno());
-                    return;
-                }
-            };
-            if let Err(e) = Sb::patch_ifree(&mut sector, 1) {
-                tx.abort();
-                reply.error(e.to_errno());
-                return;
-            }
-            if let Err(e) = tx.write_bytes(0, &sector) {
+            // Free the inode in the inobt and update AGI/SB counts
+            if let Err(e) = crate::libxfuse::alloc::allocator::free_ino(&mut tx, &sb, child_xfs_ino)
+            {
                 tx.abort();
                 reply.error(e.to_errno());
                 return;
@@ -2124,7 +2048,6 @@ impl Filesystem for Volume {
             child_raw.set_mode(0);
             child_raw.set_uid(0);
             child_raw.set_gid(0);
-            child_raw.set_magic(0);
             child_raw.set_next_unlinked();
         } else {
             // Just update timestamps
@@ -2210,6 +2133,7 @@ impl Filesystem for Volume {
         raw.set_format(XfsDinodeFmt::Local as u8);
         raw.set_forkoff(0);
         raw.set_magic(XFS_DINODE_MAGIC);
+        raw.set_next_unlinked();
         raw.set_aformat(XfsDinodeFmt::Extents as u8);
         let now = std::time::SystemTime::now();
         raw.set_mtime(now);
@@ -2217,20 +2141,12 @@ impl Filesystem for Volume {
         raw.set_atime(now);
         raw.finalise();
 
-        // 3. Create shortform directory with . and .. entries
+        // 3. Create shortform directory.  In XFS shortform format, `.` and `..`
+        // are NOT stored on disk: `.` is the directory's own inode, and `..`
+        // is the parent directory's inode, recorded in the header's parent
+        // field.  The entries array holds only non-dot entries.
         let mut dir = ShortformDirectory::new(has_ftype);
-        let dot_offset = dir.header_len() as u16;
-        if let Err(e) = dir.add(b".", XFS_DIR3_FT_DIR, new_xfs_ino, dot_offset) {
-            tx.abort();
-            reply.error(e.to_errno());
-            return;
-        }
-        let dotdot_offset = dir.entries.last().unwrap().offset + SF_OFFSET_STEP;
-        if let Err(e) = dir.add(b"..", XFS_DIR3_FT_DIR, parent_ino, dotdot_offset) {
-            tx.abort();
-            reply.error(e.to_errno());
-            return;
-        }
+        dir.parent = parent_ino;
 
         // Write directory data into the inode
         if let Err(e) = raw.set_data_bytes(dir.serialize().as_slice()) {
@@ -2407,7 +2323,7 @@ impl Filesystem for Volume {
                 return;
             }
         };
-        if child_dir.entries.len() != 2 {
+        if !child_dir.entries.is_empty() {
             reply.error(Errno::ENOTEMPTY);
             return;
         }
@@ -2467,57 +2383,12 @@ impl Filesystem for Volume {
         }
 
         // 2. Free the directory's data blocks (none for shortform)
-        // 3. Free the inode in the INOBT (update AGI counts)
-        let addr = sb.locate_ino(child_xfs_ino);
-        let agno = addr.agno;
-        let agi_offset = sb.ag_header_offset(agno, Sb::AGI_SECTOR);
-        let agi_bytes = match tx.read_bytes(agi_offset, sb.sb_blocksize as usize) {
-            Ok(b) => b,
-            Err(e) => {
-                tx.abort();
-                reply.error(e.to_errno());
-                return;
-            }
-        };
-        let mut agi = match crate::libxfuse::alloc::agi::Agi::from_bytes(agi_bytes, sb.has_crc()) {
-            Ok(a) => a,
-            Err(e) => {
-                tx.abort();
-                reply.error(e.to_errno());
-                return;
-            }
-        };
-        if let Err(e) = agi.set_free_inodes(agi.free_inodes() + 1) {
+        // 3. Free the inode in the inobt and update AGI/SB counts
+        if let Err(e) = crate::libxfuse::alloc::allocator::free_ino(&mut tx, &sb, child_xfs_ino) {
             tx.abort();
             reply.error(e.to_errno());
             return;
         }
-        if let Err(e) = tx.write_bytes(agi_offset, agi.as_bytes()) {
-            tx.abort();
-            reply.error(e.to_errno());
-            return;
-        }
-
-        // Update superblock ifree count
-        let mut sector = match tx.read_bytes(0, sb.sb_blocksize as usize) {
-            Ok(b) => b,
-            Err(e) => {
-                tx.abort();
-                reply.error(e.to_errno());
-                return;
-            }
-        };
-        if let Err(e) = Sb::patch_ifree(&mut sector, 1) {
-            tx.abort();
-            reply.error(e.to_errno());
-            return;
-        }
-        if let Err(e) = tx.write_bytes(0, &sector) {
-            tx.abort();
-            reply.error(e.to_errno());
-            return;
-        }
-
         // Clear the inode's data
         child_raw.set_format(0);
         child_raw.set_size(0);
@@ -2526,7 +2397,6 @@ impl Filesystem for Volume {
         child_raw.set_mode(0);
         child_raw.set_uid(0);
         child_raw.set_gid(0);
-        child_raw.set_magic(0);
         child_raw.set_next_unlinked();
 
         // 4. Write the child inode
@@ -2660,13 +2530,17 @@ impl Filesystem for Volume {
             return;
         }
 
-        let mut dst_dir = match ShortformDirectory::decode(&dst_parent_raw.data_bytes(), has_ftype)
-        {
-            Ok(d) => d,
-            Err(e) => {
-                tx.abort();
-                reply.error(e.to_errno());
-                return;
+        let same_parent = src_parent_offset == dst_parent_offset;
+        let mut dst_dir = if same_parent {
+            std::mem::take(&mut src_dir)
+        } else {
+            match ShortformDirectory::decode(&dst_parent_raw.data_bytes(), has_ftype) {
+                Ok(d) => d,
+                Err(e) => {
+                    tx.abort();
+                    reply.error(e.to_errno());
+                    return;
+                }
             }
         };
 
@@ -2677,8 +2551,8 @@ impl Filesystem for Volume {
             return;
         }
 
-        // 3. Remove from source directory
-        if let Err(e) = src_dir.remove(name_bytes) {
+        // 3. Remove from source directory (works for both same and different parents)
+        if let Err(e) = dst_dir.remove(name_bytes) {
             tx.abort();
             reply.error(e.to_errno());
             return;
@@ -2698,32 +2572,48 @@ impl Filesystem for Volume {
 
         let now = std::time::SystemTime::now();
 
-        // 5. Update source parent
-        src_parent_raw.set_mtime(now);
-        src_parent_raw.set_ctime(now);
-        if let Err(e) = src_parent_raw.set_data_bytes(src_dir.serialize().as_slice()) {
-            tx.abort();
-            reply.error(e.to_errno());
-            return;
-        }
-        if let Err(e) = tx.write_bytes(src_parent_offset, src_parent_raw.as_bytes()) {
-            tx.abort();
-            reply.error(e.to_errno());
-            return;
-        }
+        if same_parent {
+            // 5. Update the single parent directory (remove old name, add new name)
+            src_parent_raw.set_mtime(now);
+            src_parent_raw.set_ctime(now);
+            if let Err(e) = src_parent_raw.set_data_bytes(dst_dir.serialize().as_slice()) {
+                tx.abort();
+                reply.error(e.to_errno());
+                return;
+            }
+            if let Err(e) = tx.write_bytes(src_parent_offset, src_parent_raw.as_bytes()) {
+                tx.abort();
+                reply.error(e.to_errno());
+                return;
+            }
+        } else {
+            // 5. Update source parent
+            src_parent_raw.set_mtime(now);
+            src_parent_raw.set_ctime(now);
+            if let Err(e) = src_parent_raw.set_data_bytes(src_dir.serialize().as_slice()) {
+                tx.abort();
+                reply.error(e.to_errno());
+                return;
+            }
+            if let Err(e) = tx.write_bytes(src_parent_offset, src_parent_raw.as_bytes()) {
+                tx.abort();
+                reply.error(e.to_errno());
+                return;
+            }
 
-        // 6. Update destination parent
-        dst_parent_raw.set_mtime(now);
-        dst_parent_raw.set_ctime(now);
-        if let Err(e) = dst_parent_raw.set_data_bytes(dst_dir.serialize().as_slice()) {
-            tx.abort();
-            reply.error(e.to_errno());
-            return;
-        }
-        if let Err(e) = tx.write_bytes(dst_parent_offset, dst_parent_raw.as_bytes()) {
-            tx.abort();
-            reply.error(e.to_errno());
-            return;
+            // 6. Update destination parent
+            dst_parent_raw.set_mtime(now);
+            dst_parent_raw.set_ctime(now);
+            if let Err(e) = dst_parent_raw.set_data_bytes(dst_dir.serialize().as_slice()) {
+                tx.abort();
+                reply.error(e.to_errno());
+                return;
+            }
+            if let Err(e) = tx.write_bytes(dst_parent_offset, dst_parent_raw.as_bytes()) {
+                tx.abort();
+                reply.error(e.to_errno());
+                return;
+            }
         }
 
         // 7. Commit
@@ -3141,7 +3031,7 @@ impl Filesystem for Volume {
         s.handles.insert(
             handle,
             OpenFile {
-                ino:   u64::from(ino),
+                ino: u64::from(ino),
                 flags: flags.0,
             },
         );
@@ -3960,10 +3850,10 @@ impl Filesystem for Volume {
 
                         // Create extent record
                         let extent = crate::libxfuse::bmbt_rec::BmbtRec {
-                            br_startoff:   fblock,
+                            br_startoff: fblock,
                             br_startblock: fsblock,
                             br_blockcount: 1,
-                            br_flag:       true, // unwritten (preallocated)
+                            br_flag: true, // unwritten (preallocated)
                         };
 
                         // Insert into btree
@@ -4100,10 +3990,10 @@ impl Filesystem for Volume {
 
                 // Create extent record (try to coalesce with previous if adjacent)
                 let extent = crate::libxfuse::bmbt_rec::BmbtRec {
-                    br_startoff:   fblock,
+                    br_startoff: fblock,
                     br_startblock: fsblock,
                     br_blockcount: 1,
-                    br_flag:       true, // unwritten (preallocated)
+                    br_flag: true, // unwritten (preallocated)
                 };
 
                 // Simple coalescing: if last extent is adjacent, extend it

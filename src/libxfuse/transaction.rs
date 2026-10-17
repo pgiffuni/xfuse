@@ -87,7 +87,7 @@ use super::{
     block_cache::BlockCache,
     block_device::BlockDevice,
     error::{FsError, FsResult},
-    log::{LogWriter, XFS_LI_BUF, XFS_LI_EFI, XLOG_COMMIT_TRANS, XFS_TRANSACTION},
+    log::{LogWriter, XFS_LI_BUF, XFS_LI_EFI, XFS_TRANSACTION, XLOG_COMMIT_TRANS},
     sb::Sb,
 };
 
@@ -457,10 +457,15 @@ impl<'a> Transaction<'a> {
     fn apply_deferred_frees(&mut self) -> FsResult<()> {
         let frees: Vec<_> = self.deferred_frees.clone();
         for free in &frees {
-            free_in_group(self, self.sb, free.agno, FreeRun {
-                start: free.agbno,
-                len: free.len,
-            })?;
+            free_in_group(
+                self,
+                self.sb,
+                free.agno,
+                FreeRun {
+                    start: free.agbno,
+                    len: free.len,
+                },
+            )?;
         }
         // Commit the free space tree changes to the data device
         if !frees.is_empty() {
@@ -517,7 +522,12 @@ pub struct TransactionContext {
 
 impl TransactionContext {
     /// Build a context for one image.
-    pub fn new(device: Arc<BlockDevice>, log_device: Option<Arc<BlockDevice>>, sb: &Sb, mode: CommitMode) -> Self {
+    pub fn new(
+        device: Arc<BlockDevice>,
+        log_device: Option<Arc<BlockDevice>>,
+        sb: &Sb,
+        mode: CommitMode,
+    ) -> Self {
         let limit = default_cache_limit(sb.sb_blocksize);
         Self {
             device,
@@ -537,7 +547,13 @@ impl TransactionContext {
 
     /// Start a transaction.
     pub fn begin(&mut self) -> Transaction<'_> {
-        Transaction::begin(&self.device, self.log_device.as_deref(), &mut self.cache, &self.sb, self.mode)
+        Transaction::begin(
+            &self.device,
+            self.log_device.as_deref(),
+            &mut self.cache,
+            &self.sb,
+            self.mode,
+        )
     }
 
     /// The block cache, for tests and for the invalidation that a commit needs.
@@ -834,13 +850,17 @@ mod t {
         let mut after_log = vec![0u8; log_size as usize];
         h.dev.read_at(&mut after_log, log_start).unwrap();
         assert_eq!(
-            &before_log[..], &after_log[..],
+            &before_log[..],
+            &after_log[..],
             "aborted journal transaction wrote records to the log"
         );
 
         // The data region must also be unchanged
         let mut data = vec![0u8; 512];
         h.dev.read_at(&mut data, 0).unwrap();
-        assert!(data.iter().all(|b| *b == 0), "aborted transaction modified data");
+        assert!(
+            data.iter().all(|b| *b == 0),
+            "aborted transaction modified data"
+        );
     }
 }
