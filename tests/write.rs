@@ -45,7 +45,7 @@ use std::{
     ffi::CString,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, io::AsRawFd},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -2334,6 +2334,7 @@ fn sparse_write_creates_hole() {
 /// A hole punched in a file is reflected as zeroes when read back through a
 /// fresh mount, and `xfs_repair` accepts the result.
 #[test]
+#[cfg(target_os = "linux")]
 fn punch_hole_in_grown_file() {
     require_fusefs!();
     eprintln!("=== punch_hole_in_grown_file ===");
@@ -2351,14 +2352,15 @@ fn punch_hole_in_grown_file() {
         let file = mnt.join("files/hello.txt");
         let f = open_rw(&file);
         // Punch from block 1 to block 2 (bytes 4096..12288).
-        let result = nix::fcntl::fallocate(
-            &f,
-            nix::fcntl::FallocateFlags::FALLOC_FL_PUNCH_HOLE
-                | nix::fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE,
-            4096,
-            4096 * 2,
-        );
-        assert!(result.is_ok(), "fallocate punch_hole failed: {result:?}");
+        let result = unsafe {
+            libc::fallocate(
+                f.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                4096,
+                4096 * 2,
+            )
+        };
+        assert!(result == 0, "fallocate punch_hole failed: {result}");
     });
     with_ro_mount(&image, "punch-hole-ro", |mnt| {
         let content = read_file(&mnt.join("files/hello.txt"));

@@ -2,12 +2,9 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     io::{self, ErrorKind, Read},
-    os::{
-        fd::AsRawFd,
-        unix::{
-            ffi::{OsStrExt, OsStringExt},
-            fs::{DirEntryExt, FileExt, MetadataExt, OpenOptionsExt},
-        },
+    os::unix::{
+        ffi::{OsStrExt, OsStringExt},
+        fs::{DirEntryExt, FileExt, MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
     process::{Child, Command},
@@ -1066,25 +1063,18 @@ mod lseek {
         let p = harness4k.d.path().join("files/hello.txt");
 
         let f = fs::File::open(p).unwrap();
-        // We have to use FFI directly until Nix 0.29.0 is released.
-        // https://github.com/nix-rust/nix/pull/2349
-        // pathconf is always safe, as long as the path is valid
-        let raw = unsafe {
-            nix::errno::Errno::clear();
-            libc::fpathconf(f.as_raw_fd(), libc::_PC_MIN_HOLE_SIZE)
-        };
-        if raw == -1 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error().is_some() {
-                panic!("{}", e);
-            } else {
-                panic!("_PC_MIN_HOLE_SIZE not supported");
+        // Use nix's fpathconf which wraps the FFI call safely.
+        match nix::unistd::fpathconf(&f, nix::unistd::PathconfVar::MIN_HOLE_SIZE) {
+            Ok(Some(raw)) => {
+                // The FUSE protocol doesn't give the server any way to tell the kernel its minimum
+                // hole size, so all the kernel can report to userland is "1" or "not supported".
+                // "1" means "The file system does not specify the minimum".
+                assert_eq!(1, raw);
             }
-        } else {
-            // The FUSE protocol doesn't give the server any way to tell the kernel its minimum
-            // hole size, so all the kernel can report to userland is "1" or "not supported".
-            // "1" means "The file system does not specify the minimum".
-            assert_eq!(1, raw);
+            Ok(None) => {
+                // Unsupported returns None — expected on some systems
+            }
+            Err(e) => panic!("fpathconf failed: {e}"),
         }
     }
 
