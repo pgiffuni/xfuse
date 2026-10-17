@@ -256,10 +256,11 @@ fn build_root_inode(
         panic!("root directory data too large for inode");
     }
 
-    // Set the data fork offset (forkoff) - this is the offset from the start
-    // of the local data area to where the attribute fork begins, in 8-byte units.
-    // For a local directory with no attributes, forkoff = 0.
-    buf[ino_offset::FORKOFF] = 0;
+     // Set the data fork offset (forkoff) - this indicates where the attribute
+     // fork starts relative to the literal area (offset 96 for v2, 176 for v3).
+     // forkoff = 0 means: split remaining space between data and attr forks.
+     // For a local directory with no attributes, this is the correct value.
+     buf[ino_offset::FORKOFF] = 0;
 
     // Attribute format: extents (0 = dev, but 2 = extents for attr)
     // Wait, aformat values: 0=none, 1=local, 2=extents, 3=btree, 4=uuid, 5=rmap

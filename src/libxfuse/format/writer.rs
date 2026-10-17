@@ -163,11 +163,17 @@ pub fn format(opts: &FormatOptions) -> Result<FormatResult, FormatError> {
 
         // Encode each header into a sectsize buffer, then copy into block0.
         let mut agf_buf = vec![0u8; blocksize as usize];
+        // For AG 0, the AGF free_blocks should exclude the log.
+        let agf_free_blocks = if ag.agno == 0 {
+            (ag.free_blocks as u64).saturating_sub(plan.log_blocks as u64) as u32
+        } else {
+            ag.free_blocks
+        };
         encode_agf(
             &plan,
             ag,
-            ag.free_blocks,
-            ag.free_blocks,
+            agf_free_blocks,
+            agf_free_blocks,
             ag.btree_blocks,
             ag.bno_root,
             ag.cnt_root,

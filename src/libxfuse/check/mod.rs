@@ -47,6 +47,13 @@ use byteorder::{BigEndian, LittleEndian, ByteOrder};
 use crate::libxfuse::definitions::{XFS_SB_MAGIC, XFS_AGF_MAGIC, XFS_AGI_MAGIC, XFS_AGFL_MAGIC};
 use crate::libxfuse::format::{FormatOptions, FormatPlan};
 
+/// The sector within an AG that holds the AGF.
+const AGF_SECTOR: u32 = 1;
+/// The sector within an AG that holds the AGI.
+const AGI_SECTOR: u32 = 2;
+/// The sector within an AG that holds the AGFL.
+const AGFL_SECTOR: u32 = 3;
+
 /// The result of checking a filesystem.
 #[derive(Debug)]
 pub enum CheckStatus {
@@ -334,16 +341,66 @@ impl FsckChecker {
                 ));
             }
 
-            // Check the record count field at offset 6 (little-endian).
-            // The BNO leaf record starts at the appropriate body offset.
-            let body_start = if plan.has_crc { 56 } else { 16 };
+            // Check the record count field at offset 6 (big-endian u16).
             let numrecs_offset = bno_start + 6;
-            let _numrecs = if self.data.len() >= numrecs_offset + 2 {
+            let numrecs = if self.data.len() >= numrecs_offset + 2 {
                 BigEndian::read_u16(&self.data[numrecs_offset..numrecs_offset + 2])
             } else {
                 0
             };
-            let _ = body_start; // used in future validation
+            if numrecs == 0 {
+                errors.push(CheckError::new(
+                    "free_space",
+                    &format!("AG {} BNO root has 0 records", ag.agno),
+                ));
+            }
+
+            // Cross-reference: the BNO leaf record's block count should match
+            // the AGF's free_blocks field.  We read the AGF's free_blocks
+            // directly from the data rather than the plan, since the AGF
+            // excludes allocated regions (like the log).
+            let agf_offset = ag.start * blocksize as u64 + AGF_SECTOR as u64 * plan.sectsize as u64;
+            let agf_free_blocks = if self.data.len() >= agf_offset as usize + 56 {
+                BigEndian::read_u32(&self.data[agf_offset as usize + 52..agf_offset as usize + 56])
+            } else {
+                ag.free_blocks
+            };
+            let body_start = if plan.has_crc { 56 } else { 16 };
+            let record_offset = bno_start + body_start;
+            if self.data.len() >= record_offset + 8 {
+                // Each BNO record: startblock (4 bytes, BE) + blockcount (4 bytes, BE)
+                let _rec_start = BigEndian::read_u32(&self.data[record_offset..record_offset + 4]);
+                let rec_len = BigEndian::read_u32(&self.data[record_offset + 4..record_offset + 8]);
+                if rec_len != agf_free_blocks {
+                    errors.push(CheckError::new(
+                        "free_space",
+                        &format!(
+                            "AG {} BNO rec free blocks {} != AGF free_blocks {}",
+                            ag.agno, rec_len, agf_free_blocks
+                        ),
+                    ));
+                }
+            }
+
+            // Check CNT root similarly.
+            let cnt_offset = ag.start * blocksize as u64
+                + ag.cnt_root as u64 * blocksize as u64;
+            if cnt_offset + 8 > self.data.len() as u64 {
+                errors.push(CheckError::new(
+                    "free_space",
+                    &format!("AG {} CNT root at offset {} is out of bounds", ag.agno, cnt_offset),
+                ));
+                continue;
+            }
+            let cnt_start = cnt_offset as usize;
+            let cnt_magic = BigEndian::read_u32(&self.data[cnt_start..cnt_start + 4]);
+            let cnt_expected = if plan.has_crc { 0x41423343u32 } else { 0x41425443u32 };
+            if cnt_magic != cnt_expected {
+                errors.push(CheckError::new(
+                    "free_space",
+                    &format!("AG {} CNT root has bad magic 0x{:08x}", ag.agno, cnt_magic),
+                ));
+            }
         }
 
         errors
@@ -427,6 +484,44 @@ impl FsckChecker {
             ));
         }
 
+        // Check inode format (offset 5, u8).
+        // 0 = dev, 1 = local, 2 = extents, 3 = btree, 4 = unused.
+        // For a shortform directory, format should be 1 (local).
+        let format = self.data[root_offset + 5];
+        if format != 1 {
+            errors.push(CheckError::new(
+                "root_inode",
+                &format!("root inode format {} should be local (1) for shortform dir", format),
+            ));
+        }
+
+        // Check the fork offset (inode offset 82, u8).
+        // for v3.
+        let forkoff_raw = self.data[root_offset + 82] as usize;
+        let _ = forkoff_raw; // forkoff is informational for v2 local format
+        let inode_version = self.data[root_offset + 4]; // VERSION at offset 4
+        let literal_area_offset = if inode_version >= 3 { 176 } else { 100 };
+        let inode_size = plan.inodesize as usize;
+
+        // For local format, the shortform directory starts at the literal area
+        // offset.  If forkoff=0, the data fork gets the first half.
+        let sf_start = literal_area_offset;
+
+        // Validate the shortform directory data.
+        // The data fork (shortform dir) starts at the literal area offset.
+        let sf_data = &self.data[root_offset + sf_start..root_offset + inode_size];
+        if sf_data.len() >= 4 {
+            let count = sf_data[0];
+            // Validate entry count — a fresh root dir should have at most 2 entries.
+            if count > 2 {
+                errors.push(CheckError::new(
+                    "root_inode",
+                    &format!("root inode shortform dir has unexpected entry count: {}", count),
+                ));
+            }
+        }
+
         errors
     }
 }
+
