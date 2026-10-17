@@ -51,7 +51,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use util::{writable_copy, GOLDEN4KN, GOLDENV4, GOLDENWRITABLE};
+use util::{writable_copy, GOLDEN_NOFTYPE, GOLDEN4KN, GOLDENV4, GOLDENWRITABLE};
 
 /// Copy a golden image, mount it read-write, hand the mountpoint to `body`, and
 /// put everything back.
@@ -2145,6 +2145,65 @@ fn symlink_in_shortform_directory() {
     with_ro_mount(&image, "symlink-ro", |mnt| {
         let target = std::fs::read_link(mnt.join("sf/link.txt")).unwrap();
         assert_eq!(target, std::path::PathBuf::from("target.txt"));
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
+
+/// Create a file in a shortform directory on a file system without ftype,
+/// to exercise the sf_32 path (4-byte inode numbers, no ftype byte).
+#[test]
+fn create_in_shortform_directory_without_ftype() {
+    require_fusefs!();
+    eprintln!("=== create_in_shortform_directory_without_ftype ===");
+    let image = writable_copy(&GOLDEN_NOFTYPE, "create-noftype");
+    with_rw_mount_at(&image, "create-noftype-create", |mnt| {
+        File::create(mnt.join("sf/newfile.txt")).unwrap();
+    });
+    with_ro_mount(&image, "create-noftype-ro", |mnt| {
+        assert!(
+            std::path::Path::new(&mnt.join("sf/newfile.txt")).exists(),
+            "new file should exist"
+        );
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
+
+/// Remove a file from a shortform directory on a file system without ftype.
+#[test]
+fn unlink_from_shortform_directory_without_ftype() {
+    require_fusefs!();
+    eprintln!("=== unlink_from_shortform_directory_without_ftype ===");
+    let image = writable_copy(&GOLDEN_NOFTYPE, "unlink-noftype");
+    with_rw_mount_at(&image, "unlink-noftype-unlink", |mnt| {
+        std::fs::remove_file(mnt.join("sf/frame000000")).unwrap();
+    });
+    with_ro_mount(&image, "unlink-noftype-ro", |mnt| {
+        assert!(
+            !std::path::Path::new(&mnt.join("sf/frame000000")).exists(),
+            "removed file should not exist"
+        );
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
+
+/// Rename a file within a shortform directory on a file system without ftype.
+#[test]
+fn rename_within_directory_without_ftype() {
+    require_fusefs!();
+    eprintln!("=== rename_within_directory_without_ftype ===");
+    let image = writable_copy(&GOLDEN_NOFTYPE, "rename-noftype");
+    with_rw_mount_at(&image, "rename-noftype-rename", |mnt| {
+        std::fs::rename(mnt.join("sf/frame000000"), mnt.join("sf/renamed")).unwrap();
+    });
+    with_ro_mount(&image, "rename-noftype-ro", |mnt| {
+        assert!(
+            !std::path::Path::new(&mnt.join("sf/frame000000")).exists(),
+            "old name should not exist"
+        );
+        assert!(
+            std::path::Path::new(&mnt.join("sf/renamed")).exists(),
+            "new name should exist"
+        );
     });
     xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
 }
