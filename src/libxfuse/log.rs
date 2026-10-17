@@ -597,19 +597,78 @@ pub struct LogWriter<'a> {
     next_tid: u32,
     /// Buffer for the current transaction's operations
     pending:  Vec<u8>,
+    /// Number of operations accumulated in `pending`
+    op_count: u32,
 }
 
 impl<'a> LogWriter<'a> {
     /// Create a writer that appends to the log.
+    ///
+    /// Reconstructs the current log position and cycle by scanning for
+    /// existing records.  This ensures that each transaction writes after
+    /// the previous one instead of overwriting it from the log start.
     pub fn new(device: &'a BlockDevice, sb: &'a Sb) -> Self {
+        let (pos, cycle) = Self::find_log_tail(device, sb);
         Self {
             device,
             sb,
-            pos: sb.log_start_bytes(),
-            cycle: 1,
+            pos,
+            cycle,
             next_tid: 1,
             pending: Vec::new(),
+            op_count: 0,
         }
+    }
+
+    /// Scan the log region for the last written record.
+    ///
+    /// Returns the byte position after the last complete record, and the
+    /// cycle number from that record.  If no records exist, returns the
+    /// log start position with cycle 1.
+    fn find_log_tail(device: &BlockDevice, sb: &Sb) -> (u64, u32) {
+        let bs = u64::from(sb.sb_blocksize) as usize;
+        let log_start = sb.log_start_bytes();
+        let log_size = sb.log_blocks_len() * bs as u64;
+        if log_size == 0 {
+            return (log_start, 1);
+        }
+        let log_end = log_start + log_size;
+        let mut pos = log_start;
+        let mut cycle = 1u32;
+
+        while pos + XLOG_HEADER_SIZE as u64 <= log_end {
+            let mut magic_buf = [0u8; 4];
+            if device.read_at(&mut magic_buf, pos).is_err() {
+                break;
+            }
+            let magic = u32::from_be_bytes(magic_buf);
+            if magic != XLOG_HEADER_MAGIC_NUM {
+                break;
+            }
+
+            let header_bytes = std::cmp::max(XLOG_HEADER_SIZE, bs);
+            let mut buf = vec![0u8; header_bytes];
+            if device.read_at(&mut buf, pos).is_err() {
+                break;
+            }
+
+            let header = match XlogRecHeader::decode(&buf) {
+                Ok(h) => h,
+                Err(_) => break,
+            };
+
+            cycle = header.cycle;
+            let data_len = header.len as u64;
+            let record_end = pos + XLOG_HEADER_SIZE as u64 + data_len;
+            if record_end > log_end {
+                break;
+            }
+            let rounded = record_end.div_ceil(bs as u64) * bs as u64;
+            let wrapped = (rounded - log_start) % log_size;
+            pos = log_start + wrapped;
+        }
+
+        (pos, cycle)
     }
 
     /// Begin a new transaction, returning a transaction ID.
@@ -624,6 +683,7 @@ impl<'a> LogWriter<'a> {
         let header = XlogOpHeader::encode(tid, payload.len() as u32, clientid, flags, 0);
         self.pending.extend_from_slice(&header);
         self.pending.extend_from_slice(payload);
+        self.op_count += 1;
     }
 
     /// Flush the current transaction to the log.
@@ -640,36 +700,36 @@ impl<'a> LogWriter<'a> {
             2, // version
             data_len,
             lsn,
-            XlogLsn::new(0, 0), // tail_lsn will be set properly later
-            0,                  // crc - computed by XFS
+            lsn,                                   // tail_lsn points to this record
+            0,                                    // crc - computed below before writing
             0,                  // prev_block
-            (self.pending.len() / XlogOpHeader::SIZE) as u32,
+            self.op_count,
             0, // fmt
         );
 
-        let record = [&header[..], &self.pending[..]].concat();
+        let mut record = [&header[..], &self.pending[..]].concat();
+
+        // Compute CRC over the first 32 bytes (everything before the CRC
+        // field at offset 32), then patch it into the record (little-endian).
+        let crc = {
+            use crc::Crc;
+            let crc = Crc::<u32>::new(&crc::CRC_32_ISCSI);
+            let mut digest = crc.digest();
+            digest.update(&record[..32]);
+            digest.finalize()
+        };
+        record[32..36].copy_from_slice(&crc.to_le_bytes());
+
         self.device.write_at(&record, self.pos)?;
         self.device.flush()?;
 
+        // Advance position using data_len (before clearing pending) to
+        // prevent the next record from overwriting this one.
+        self.pos = self.next_record_offset_with_size(data_len as usize);
         self.pending.clear();
-        self.pos = self.next_record_offset();
+        self.op_count = 0;
 
         Ok(lsn)
-    }
-
-    /// Advance to the next record boundary, wrapping within the log region.
-    fn next_record_offset(&self) -> u64 {
-        let bs = u64::from(self.sb.sb_blocksize);
-        let log_size = self.sb.log_blocks_len() * bs;
-        if log_size == 0 {
-            // No log area configured: advance past the current record
-            return self.pos + XLOG_HEADER_SIZE as u64 + self.pending.len() as u64;
-        }
-        let header_end = self.pos + XLOG_HEADER_SIZE as u64;
-        let record_end = header_end + self.pending.len() as u64;
-        let rounded = record_end.div_ceil(bs) * bs;
-        let wrapped = (rounded - self.sb.log_start_bytes()) % log_size;
-        self.sb.log_start_bytes() + wrapped
     }
 
     /// Get the current LSN (log sequence number).
@@ -710,13 +770,24 @@ impl<'a> LogWriter<'a> {
             2, // version
             0, // no data
             lsn,
-            XlogLsn::new(0, 0), // tail_lsn
-            0,                  // crc
+            lsn,              // tail_lsn points to this record
+            0,                // crc - computed below
             0,                  // prev_block
             1,                  // num_logops
-            0,                  // fmt
+            0, // fmt
         );
-        let full_record = [&rec_header[..], &record[..]].concat();
+
+        // Compute CRC over first 32 bytes, patch into record
+        let mut full_record = [&rec_header[..], &record[..]].concat();
+        let crc = {
+            use crc::Crc;
+            let crc = Crc::<u32>::new(&crc::CRC_32_ISCSI);
+            let mut digest = crc.digest();
+            digest.update(&full_record[..32]);
+            digest.finalize()
+        };
+        full_record[32..36].copy_from_slice(&crc.to_le_bytes());
+
         self.device.write_at(&full_record, self.pos)?;
         self.device.flush()?;
         let result = XlogLsn::new(self.cycle, (self.pos / XLOG_HEADER_SIZE as u64) as u32);
@@ -729,13 +800,17 @@ impl<'a> LogWriter<'a> {
     /// After a transaction's data has been written to the data device, the
     /// log records for that transaction can be reclaimed.  In this
     /// implementation, log space is reused by wrapping (via
-    /// `next_record_offset`); we record the tail LSN so that mount-time
+    /// `next_record_offset_with_size`); we record the tail LSN so that mount-time
     /// recovery knows the lower bound of records to replay.
+    ///
+    /// ## Status
+    ///
+    /// This is a stub.  The v4 superblock does not have an `sb_logtail` field
+    /// at offset 404 in the v5 format that most images use, and writing
+    /// there corrupts adjacent superblock fields.  Log space reclamation via
+    /// wrapping is still functional; only the persistent tail pointer update
+    /// is deferred.
     pub fn reclaim_log(&self, _tail_lsn: &XlogLsn) -> FsResult<()> {
-        // TODO: For full XFS compliance, update sb_logtail (v4) or the
-        // log intent log (v5) to advance the tail pointer.  In this
-        // implementation, log wrapping via next_record_offset() reclaims
-        // space automatically.
         Ok(())
     }
 
@@ -984,24 +1059,28 @@ impl LogRecovery {
     /// Committed transactions have a COMMIT op and can be replayed safely.
     pub fn analyze(reader: &mut (impl std::io::Read + std::io::Seek), sb: &Sb) -> FsResult<Self> {
         let mut walker = LogWalker::new(reader, sb);
-        let mut committed = Vec::new();
-        let mut uncommitted = Vec::new();
-        let mut total_records = 0usize;
-        let mut total_ops = 0usize;
+        let mut all_records: Vec<LogRecord> = Vec::new();
 
         for record in &mut walker {
-            total_records += 1;
-            total_ops += record.ops.len();
-            let txns = LogTransaction::group_from_records(vec![record]);
-            for txn in txns {
-                if txn.committed {
-                    committed.push(txn);
-                } else {
-                    uncommitted.push(txn);
-                }
-            }
+            all_records.push(record);
         }
 
+        let total_records = all_records.len();
+        let total_ops: usize = all_records.iter().map(|r| r.ops.len()).sum();
+
+        // Group ALL records by transaction ID at once, so that transactions
+        // spanning multiple records are reconstructed correctly.
+        let txns = LogTransaction::group_from_records(all_records);
+
+        let mut committed = Vec::new();
+        let mut uncommitted = Vec::new();
+        for txn in txns {
+            if txn.committed {
+                committed.push(txn);
+            } else {
+                uncommitted.push(txn);
+            }
+        }
         Ok(Self {
             committed,
             uncommitted,
@@ -1153,6 +1232,79 @@ mod tests {
             XLOG_HEADER_MAGIC_NUM,
             "checkpoint record should have log magic"
         );
+    }
+
+    /// Regression test for a non-overlap defect in `LogWriter::flush()`.
+    ///
+    /// The bug: `pending` was cleared *before* `next_record_offset()` computed
+    /// the next write position, so the next record overwrote the previous one.
+    /// This test writes two transactions and verifies their record headers
+    /// land at distinct, non-overlapping offsets.
+    #[test]
+    fn consecutive_flushes_do_not_overlap() {
+        let path = match crate::libxfuse::alloc::golden("xfsv4.img") {
+            Some(p) => p,
+            None => {
+                eprintln!("skipping: no unpacked xfsv4.img");
+                return;
+            }
+        };
+        let mut copy = tempfile::NamedTempFile::new().unwrap();
+        let mut src = std::fs::File::open(&path).unwrap();
+        std::io::copy(&mut src, &mut copy).unwrap();
+
+        let device = crate::libxfuse::block_device::BlockDevice::open(
+            copy.path(),
+            crate::libxfuse::block_device::Access::ReadWrite,
+        )
+        .unwrap();
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let sb = crate::libxfuse::sb::Sb::from(&mut reader);
+
+        let mut writer = LogWriter::new(&device, &sb);
+
+        // First transaction: a record with a non-trivial payload
+        let tid1 = writer.begin_transaction();
+        writer.append_op(tid1, XFS_TRANSACTION, 0, &[0xAB; 256]);
+        let lsn1 = writer.flush(tid1).unwrap();
+        let pos1 = lsn1.block() as u64 * XLOG_HEADER_SIZE as u64;
+
+        // Second transaction: another record
+        let tid2 = writer.begin_transaction();
+        writer.append_op(tid2, XFS_TRANSACTION, XLOG_COMMIT_TRANS, &[0xCD; 256]);
+        let lsn2 = writer.flush(tid2).unwrap();
+        let pos2 = lsn2.block() as u64 * XLOG_HEADER_SIZE as u64;
+
+        // The two records must not overlap
+        assert!(
+            pos2 >= pos1 + XLOG_HEADER_SIZE as u64 + 256,
+            "second record at {} overlaps first record at {} (first record spans to {})",
+            pos2, pos1, pos1 + XLOG_HEADER_SIZE as u64 + 256
+        );
+
+        // Both records should have valid magic numbers
+        let mut buf1 = vec![0u8; 4];
+        device.read_at(&mut buf1, pos1).unwrap();
+        assert_eq!(
+            u32::from_be_bytes(buf1[..4].try_into().unwrap()),
+            XLOG_HEADER_MAGIC_NUM,
+            "first record has valid magic"
+        );
+
+        let mut buf2 = vec![0u8; 4];
+        device.read_at(&mut buf2, pos2).unwrap();
+        assert_eq!(
+            u32::from_be_bytes(buf2[..4].try_into().unwrap()),
+            XLOG_HEADER_MAGIC_NUM,
+            "second record has valid magic"
+        );
+
+        // Verify op_count in the header: both records should have 1 op
+        let mut hdr1 = vec![0u8; XLOG_HEADER_SIZE];
+        device.read_at(&mut hdr1, pos1).unwrap();
+        let header1 = XlogRecHeader::decode(&hdr1).unwrap();
+        assert_eq!(header1.num_logops, 1, "first record should have 1 op");
+        assert_ne!(header1.crc, 0, "first record CRC must be non-zero");
     }
 }
 
