@@ -45,7 +45,7 @@ use std::{
     ffi::CString,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::{fs::PermissionsExt, io::AsRawFd},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -2349,17 +2349,16 @@ fn punch_hole_in_grown_file() {
     // Then punch a hole in the middle of the grown region.
     with_rw_mount_at(&image, "punch-hole-punch", |mnt| {
         let file = mnt.join("files/hello.txt");
-        let mut f = open_rw(&file);
+        let f = open_rw(&file);
         // Punch from block 1 to block 2 (bytes 4096..12288).
-        let ret = unsafe {
-            libc::fallocate(
-                f.as_raw_fd(),
-                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                4096,
-                4096 * 2,
-            )
-        };
-        assert_eq!(ret, 0, "fallocate punch_hole failed");
+        let result = nix::fcntl::fallocate(
+            &f,
+            nix::fcntl::FallocateFlags::FALLOC_FL_PUNCH_HOLE
+                | nix::fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE,
+            4096,
+            4096 * 2,
+        );
+        assert!(result.is_ok(), "fallocate punch_hole failed: {result:?}");
     });
     with_ro_mount(&image, "punch-hole-ro", |mnt| {
         let content = read_file(&mnt.join("files/hello.txt"));

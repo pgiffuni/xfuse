@@ -1024,7 +1024,7 @@ mod lseek {
             Offset::Eof => f.metadata().unwrap().size() as libc::off_t,
             Offset::BeyondEof => f.metadata().unwrap().size() as libc::off_t + 1,
         };
-        assert_eq!(expected, nix::unistd::lseek(f.as_raw_fd(), ofs, whence));
+        assert_eq!(expected, nix::unistd::lseek(&f, ofs, whence));
     }
 
     /// A completely sparse file has no data regions
@@ -1037,7 +1037,7 @@ mod lseek {
         let f = fs::File::open(p).unwrap();
         assert_eq!(
             Err(Errno::ENXIO),
-            nix::unistd::lseek(f.as_raw_fd(), 0, Whence::SeekData)
+            nix::unistd::lseek(&f, 0, Whence::SeekData)
         );
     }
 
@@ -1053,7 +1053,7 @@ mod lseek {
         let f = fs::File::open(p).unwrap();
         assert_eq!(
             Err(Errno::ENXIO),
-            nix::unistd::lseek(f.as_raw_fd(), offset, Whence::SeekData)
+            nix::unistd::lseek(&f, offset, Whence::SeekData)
         );
     }
 
@@ -1099,14 +1099,11 @@ mod lseek {
         // The unwritten extent should not count as a data region
         assert_eq!(
             Err(Errno::ENXIO),
-            nix::unistd::lseek(f.as_raw_fd(), 0, Whence::SeekData)
+            nix::unistd::lseek(&f, 0, Whence::SeekData)
         );
 
         // The unwritten extent should count as a hole
-        assert_eq!(
-            Ok(0),
-            nix::unistd::lseek(f.as_raw_fd(), 0, Whence::SeekHole)
-        );
+        assert_eq!(Ok(0), nix::unistd::lseek(&f, 0, Whence::SeekHole));
     }
 }
 
@@ -1467,7 +1464,7 @@ mod read {
 
         // But not data
         let mut buf = vec![0; 4096];
-        let e = nix::unistd::read(f.as_raw_fd(), &mut buf).unwrap_err();
+        let e = nix::unistd::read(&f, &mut buf).unwrap_err();
         assert_eq!(e, nix::Error::ENXIO);
     }
 
@@ -1817,7 +1814,8 @@ mod stat {
         let path = harness4k.d.path().join("links").join(linkname);
 
         let flags = nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW;
-        let stat = nix::sys::stat::fstatat(None, &path, flags).unwrap();
+        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(libc::AT_FDCWD) };
+        let stat = nix::sys::stat::fstatat(fd, &path, flags).unwrap();
         assert_eq!(1, stat.st_nlink, "AT_SYMLINK_NOFOLLOW was ignored");
         assert_eq!(ino, stat.st_ino);
     }
