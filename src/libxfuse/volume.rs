@@ -473,6 +473,14 @@ impl State {
         }
     }
 
+    /// Drop a directory inode from the open_files cache so that the next
+    /// lookup re-reads it from the image.  This must be called after any
+    /// write that modifies a directory, because the cached `Dinode` holds a
+    /// snapshot of the directory entries that subsequent lookups would see.
+    fn invalidate_dir_cache(&mut self, fuse_ino: u64) {
+        self.open_files.remove(&fuse_ino);
+    }
+
     /// Begin a transaction on the data device.
     fn begin(&mut self) -> Transaction<'_> {
         self.tx.begin()
@@ -1079,12 +1087,10 @@ impl State {
 
         // Try to add the entry
         let first_offset = if dir.entries.is_empty() {
-            dir.header_len() as u16
+            ShortformDirectory::first_entry_offset(&sb)
         } else {
             dir.entries.last().unwrap().offset + SF_OFFSET_STEP
         };
-
-        // Try to add the entry to a test copy
         let mut test_dir = dir.clone();
         test_dir.add(name, ftype, child_ino, first_offset)?;
 
@@ -1478,7 +1484,14 @@ impl State {
 impl Filesystem for Volume {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let s = &mut *self.state.write().unwrap();
-        let parent_oi = &mut s.open_files.get_mut(&u64::from(parent)).unwrap();
+        match s.open_files.get_mut(&u64::from(parent)) {
+            Some(_parent_oi) => {}
+            None => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        }
+        let parent_oi = s.open_files.get_mut(&u64::from(parent)).unwrap();
         let dirsize = s.sb.sb_blocksize << s.sb.sb_dirblklog;
         s.device.set_bufsize(dirsize as usize);
         let dir = parent_oi.dinode.get_dir(s.device.by_ref(), &s.sb);
@@ -1495,7 +1508,9 @@ impl Filesystem for Volume {
                     Err(err) => reply.error(Errno::from_i32(err)),
                 }
             }
-            Err(err) => reply.error(Errno::from_i32(err)),
+            Err(err) => {
+                reply.error(Errno::from_i32(err))
+            }
         }
     }
 
@@ -1687,7 +1702,7 @@ impl Filesystem for Volume {
         };
 
         let first_offset = if dir.entries.is_empty() {
-            dir.header_len() as u16
+            ShortformDirectory::first_entry_offset(&sb)
         } else {
             dir.entries.last().unwrap().offset + SF_OFFSET_STEP
         };
@@ -1718,6 +1733,8 @@ impl Filesystem for Volume {
             reply.error(e.to_errno());
             return;
         }
+        s.invalidate_dir_cache(u64::from(parent));
+
 
         let ttl = s.ttl();
 
@@ -1872,7 +1889,7 @@ impl Filesystem for Volume {
         };
 
         let first_offset = if dir.entries.is_empty() {
-            dir.header_len() as u16
+            ShortformDirectory::first_entry_offset(&sb)
         } else {
             dir.entries.last().unwrap().offset + SF_OFFSET_STEP
         };
@@ -1900,6 +1917,8 @@ impl Filesystem for Volume {
             reply.error(e.to_errno());
             return;
         }
+        s.invalidate_dir_cache(u64::from(parent));
+
 
         let ttl = s.ttl();
         let mut dev = BlockReader::from_device(s.device.device());
@@ -2106,6 +2125,8 @@ impl Filesystem for Volume {
             reply.error(e.to_errno());
             return;
         }
+        s.invalidate_dir_cache(u64::from(parent));
+
 
         reply.ok();
     }
@@ -2235,7 +2256,7 @@ impl Filesystem for Volume {
         };
 
         let first_offset = if parent_dir.entries.is_empty() {
-            parent_dir.header_len() as u16
+            ShortformDirectory::first_entry_offset(&sb)
         } else {
             parent_dir.entries.last().unwrap().offset + SF_OFFSET_STEP
         };
@@ -2267,6 +2288,8 @@ impl Filesystem for Volume {
             reply.error(e.to_errno());
             return;
         }
+        s.invalidate_dir_cache(u64::from(parent));
+
 
         let ttl = s.ttl();
         let mut dev = BlockReader::from_device(s.device.device());
@@ -2448,6 +2471,8 @@ impl Filesystem for Volume {
             reply.error(e.to_errno());
             return;
         }
+        s.invalidate_dir_cache(u64::from(parent));
+
 
         reply.ok();
     }
@@ -2588,8 +2613,10 @@ impl Filesystem for Volume {
             return;
         }
 
-        // 3. Remove from source directory (works for both same and different parents)
-        if let Err(e) = dst_dir.remove(name_bytes) {
+        // 3. Remove from source directory
+        // When same_parent, dst_dir took src_dir's entries via mem::take.
+        // When different parents, src_dir still holds the source entries.
+        if let Err(e) = if same_parent { dst_dir.remove(name_bytes) } else { src_dir.remove(name_bytes) } {
             tx.abort();
             reply.error(e.to_errno());
             return;
@@ -2597,7 +2624,7 @@ impl Filesystem for Volume {
 
         // 4. Add to destination directory with new name
         let first_offset = if dst_dir.entries.is_empty() {
-            dst_dir.header_len() as u16
+            ShortformDirectory::first_entry_offset(&sb)
         } else {
             dst_dir.entries.last().unwrap().offset + SF_OFFSET_STEP
         };
@@ -2658,6 +2685,9 @@ impl Filesystem for Volume {
             reply.error(e.to_errno());
             return;
         }
+        s.invalidate_dir_cache(u64::from(parent));
+        s.invalidate_dir_cache(u64::from(newparent));
+
 
         reply.ok();
     }
@@ -2800,7 +2830,7 @@ impl Filesystem for Volume {
             XFS_DIR3_FT_UNKNOWN
         };
         let first_offset = if dir.entries.is_empty() {
-            dir.header_len() as u16
+            ShortformDirectory::first_entry_offset(&sb)
         } else {
             dir.entries.last().unwrap().offset + SF_OFFSET_STEP
         };
@@ -2842,6 +2872,8 @@ impl Filesystem for Volume {
             reply.error(e.to_errno());
             return;
         }
+        s.invalidate_dir_cache(u64::from(newparent));
+
 
         // Return entry for new link
         let ttl = s.ttl();
@@ -2918,6 +2950,7 @@ impl Filesystem for Volume {
         raw.set_format(XfsDinodeFmt::Local as u8);
         raw.set_forkoff(0);
         raw.set_magic(XFS_DINODE_MAGIC);
+        raw.set_next_unlinked();
         raw.set_aformat(XfsDinodeFmt::Extents as u8);
         let now = std::time::SystemTime::now();
         raw.set_mtime(now);
@@ -2975,7 +3008,7 @@ impl Filesystem for Volume {
         };
 
         let first_offset = if dir.entries.is_empty() {
-            dir.header_len() as u16
+            ShortformDirectory::first_entry_offset(&sb)
         } else {
             dir.entries.last().unwrap().offset + SF_OFFSET_STEP
         };
@@ -3005,6 +3038,8 @@ impl Filesystem for Volume {
             reply.error(e.to_errno());
             return;
         }
+        s.invalidate_dir_cache(u64::from(parent));
+
 
         let ttl = s.ttl();
         let mut dev = BlockReader::from_device(s.device.device());

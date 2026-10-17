@@ -330,6 +330,17 @@ impl ShortformDirectory {
         1 + 1 + if self.i8count { 8 } else { 4 }
     }
 
+    /// The byte offset the first entry gets in a shortform directory, which
+    /// is the size of the data block header as it would appear in block
+    /// format.  This cannot be derived from the shortform header alone, so
+    /// it is computed from the inode size: `inodesize * 3 / 16`.
+    ///
+    /// The value is empirically 48 for 256-byte inodes (v4 with ftype) and
+    /// 96 for 512-byte inodes (v5 with CRC), matching the native XFS images.
+    pub fn first_entry_offset(sb: &Sb) -> u16 {
+        sb.inode_size() as u16 * 3 / 16
+    }
+
     /// The size of the directory's data: header plus every entry.
     pub fn size(&self) -> usize {
         self.entries
@@ -521,15 +532,18 @@ impl ShortformDirectory {
                 "a shortform header's entry count is one byte",
             ));
         }
-        let offset = match self.entries.last() {
+         let offset = match self.entries.last() {
             Some(last) => {
-                // The step between entries is the last entry's size rounded up to
-                // 8-byte alignment.  This matches native XFS behavior where the
-                // offset field in each entry is the byte position within the data
-                // fork, and entries are packed with 8-byte alignment.
-                let last_entry_len = self.entry_len(last.name.len());
-                let step = (last_entry_len + 7) & !7;
-                last.offset + step as u16
+                // The step between entries is the last entry's block-format size
+                // rounded up to 8-byte alignment.  The offset field in each entry
+                // is the byte position within the data fork as it would appear in
+                // block format, where entries always use 8-byte inode numbers.
+                let step = if self.ftype {
+                    ((last.name.len() as u16 + 19) / 8) * 8
+                } else {
+                    ((last.name.len() as u16 + 18) / 8) * 8
+                };
+                last.offset + step
             }
             None => first_offset,
         };

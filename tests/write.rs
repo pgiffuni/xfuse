@@ -2093,3 +2093,55 @@ fn rename_moves_file_within_directory() {
     });
     xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
 }
+
+/// Rename a file across two different shortform directories within the same
+/// parent, then verify the old location is empty and the new one holds the file.
+#[test]
+fn rename_moves_file_across_directories() {
+    require_fusefs!();
+    eprintln!("=== rename_moves_file_across_directories ===");
+    let image = writable_copy(&GOLDENV4, "rename-across");
+    // Create two subdirectories in the shortform `sf` directory.
+    with_rw_mount_at(&image, "rename-across-mkdir", |mnt| {
+        std::fs::create_dir(mnt.join("sf/dira")).unwrap();
+    });
+    with_rw_mount_at(&image, "rename-across-mkdir2", |mnt| {
+        std::fs::create_dir(mnt.join("sf/dirb")).unwrap();
+    });
+    // Create a file in the first directory.
+    with_rw_mount_at(&image, "rename-across-create", |mnt| {
+        File::create(mnt.join("sf/dira/target.txt")).unwrap();
+    });
+    // Rename it across directories.
+    with_rw_mount_at(&image, "rename-across-rename", |mnt| {
+        std::fs::rename(mnt.join("sf/dira/target.txt"), mnt.join("sf/dirb/renamed.txt"))
+            .unwrap();
+    });
+    with_ro_mount(&image, "rename-across-ro", |mnt| {
+        assert!(
+            !std::path::Path::new(&mnt.join("sf/dira/target.txt")).exists(),
+            "old name should not exist"
+        );
+        assert!(
+            std::path::Path::new(&mnt.join("sf/dirb/renamed.txt")).exists(),
+            "new name should exist in destination directory"
+        );
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
+
+/// Create a symlink in a shortform directory, then verify it survives remount.
+#[test]
+fn symlink_in_shortform_directory() {
+    require_fusefs!();
+    eprintln!("=== symlink_in_shortform_directory ===");
+    let image = writable_copy(&GOLDENV4, "symlink");
+    with_rw_mount_at(&image, "symlink-create", |mnt| {
+        std::os::unix::fs::symlink("target.txt", mnt.join("sf/link.txt")).unwrap();
+    });
+    with_ro_mount(&image, "symlink-ro", |mnt| {
+        let target = std::fs::read_link(mnt.join("sf/link.txt")).unwrap();
+        assert_eq!(target, std::path::PathBuf::from("target.txt"));
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
