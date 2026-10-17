@@ -119,6 +119,7 @@ use crate::libxfuse::{
         BtreeRoot,
         BMBT_NULL_PTR,
     },
+    delayed_alloc::{DelayedAlloc, GlobalReservation},
     log::{LogRecovery, LogReplayer},
 };
 
@@ -153,8 +154,13 @@ pub const NO_IMAGE: &str = "no image has been opened in this process";
 
 #[derive(Debug)]
 struct OpenInode {
-    dinode: Dinode,
-    count:  u64,
+    dinode:        Dinode,
+    count:         u64,
+    /// Delayed allocation state for this inode.
+    delayed:       DelayedAlloc,
+    /// Raw write data staged for delayed allocation, stored as (file offset, bytes).
+    /// These are written through `write_extending` at flush time.
+    staged_writes: Vec<(u64, Vec<u8>)>,
 }
 
 /// An open file, as FUSE sees it.
@@ -185,16 +191,18 @@ struct OpenFile {
 /// lock to avoid holding it when the value is not needed.
 #[derive(Debug)]
 struct State {
-    device:      BlockReader,
-    rt_device:   Option<Arc<BlockDevice>>,
+    device:          BlockReader,
+    rt_device:       Option<Arc<BlockDevice>>,
     #[allow(dead_code)] // Used on FreeBSD with --journal-device
     log_device: Option<Arc<BlockDevice>>,
-    sb:          Sb,
-    open_files:  HashMap<u64, OpenInode>,
-    handles:     HashMap<u64, OpenFile>,
-    next_handle: u64,
-    tx:          TransactionContext,
-    writable:    bool,
+    sb:              Sb,
+    open_files:      HashMap<u64, OpenInode>,
+    handles:         HashMap<u64, OpenFile>,
+    next_handle:     u64,
+    tx:              TransactionContext,
+    writable:        bool,
+    /// Global reservation counter for delayed allocation.
+    reserved_blocks: GlobalReservation,
 }
 
 /// All the state a mounted XFS image needs to answer FUSE requests.
@@ -297,8 +305,10 @@ impl Volume {
         open_files.insert(
             1,
             OpenInode {
-                dinode: root_inode,
-                count:  1,
+                dinode:        root_inode,
+                count:         1,
+                delayed:       DelayedAlloc::new(),
+                staged_writes: Vec::new(),
             },
         );
 
@@ -335,6 +345,7 @@ impl Volume {
                 next_handle: 1,
                 tx,
                 writable,
+                reserved_blocks: GlobalReservation::new(),
             }),
             no_open:    AtomicBool::new(false),
             no_opendir: AtomicBool::new(false),
@@ -449,7 +460,12 @@ impl State {
                 } else if mode & (S_IFMT as u32) == (S_IFREG as u32) {
                     let _ = dinode.get_file();
                 }
-                OpenInode { dinode, count: 1 }
+                OpenInode {
+                    dinode,
+                    count: 1,
+                    delayed: DelayedAlloc::new(),
+                    staged_writes: Vec::new(),
+                }
             })
     }
 
@@ -471,6 +487,64 @@ impl State {
         if let Some(oi) = self.open_files.get_mut(&ino) {
             oi.dinode = dinode;
         }
+    }
+
+    /// Flush delayed allocation state for an inode.
+    ///
+    /// This is the C2 flush path: iterate over staged writes, call
+    /// [`write_extending`](Self::write_extending) for each, release global
+    /// reservations, and clear the staging state.  Called from
+    /// [`fsync`](Filesystem::fsync) and [`release`](Filesystem::release), and
+    /// from [`read`](Filesystem::read) when staged data overlaps the read range.
+    fn flush_inode(&mut self, ino: u64) -> FsResult<()> {
+        let has_staged = self
+            .open_files
+            .get(&ino)
+            .map(|oi| !oi.staged_writes.is_empty())
+            .unwrap_or(false);
+        if !has_staged {
+            return Ok(());
+        }
+
+        // Take the staged writes out of the inode so we can borrow `self`
+        // mutably for write_extending.
+        let staged_writes: Vec<(u64, Vec<u8>)> = {
+            let oi = self
+                .open_files
+                .get_mut(&ino)
+                .ok_or_else(|| no_entry(b"an inode the kernel has not looked up"))?;
+            std::mem::take(&mut oi.staged_writes)
+        };
+
+        // Count reserved blocks before flushing so we can release them after.
+        let reserved = self
+            .open_files
+            .get(&ino)
+            .map(|oi| oi.delayed.dirty_block_count())
+            .unwrap_or(0);
+
+        // Process each staged write through the existing extending write path.
+        // write_extending reads the in-memory inode (including the size updated
+        // during staging), allocates blocks, writes data, updates extents, and
+        // commits — refreshing the inode cache on success.
+        let mut total_written = 0u32;
+        for (offset, data) in staged_writes {
+            let end = offset + data.len() as u64;
+            let n = self
+                .write_extending(ino, offset, end, &data)
+                .inspect_err(|e| {
+                    warn!("inode {ino}: flushing staged write at {offset}..{end} failed: {e}");
+                })?;
+            total_written += n;
+        }
+
+        // Release the global reservation for the blocks that were staged.
+        // At flush time, `allocate` inside write_extending has decremented
+        // sb_fdblocks, so the global counter is restored by releasing the
+        // reservation that was made during staging.
+        self.reserved_blocks.release(reserved);
+        let _ = total_written;
+        Ok(())
     }
 
     /// Drop a directory inode from the open_files cache so that the next
@@ -1391,16 +1465,37 @@ impl State {
             // Past the end of the file the write has to *become* part of the
             // file: blocks allocated, extents recorded, and a size to match.
             //
-            // A refusal is logged, because the reasons here are the interesting
-            // ones -- "this inode's data fork is full and here are the two numbers"
-            // is the difference between a debuggable limit and `ENOSPC` from the
-            // void, and it says which of the five candidates in
-            // `docs/write-support-progress.md` was actually hit.
-            return self
-                .write_extending(ino, offset, end, data)
-                .inspect_err(|e| {
-                    warn!("inode {ino}: a write past its end at {offset}..{end} was refused: {e}");
-                });
+            // With delayed allocation, the write is staged in memory: the data
+            // is held in [`OpenInode::staged_writes`] and the file size is
+            // updated at flush time (not here), so that `write_extending`
+            // sees the *original* size when it computes how many blocks to
+            // allocate.
+
+            let blocksize = u64::from(self.sb.sb_blocksize);
+            let write_first = offset / blocksize;
+            let last_needed = end.div_ceil(blocksize);
+            let old_last = size.div_ceil(blocksize);
+            let first_new = write_first.max(old_last);
+            let needed = last_needed - first_new;
+
+            // Reserve blocks in the global counter to prevent overcommit.
+            let free = self.sb.sb_fdblocks;
+            if !self.reserved_blocks.try_reserve(needed, free) {
+                return Err(FsError::NoSpace);
+            }
+
+            // Stage the raw write for the flush path.  The in-memory inode size
+            // is NOT updated here — write_extending will set it at commit time.
+            oi.staged_writes.push((offset, data.to_vec()));
+
+            // Record the dirty range in DelayedAlloc for accounting.
+            let block_size = usize::try_from(blocksize).expect("blocksize fits in usize");
+            let _ =
+                oi.delayed
+                    .stage_write(first_new, needed, vec![0u8; needed as usize * block_size]);
+
+            debug!("staged write ino {ino}: offset {offset} end {end} needed {needed} blocks",);
+            return Ok(data.len() as u32);
         }
 
         // Work out where every block of the write lands before writing any of
@@ -3306,12 +3401,22 @@ impl Filesystem for Volume {
     fn flush(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _fh: FileHandle,
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        reply.ok()
+        // FUSE flush is synchronous: the kernel waits for this reply before
+        // the close() syscall returns.  Flush any staged delayed-allocation
+        // writes so the data is durable on disk.
+        let s = &mut *self.state.write().unwrap();
+        match s.flush_inode(u64::from(ino)) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                warn!("inode {}: flush failed: {e}", u64::from(ino));
+                reply.error(e.to_errno())
+            }
+        }
     }
 
     /// Flush the image, if the caller wants the data to have reached the
@@ -3319,16 +3424,21 @@ impl Filesystem for Volume {
     fn fsync(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
         let s = &mut *self.state.write().unwrap();
-        let result = s.tx.device().flush();
-        match result {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO))),
+        match s.flush_inode(u64::from(ino)) {
+            Ok(()) => match s.tx.device().flush() {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO))),
+            },
+            Err(e) => {
+                warn!("inode {}: fsync failed: {e}", u64::from(ino));
+                reply.error(e.to_errno())
+            }
         }
     }
 
@@ -3355,7 +3465,7 @@ impl Filesystem for Volume {
     fn release(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
@@ -3363,6 +3473,10 @@ impl Filesystem for Volume {
         reply: ReplyEmpty,
     ) {
         let s = &mut *self.state.write().unwrap();
+        // Flush any staged delayed-allocation writes before releasing the handle.
+        if let Err(e) = s.flush_inode(u64::from(ino)) {
+            warn!("inode {}: release flush failed: {e}", u64::from(ino));
+        }
         s.handles.remove(&u64::from(fh));
         reply.ok()
     }
@@ -3378,6 +3492,27 @@ impl Filesystem for Volume {
         _lock_owner: Option<LockOwner>,
         reply: fuser::ReplyData,
     ) {
+        // Check if there are staged writes that overlap the read range.
+        // If so, flush them before reading, since the staged data is not
+        // yet on disk.
+        {
+            let s = self.state.read().unwrap();
+            let needs_flush = s
+                .open_files
+                .get(&u64::from(ino))
+                .map(|oi| !oi.staged_writes.is_empty())
+                .unwrap_or(false);
+            if needs_flush {
+                drop(s);
+                let s = &mut *self.state.write().unwrap();
+                if let Err(e) = s.flush_inode(u64::from(ino)) {
+                    warn!("inode {}: read-time flush failed: {e}", u64::from(ino));
+                    reply.error(e.to_errno());
+                    return;
+                }
+            }
+        }
+
         let s = self.state.read().unwrap();
         let oi = s.open_files.get(&u64::from(ino)).unwrap();
 
