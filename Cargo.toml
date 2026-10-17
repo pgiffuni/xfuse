@@ -18,6 +18,14 @@ exclude = [
   "/benches"
 ]
 
+[lib]
+name = "xfs_fuse"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xfs-fuse"
+path = "src/main.rs"
+
 [dependencies]
 bincode-next = {version = "2.1.0", default-features = false, features = ["derive", "std"]}
 bitflags = "2.4"

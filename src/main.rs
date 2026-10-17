@@ -29,11 +29,9 @@ use std::path::PathBuf;
 
 use clap::{crate_version, Parser};
 use fuser::{mount, MountOption, SessionACL};
-use libxfuse::volume::Volume;
 use nix::unistd::daemon;
 use tracing_subscriber::EnvFilter;
-
-mod libxfuse;
+use xfs_fuse::libxfuse::volume::Volume;
 
 #[derive(Parser, Clone, Debug)]
 #[clap(version = crate_version!())]

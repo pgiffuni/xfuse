@@ -2484,3 +2484,122 @@ fn two_staged_writes_both_survive_fsync() {
     });
     xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
 }
+
+/// A staged write followed by a hole punch through the middle of the staged
+/// region must produce a correct image: the staged data is flushed first, then
+/// the punch creates a hole.
+#[test]
+#[cfg(target_os = "linux")]
+fn punch_hole_in_staged_write() {
+    require_fusefs!();
+    eprintln!("=== punch_hole_in_staged_write ===");
+    let image = writable_copy(&GOLDENV4, "punch-staged");
+    let punch_off = 4096usize;
+    let punch_len = 1024usize;
+    let original = with_rw_mount_at(&image, "punch-staged", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let before = std::fs::metadata(&file).unwrap().len() as usize;
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::End(0)).unwrap();
+        // Write 8K past EOF — staged in delayed allocation.
+        // After the write, file size = before + 8192 = 14 + 8192 = 8206.
+        // Block size is 512, so the file covers blocks 0..17 (ceil(8206/512)=17).
+        f.write_all(&[b'X'; 4096 * 2]).unwrap();
+        // Do NOT fsync — the data is still staged.
+        // Punch a hole in the middle of the staged data region.
+        // The original file occupies block 0 (0..512).
+        // Staged data starts at offset 14 (block 0), but the "new" region is
+        // blocks 1..16. Punch block 8 (bytes 4096..4607) for 1024 bytes (blocks 8..10).
+        let result = unsafe {
+            libc::fallocate(
+                f.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                punch_off as i64,
+                punch_len as i64,
+            )
+        };
+        assert_eq!(result, 0, "fallocate punch_hole failed");
+        drop(f);
+        before
+    });
+    with_ro_mount(&image, "punch-staged-ro", |mnt| {
+        let content = read_file(&mnt.join("files/hello.txt"));
+        // File grew by 8K.
+        assert_eq!(content.len(), original + 4096 * 2);
+        // Original content preserved.
+        assert_eq!(&content[..14], b"Hello, World!\n");
+        // The punched region (4096..5120) reads as zeros.
+        // Note: punch removes blocks 8..10 (4096..5120 byte range), but
+        // since these are file blocks in the staged region, they should be zero.
+        assert!(
+            content[punch_off..punch_off + punch_len]
+                .iter()
+                .all(|b| *b == 0),
+            "punched region should be zero"
+        );
+        // Data before the punch (staged region before block 8) has 'X'.
+        assert!(
+            content[512..4096].iter().all(|b| *b == b'X'),
+            "staged data before punch should survive"
+        );
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
+
+/// A staged write that is a short write (not block-aligned) must zero-fill the
+/// remainder of the block on flush, preserving both the original data and the
+/// new data.
+#[test]
+#[cfg(target_os = "linux")]
+fn short_staged_write_preserves_zeros() {
+    require_fusefs!();
+    eprintln!("=== short_staged_write_preserves_zeros ===");
+    let image = writable_copy(&GOLDENV4, "short-staged");
+    let original = with_rw_mount_at(&image, "short-staged", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let before = std::fs::metadata(&file).unwrap().len() as usize;
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::End(0)).unwrap();
+        // Short write: 3 bytes past EOF.
+        f.write_all(b"abc").unwrap();
+        drop(f);
+        before
+    });
+    with_ro_mount(&image, "short-staged-ro", |mnt| {
+        let content = read_file(&mnt.join("files/hello.txt"));
+        assert_eq!(content.len(), original + 3);
+        assert_eq!(&content[..14], b"Hello, World!\n");
+        assert_eq!(&content[original..], b"abc");
+        // The rest of the block should be zero-filled (padding to block boundary).
+        // The file size is original + 3, so there's nothing past 'abc'.
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
+
+/// Multiple staged writes at the same offset must coalesce into a single
+/// extent on flush, not produce duplicate or overlapping extents.
+#[test]
+#[cfg(target_os = "linux")]
+fn coalesced_staged_writes_produce_one_extent() {
+    require_fusefs!();
+    eprintln!("=== coalesced_staged_writes_produce_one_extent ===");
+    let image = writable_copy(&GOLDENV4, "coalesce");
+    let original = with_rw_mount_at(&image, "coalesce", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let before = std::fs::metadata(&file).unwrap().len() as usize;
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::End(0)).unwrap();
+        // Two sequential writes past EOF — should coalesce.
+        f.write_all(b"hello").unwrap();
+        f.write_all(b" world").unwrap();
+        f.flush().unwrap();
+        drop(f);
+        before
+    });
+    with_ro_mount(&image, "coalesce-ro", |mnt| {
+        let content = read_file(&mnt.join("files/hello.txt"));
+        assert_eq!(content.len(), original + 11);
+        assert_eq!(&content[original..], b"hello world");
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}

@@ -56,6 +56,10 @@ mod da_btree;
 mod definitions;
 #[allow(dead_code)]
 mod delayed_alloc;
+#[allow(dead_code)]
+pub mod format;
+#[allow(dead_code)]
+pub mod check;
 mod dinode;
 mod dinode_core;
 mod dir3;
