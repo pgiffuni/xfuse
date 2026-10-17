@@ -1256,6 +1256,9 @@ impl State {
         if !self.writable {
             return Err(FsError::read_only("truncate"));
         }
+        // Flush any staged delayed-allocation writes before modifying metadata,
+        // so the on-disk inode reflects all pending writes.
+        self.flush_inode(ino)?;
         let sb = self.sb;
         let blocksize = u64::from(sb.sb_blocksize);
         let inode_size = sb.inode_size();
@@ -3746,6 +3749,13 @@ impl Filesystem for Volume {
         let s = &mut *self.state.write().unwrap();
         if !s.writable {
             reply.error(Errno::EROFS);
+            return;
+        }
+
+        // Flush any staged delayed-allocation writes before modifying metadata.
+        if let Err(e) = s.flush_inode(u64::from(ino)) {
+            warn!("inode {ino}: fallocate flush failed: {e}");
+            reply.error(e.to_errno());
             return;
         }
 

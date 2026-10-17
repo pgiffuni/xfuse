@@ -2406,3 +2406,79 @@ fn truncate_shrinks_file() {
     });
     xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
 }
+
+/// A write past EOF is staged in memory (delayed allocation).  Truncating
+/// the file before the staged data is flushed must still produce a correct
+/// image: the staged write is flushed first, then the truncation applies.
+#[test]
+#[cfg(target_os = "linux")]
+fn truncate_after_staged_write() {
+    require_fusefs!();
+    eprintln!("=== truncate_after_staged_write ===");
+    let image = writable_copy(&GOLDENV4, "trunc-staged");
+    let before = with_rw_mount_at(&image, "trunc-staged", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let before = std::fs::metadata(&file).unwrap().len() as usize;
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::End(0)).unwrap();
+        // Write past EOF — this is staged in delayed allocation.
+        f.write_all(&[b'Z'; 4096 * 2]).unwrap();
+        // File descriptor still open: staged data not yet on disk.
+        // Truncate to a size larger than the original but smaller than the write.
+        let result = unsafe { libc::ftruncate(f.as_raw_fd(), (before + 100) as i64) };
+        assert_eq!(result, 0, "ftruncate failed");
+        drop(f);
+        before
+    });
+    with_ro_mount(&image, "trunc-staged-ro", |mnt| {
+        let content = read_file(&mnt.join("files/hello.txt"));
+        assert_eq!(
+            content.len(),
+            before + 100,
+            "file was not truncated to the right size"
+        );
+        assert_eq!(
+            &content[..before],
+            b"Hello, World!\n",
+            "original content was lost"
+        );
+        // The first 100 bytes of the staged write (b'Z') should survive the
+        // truncation — the staged data is flushed before truncate runs.
+        assert!(
+            content[before..].iter().all(|b| *b == b'Z'),
+            "staged data was not flushed before truncate"
+        );
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
+
+/// Two writes past EOF, each staged separately, are both flushed and both
+/// readable after sync.
+#[test]
+#[cfg(target_os = "linux")]
+fn two_staged_writes_both_survive_fsync() {
+    require_fusefs!();
+    eprintln!("=== two_staged_writes_both_survive_fsync ===");
+    let image = writable_copy(&GOLDENV4, "two-staged");
+    let original = with_rw_mount_at(&image, "two-staged", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let before = std::fs::metadata(&file).unwrap().len() as usize;
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::End(0)).unwrap();
+        f.write_all(b"first").unwrap();
+        f.sync_all().unwrap();
+        f.seek(SeekFrom::End(0)).unwrap();
+        f.write_all(b"second").unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        before
+    });
+    with_ro_mount(&image, "two-staged-ro", |mnt| {
+        let content = read_file(&mnt.join("files/hello.txt"));
+        assert_eq!(content.len(), original + 11, "file did not grow correctly");
+        assert_eq!(&content[..original], b"Hello, World!\n");
+        assert_eq!(&content[original..original + 5], b"first");
+        assert_eq!(&content[original + 5..], b"second");
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
