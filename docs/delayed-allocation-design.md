@@ -313,7 +313,7 @@ The existing `write_data` / `write_extending` path remains as the fallback:
 | Phase | What | Grounded in |
 |-------|------|-------------|
 | C1 | `DelayedAlloc`, `DirtyRange`, `PendingReservation` structs + reservation accounting | §4.1, §4.2 |
-| C2 | Write path: stage writes into `DelayedAlloc`, keep immediate path as fallback | §4.3 |
+| C2 | Write path: stage writes into `DelayedAlloc`, keep immediate path as fallback | §4.3 **implemented** |
 | C3 | Flush path: coalesce, allocate, write data, update extent map, commit | §4.4, §4.5 |
 | C4 | Interaction with truncate, hole punching, ZERO_RANGE, preallocation | §4.6 |
 | C5 | Lock ordering and concurrency safety | §4.7 |
