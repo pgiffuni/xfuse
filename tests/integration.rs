@@ -515,7 +515,8 @@ mod dev {
             .unwrap();
         let d = tempdir().unwrap();
         let child = Command::new(cargo_bin!("xfs-fuse"))
-            .arg("-o").arg("ro")
+            .arg("-o")
+            .arg("ro")
             .arg(md.path())
             .arg(d.path())
             .spawn()
@@ -780,7 +781,8 @@ fn daemonize() {
 
     let d = tempdir().unwrap();
     let mut child = Command::new(cargo_bin!("xfs-fuse"))
-        .arg("-o").arg("ro")
+        .arg("-o")
+        .arg("ro")
         .arg(GOLDEN1K.as_path())
         .arg(d.path())
         .spawn()

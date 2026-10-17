@@ -51,7 +51,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use util::{writable_copy, GOLDEN_NOFTYPE, GOLDEN4KN, GOLDENV4, GOLDENWRITABLE};
+use util::{writable_copy, GOLDEN4KN, GOLDENV4, GOLDENWRITABLE, GOLDEN_NOFTYPE};
 
 /// Copy a golden image, mount it read-write, hand the mountpoint to `body`, and
 /// put everything back.
@@ -192,7 +192,7 @@ fn mount(image: &Path, tag: &str, writable: bool, journal: bool) -> Mounted {
     std::fs::create_dir_all(&mnt)
         .unwrap_or_else(|e| panic!("creating the mountpoint {mnt:?}: {e}"));
 
-     let mut opts = vec!["-f".to_string()];
+    let mut opts = vec!["-f".to_string()];
     if !writable {
         opts.push("-o".to_string());
         opts.push("ro".to_string());

@@ -117,8 +117,8 @@ fn main() {
         eprintln!("journaling enabled: writes will be protected by the XFS log");
     } else {
         eprintln!(
-            "warning: mounting read-write without --no-journal.  A crash (power loss, \
-             SIGKILL, etc.) mid-write can leave the filesystem inconsistent."
+            "warning: mounting read-write without --no-journal.  A crash (power loss, SIGKILL, \
+             etc.) mid-write can leave the filesystem inconsistent."
         );
     }
 
