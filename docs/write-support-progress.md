@@ -82,30 +82,32 @@ group header looks like, and it is used below as one.
 
 Implemented: `init`, `lookup`, `forget`, `getattr`, `readlink`, `open`,
 `read`, `lseek`, `opendir`, `readdir`, `statfs`, `getxattr`, `listxattr`,
-`write`, `flush`, `fsync`, `release`.
-
-Not implemented: `setattr`, `create`, `mkdir`, `unlink`, `rmdir`, `rename`,
-`setxattr`, `removexattr`, `fallocate`, `link`, `symlink`, `mknod`, `access`,
-`chown`-family.
+`write`, `flush`, `fsync`, `release`, `setattr` (size only), `create`,
+`mknod`, `mkdir`, `unlink`, `rmdir`, `rename`, `symlink`, `link`,
+`fallocate` (punch hole, zero range, allocate), `setxattr`, `removexattr`, `access`.
 
 `FUSE_NO_OPEN_SUPPORT` and `FUSE_NO_OPENDIR_SUPPORT` are negotiated, so the
 kernel usually does not send `open`/`opendir` at all.
 
 ### Limitations relevant to write support
 
-1. A read-write mount is experimental and not crash safe: it is reached only
-   now the default and commits blocks straight to the image with no
-   journal.  There is no recovery from a torn write.
+1. A read-write mount is available in two modes.  `--no-journal` (Direct mode)
+   commits blocks straight to the image with no journal.  This is not crash safe:
+   a crash mid-write can leave the image inconsistent.  The default (Journal mode)
+   writes dirty blocks to the log first, then to the data device, providing
+   crash safety via WAL replay on mount.
 2. A file's data fork must be a list of extents in the inode.  A file whose
    fork is a B+tree is refused with a message that says so.
-3. Overwriting, extending and truncating are implemented.  There is no `create`,
-   so a write never has to make a new directory entry, and no `unlink`, so a write
-   never has to take a whole file's blocks away at once.  `setattr` is honoured
-   only for a file's size; anything else it is asked to change is refused with
-   `ENOTSUP` rather than acknowledged and ignored.
-4. The reverse mapping tree, the reference count tree, the inode allocation
-   group's new-chunk counters, and the log are not maintained.  A read-write
-   mount refuses images that have features it cannot keep up to date.
+3. Overwriting, extending and truncating are implemented.  `create`, `unlink`,
+   and `mkdir` are also implemented; a write does not encounter a file that does
+   not already have a directory entry.  `setattr` is honoured only for a file's
+   size; anything else it is asked to change is refused with `ENOTSUP` rather
+   than acknowledged and ignored.
+4. The reverse mapping tree, the reference count tree, and the inode allocation
+   group's new-chunk counters are not maintained.  A read-write mount refuses
+   images that have features it cannot keep up to date (see `capabilities.rs`).
+   The log is not fully maintained: `reclaim_log` is a no-op, so the log tail
+   pointer is not persisted across unmount.
 5. Everything above `transaction.rs` writes to the image through a
    `Transaction`; nothing writes to the device directly.
 
@@ -220,7 +222,7 @@ What is left in order:
 | Area | Status | Where |
 |:-----|:-------|:------|
 | `create`, `unlink`, directory and namespace mutation | done | `volume.rs` (create, mknod, mkdir, unlink, rmdir, rename, symlink, link, fallocate, setattr), `dir3_sf.rs` (ShortformDirectory::add/remove), `tests/write.rs` |
-| Journal, log recovery, crash safety | done | `journal: Phase 31` and subsequent commits; journal enabled by default with `--no-journal` to opt out |
+| Journal, log recovery | done (partial) | `log.rs` (LogWriter, LogWalker, LogRecovery, LogReplayer); `transaction.rs` (`commit_journal`); journal enabled by default with `--no-journal` to opt out. *Known gaps*: `reclaim_log` is a no-op (no log tail pointer persistence); EFI replay not implemented in `LogReplayer`; CRC covers only first 32 bytes of record header. |
 | Sparse-file hole punching, `fallocate` | done | `volume.rs` fallocate (punch hole for both extents and B+tree files) |
 
 ---

@@ -1,8 +1,31 @@
 # XFS Journaling and Crash Recovery Design
 
-## Status: Implementation Complete
+## Status: Implementation in Progress
 
-This document records the design for implementing XFS journal logging and crash recovery in xfuse. It is the source-grounded plan that preceded the implementation. Licensing: BSD-2-Clause, new contributions only.
+This document records the design for implementing XFS journal logging and crash
+recovery in xfuse. The journal commit path is wired into `Transaction::commit()`
+and `commit_journal()` writes buffer log items (XFS_LI_BUF) and EFI intent items
+(XFS_LI_EFI) to the log with proper record headers, CRC checksums, and commit
+records. Recovery reads and replays committed transactions via `LogRecovery::analyze()`
+and `LogReplayer::replay()`.
+
+### Known limitations of the current implementation
+
+- `reclaim_log()` is a no-op: the log tail pointer (`sb_logtail`) is not persisted
+  to the superblock.  Log space is reclaimed via wrapping, but a crash after a
+  committed write may leave stale records in the log region that recovery will
+  replay again.  This is safe (idempotent replay) but not space-efficient.
+- Transaction IDs start at 1 for each mount and do not persist across remounts.
+- Cycle number reconstruction relies on scanning the log; wraparound within the
+  log region has not been tested with multiple cycles.
+- CRC is computed over the first 32 bytes of the record header (fields before
+  `h_crc`).  This matches the measurement taken from the golden image format but
+  has not been validated against `xfs_logprint` on a freshly created log.
+- `LogReplayer::replay()` handles Buf (buffer) items only.  EFI/EFD pairs are
+  written to the log for deferred frees, but EFI replay (replaying the free
+  operation itself) is not yet implemented in the replayer.
+
+Licensing: BSD-2-Clause, new contributions only.
 
 ## What was implemented
 
@@ -66,11 +89,20 @@ This document records the design for implementing XFS journal logging and crash 
 - `Transaction::commit()` now applies deferred frees after data is written
 - `Transaction::abort()` clears deferred frees
 
+### What is implemented:
+- Log record writing in `commit_journal()` with Buf items and COMMIT records
+- CRC computation for log record headers (little-endian CRC-32C)
+- `BufItem` extraction and replay for buffer log items
+- `XFS_LI_EFI` intent items for deferred frees — written to log on commit
+- Checkpoint records (`LogWriter::checkpoint()`)
+- Log position reconstruction (`LogWriter::new` scans for existing records)
+
 ### What is NOT yet implemented:
-- No log record writing in commit path (Journal mode writes directly)
-- No actual buf-item replay (extract_buf_item returns None stub)
-- No intent/done item support in log items
-- No log tail management or checkpoint records
+- EFI/EFD replay in `LogReplayer::replay()` (EFI items are written but not
+  replayed during recovery; deferred frees rely on the data device being written
+  before the log is discarded)
+- Log tail pointer persistence (`reclaim_log` is a no-op)
+- External log device CRC handling
 
 ### Log format findings (observed from xfsv4.img golden image)
 
@@ -113,11 +145,13 @@ Measured values from `xfs_logprint -f` and direct byte inspection:
 ### Current write path (`volume.rs`)
 
 Writes go through:
-1. `State::begin()` → `TransactionContext::begin()` → `Transaction` in `CommitMode::Direct`
-2. Changes accumulate in `BlockCache` via `tx.write_bytes()`
-3. `tx.commit()` → writes all dirty blocks to image, flushes
+1. `State::begin()` → `TransactionContext::begin()` → `Transaction`
+2. In `CommitMode::Direct` (no journal): changes accumulate in `BlockCache` via `tx.write_bytes()`, then `tx.commit()` writes all dirty blocks to image and flushes.
+3. In `CommitMode::Journal` (default when `--journal`): `commit_journal()` writes log records first, then writes data blocks, ensuring crash safety via WAL protocol.
 
-No log involvement. A crash mid-commit leaves partial state on disk.
+Journal mode provides crash safety: if the system crashes mid-commit, the log can be
+replayed to restore consistency. Direct mode (selected with `--no-journal`) is not
+crash safe.
 
 ### Allocation (`alloc/`)
 
@@ -143,9 +177,9 @@ From `xfs-algorithms.md` §12 and native image analysis:
 5. When magic is present, `h_cycle` is the invalid marker, and the cycle is in the next word (`xlog_get_cycle`)
 6. LSNs are 64-bit: upper 32 bits = cycle, lower 32 bits = block number
 
-### Transaction format (documented, not implemented)
+### Transaction format (implemented)
 
-From XFS Logging Design:
+The transaction commit path follows the documented XFS write-ahead logging protocol:
 
 1. **Reservation**: Transaction reserves log space before modifying
 2. **Modification**: Changes metadata in memory, marked as logged items
@@ -317,27 +351,24 @@ Write path must serialize initially; add parallelism only after correctness prov
 4. **Delayed allocation only sequential**: Random writes may still use immediate allocation
 5. **No real-time device writes**: RT device writes are refused
 
-## Feature matrix (proposed)
+## Feature matrix
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Log format 1 (v4) | Implemented | Parsing in log.rs |
-| Log format 2 (v5) | Documented | Larger IClogs, explicit log unit |
+| Log format 1 (v4) | Implemented | Parsing in `log.rs`, `LogWalker` |
+| Log format 2 (v5) | Implemented | Larger IClogs, explicit log unit support |
 | Internal log | Implemented | In-filesystem log area |
-| External log | Implemented | Separate device via --journal-device |
-| Log record CRC | Documented | Little-endian CRC32C |
-| Transaction commit records | Implemented | Op header flags |
-| Intent/done items (EFI/EFD) | Implemented | Deferred extent freeing |
-| Metadata item types | Surveyed | See table above |
-| Recovery | Implemented | Crash recovery on mount |
-| Delayed allocation | Planned | Post-recovery |
-| Allocation reservations | Surveyed | See reservation accounting |
-| Transaction commit records | Not started | Op header flags |
-| Intent/done items (EFI/EFD) | Not started | Deferred extent freeing |
-| Metadata item types | Surveyed | See table above |
-| Recovery | Not started | Post-write-support |
-| Delayed allocation | Not started | Post-recovery |
-| Allocation reservations | Surveyed | See reservation accounting |
+| External log | Implemented | Separate device via `--journal-device` |
+| Log record CRC | Implemented | CRC-32C over first 32 bytes of header |
+| Transaction commit records | Implemented | Op header flags, `XLOG_COMMIT_TRANS` |
+| Buf items (XFS_LI_BUF) | Implemented | Written and replayed during recovery |
+| EFI intent items (XFS_LI_EFI) | Implemented (write) | Written on commit for deferred frees; replay not yet implemented |
+| EFD done items (XFS_LI_EFD) | Not implemented | Replay of extents-freed deferred free completion |
+| Metadata item types | Surveyed | See table above; Buf and EFI are the implemented types |
+| Recovery | Implemented (partial) | Committed transactions replayed; EFI replay not yet |
+| Delayed allocation | Implemented | `delayed_alloc.rs` with staged writes, flush at fsync/release |
+| Allocation reservations | Implemented | `GlobalReservation` for overcommit prevention |
+| Log tail persistence | Not implemented | `reclaim_log` is a no-op; wrap-around reclaims space |
 
 ## Phase 19-20: Journal write-read round-trip verification
 
@@ -381,8 +412,8 @@ Added `reclaim_log()` method to `LogWriter` that advances the log tail after
 a transaction's data has been written to the data device.
 
 In this implementation, log space is reclaimed via wrap-around (managed by
-`next_record_offset` in `LogWriter`). The `reclaim_log` method is called after
-the COMMIT record is flushed and data blocks are written to their final locations,
+`next_record_offset_with_size` in `LogWriter`). The `reclaim_log` method is called
+after the COMMIT record is flushed and data blocks are written to their final locations,
 following the write-ahead logging protocol:
 
 1. Write dirty blocks to the log (Buf items with XFS_LI_BUF type code)
