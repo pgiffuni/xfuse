@@ -532,7 +532,7 @@ impl ShortformDirectory {
                 "a shortform header's entry count is one byte",
             ));
         }
-         let offset = match self.entries.last() {
+        let offset = match self.entries.last() {
             Some(last) => {
                 // The step between entries is the last entry's block-format size
                 // rounded up to 8-byte alignment.  The offset field in each entry

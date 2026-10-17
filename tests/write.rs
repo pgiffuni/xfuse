@@ -2114,8 +2114,11 @@ fn rename_moves_file_across_directories() {
     });
     // Rename it across directories.
     with_rw_mount_at(&image, "rename-across-rename", |mnt| {
-        std::fs::rename(mnt.join("sf/dira/target.txt"), mnt.join("sf/dirb/renamed.txt"))
-            .unwrap();
+        std::fs::rename(
+            mnt.join("sf/dira/target.txt"),
+            mnt.join("sf/dirb/renamed.txt"),
+        )
+        .unwrap();
     });
     with_ro_mount(&image, "rename-across-ro", |mnt| {
         assert!(

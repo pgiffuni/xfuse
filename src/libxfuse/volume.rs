@@ -1508,9 +1508,7 @@ impl Filesystem for Volume {
                     Err(err) => reply.error(Errno::from_i32(err)),
                 }
             }
-            Err(err) => {
-                reply.error(Errno::from_i32(err))
-            }
+            Err(err) => reply.error(Errno::from_i32(err)),
         }
     }
 
@@ -1735,7 +1733,6 @@ impl Filesystem for Volume {
         }
         s.invalidate_dir_cache(u64::from(parent));
 
-
         let ttl = s.ttl();
 
         // 4. Add inode to open files (after commit, so we can borrow self again)
@@ -1918,7 +1915,6 @@ impl Filesystem for Volume {
             return;
         }
         s.invalidate_dir_cache(u64::from(parent));
-
 
         let ttl = s.ttl();
         let mut dev = BlockReader::from_device(s.device.device());
@@ -2127,7 +2123,6 @@ impl Filesystem for Volume {
         }
         s.invalidate_dir_cache(u64::from(parent));
 
-
         reply.ok();
     }
 
@@ -2289,7 +2284,6 @@ impl Filesystem for Volume {
             return;
         }
         s.invalidate_dir_cache(u64::from(parent));
-
 
         let ttl = s.ttl();
         let mut dev = BlockReader::from_device(s.device.device());
@@ -2473,7 +2467,6 @@ impl Filesystem for Volume {
         }
         s.invalidate_dir_cache(u64::from(parent));
 
-
         reply.ok();
     }
 
@@ -2616,7 +2609,11 @@ impl Filesystem for Volume {
         // 3. Remove from source directory
         // When same_parent, dst_dir took src_dir's entries via mem::take.
         // When different parents, src_dir still holds the source entries.
-        if let Err(e) = if same_parent { dst_dir.remove(name_bytes) } else { src_dir.remove(name_bytes) } {
+        if let Err(e) = if same_parent {
+            dst_dir.remove(name_bytes)
+        } else {
+            src_dir.remove(name_bytes)
+        } {
             tx.abort();
             reply.error(e.to_errno());
             return;
@@ -2687,7 +2684,6 @@ impl Filesystem for Volume {
         }
         s.invalidate_dir_cache(u64::from(parent));
         s.invalidate_dir_cache(u64::from(newparent));
-
 
         reply.ok();
     }
@@ -2874,7 +2870,6 @@ impl Filesystem for Volume {
         }
         s.invalidate_dir_cache(u64::from(newparent));
 
-
         // Return entry for new link
         let ttl = s.ttl();
         // Need to decode target inode with Dinode for stat
@@ -3039,7 +3034,6 @@ impl Filesystem for Volume {
             return;
         }
         s.invalidate_dir_cache(u64::from(parent));
-
 
         let ttl = s.ttl();
         let mut dev = BlockReader::from_device(s.device.device());
