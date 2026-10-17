@@ -41,11 +41,13 @@
 
 mod util;
 
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 use std::{
     ffi::CString,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::{fs::PermissionsExt, io::AsRawFd},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
