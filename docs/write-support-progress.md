@@ -2807,6 +2807,34 @@ metadata — hand-editing is for tests whose subject *is* malformed metadata.
 
 ---
 
+## Workstream C: delayed allocation
+
+This is a separate effort whose design is in [`delayed-allocation-design.md`].
+It defers physical block allocation for file data until flush time, coalescing
+adjacent dirty ranges into larger extents to reduce fragmentation.
+
+### Completed
+
+* Per-inode pending-write data structures (`DelayedAlloc`, `DirtyRange`,
+  `PendingReservation`, `GlobalReservation`) in `src/libxfuse/delayed_alloc.rs`.
+* Pure (no device access) operations: `stage_write`, `stage_hole`, `assign_extent`,
+  `coalesce`, `dirty_ranges`, `take_dirty`, `remove_range`.
+* 22 unit tests covering: delayed/hole/unwritten classification, reservation
+  accounting, adjacent-write coalescing, overlap overwriting, gap handling,
+  sequential writes, EOF extension, failure rollback.
+* `cargo +nightly test --lib` — 256 unit tests pass (including 22 new).
+* `cargo +nightly fmt` and `cargo +nightly clippy -- -D warnings` — clean.
+
+### Next
+
+* C2: Integrate into `write_data` path with immediate-allocation fallback.
+* C3: Implement flush path (coalesce, allocate, write data, update extent map, commit).
+* C4: Wire up truncate/hole-punch/ZERO_RANGE/prealloc interactions.
+* C5: Lock ordering and concurrency analysis.
+* C6: Integration tests over real images.
+
+---
+
 ## Definition of done for full read-write support
 
 | Item | Status |

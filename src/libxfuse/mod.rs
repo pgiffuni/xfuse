@@ -54,6 +54,8 @@ mod btree;
 mod capabilities;
 mod da_btree;
 mod definitions;
+#[allow(dead_code)]
+mod delayed_alloc;
 mod dinode;
 mod dinode_core;
 mod dir3;
