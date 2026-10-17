@@ -283,6 +283,8 @@ fn main() {
         let mut child = Command::new(cargo_bin!("xfs-fuse"))
             .arg(gnop.as_path())
             .arg(d.path())
+            .arg("-o")
+            .arg("ro")
             .spawn()
             .unwrap();
 

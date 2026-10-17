@@ -491,11 +491,14 @@ impl State {
 
     /// Flush delayed allocation state for an inode.
     ///
-    /// This is the C2 flush path: iterate over staged writes, call
-    /// [`write_extending`](Self::write_extending) for each, release global
-    /// reservations, and clear the staging state.  Called from
-    /// [`fsync`](Filesystem::fsync) and [`release`](Filesystem::release), and
-    /// from [`read`](Filesystem::read) when staged data overlaps the read range.
+    /// This is the C3 flush path: coalesce adjacent staged writes, allocate
+    /// blocks for the coalesced ranges, write data, update the extent map, and
+    /// commit — reusing the existing [`write_extending`](Self::write_extending)
+    /// implementation for each coalesced write.
+    ///
+    /// Called from [`flush`](Filesystem::flush), [`fsync`](Filesystem::fsync),
+    /// [`release`](Filesystem::release), and [`read`](Filesystem::read) when
+    /// staged data overlaps the read range.
     fn flush_inode(&mut self, ino: u64) -> FsResult<()> {
         let has_staged = self
             .open_files
@@ -508,7 +511,7 @@ impl State {
 
         // Take the staged writes out of the inode so we can borrow `self`
         // mutably for write_extending.
-        let staged_writes: Vec<(u64, Vec<u8>)> = {
+        let mut staged_writes: Vec<(u64, Vec<u8>)> = {
             let oi = self
                 .open_files
                 .get_mut(&ino)
@@ -523,19 +526,36 @@ impl State {
             .map(|oi| oi.delayed.dirty_block_count())
             .unwrap_or(0);
 
-        // Process each staged write through the existing extending write path.
-        // write_extending reads the in-memory inode (including the size updated
-        // during staging), allocates blocks, writes data, updates extents, and
-        // commits — refreshing the inode cache on success.
-        let mut total_written = 0u32;
+        // C3: Coalesce adjacent staged writes so that sequential writes
+        // produce a single extent and a single transaction, reducing
+        // fragmentation and transaction overhead.
+        staged_writes.sort_unstable_by_key(|(offset, _)| *offset);
+        let mut coalesced: Vec<(u64, Vec<u8>)> = Vec::with_capacity(staged_writes.len());
         for (offset, data) in staged_writes {
+            if let Some(last) = coalesced.last_mut() {
+                if last.0 + last.1.len() as u64 == offset {
+                    last.1.extend_from_slice(&data);
+                    continue;
+                }
+            }
+            coalesced.push((offset, data));
+        }
+
+        // Process each coalesced write through the existing extending write path.
+        // write_extending reads the in-memory inode, allocates blocks, writes
+        // data, updates extents, and commits — refreshing the inode cache on
+        // success.
+        let mut errors: Vec<FsError> = Vec::new();
+        let mut total_written = 0u32;
+        for (offset, data) in coalesced {
             let end = offset + data.len() as u64;
-            let n = self
-                .write_extending(ino, offset, end, &data)
-                .inspect_err(|e| {
+            match self.write_extending(ino, offset, end, &data) {
+                Ok(n) => total_written += n,
+                Err(e) => {
                     warn!("inode {ino}: flushing staged write at {offset}..{end} failed: {e}");
-                })?;
-            total_written += n;
+                    errors.push(e);
+                }
+            }
         }
 
         // Release the global reservation for the blocks that were staged.
@@ -543,6 +563,15 @@ impl State {
         // sb_fdblocks, so the global counter is restored by releasing the
         // reservation that was made during staging.
         self.reserved_blocks.release(reserved);
+
+        // Clear the delayed allocation state.
+        if let Some(oi) = self.open_files.get_mut(&ino) {
+            oi.delayed.take_dirty();
+        }
+
+        if !errors.is_empty() {
+            return Err(errors.into_iter().next().expect("errors is non-empty"));
+        }
         let _ = total_written;
         Ok(())
     }
