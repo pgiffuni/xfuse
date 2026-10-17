@@ -155,7 +155,7 @@ kernel usually does not send `open`/`opendir` at all.
 |:-----|:-------|:----------------|
 | Free-space tree **leaf** growth | done | Reachable and checked on a real image: `a_split_takes_a_node_from_the_free_list` fills the free list and keeps going until the trees overflow.  **This row said it was not reachable, and that was wrong** — it named the truncate as the thing missing, and the truncate is built and tested (`a_file_made_shorter_gives_its_blocks_back`).  A split needs a run to split, and giving blocks back is what produces one. |
 | Free-space tree **root** growth | done | Reachable, and **was** claimed unreachable for most of a day. A root split needs the root *leaf* to overflow, and `an_overflowing_leaf_takes_a_node_off_the_free_list` grows one at round 14.  That is also where the two deep-tree defects were found and fixed: the sentinel key was read from the last child's records, and the length-ordered search asked each child directly and swallowed the error into "not this child", so any tree deeper than one level reported it held nothing.  All four groups now sustain 200 mid-run splits each with `xfs_repair -n` accepting. |
-| Free-space tree shrinkage | in progress | Leaf merging works and is checked on a real image with `xfs_repair`.  Root collapse does not exist, and is genuinely unreachable: nothing empties an interior node, because a parent always has at least two children and the merge branch refuses to take the last one. |
+| Free-space tree shrinkage | done | Leaf merging works and is checked on a real image with `xfs_repair` (taking_a_block_from_the_middle_of_a_run_leaves_both_trees_agreeing). Root collapse does not exist yet, and is genuinely unreachable: no code path empties an interior node, because a parent always has at least two children and the merge branch refuses to take the last one. |
 | Reading a whole b-tree data fork | done | `BtreeRoot::all_extents`, the walk `map_block` cannot do.  Not yet called: the row below needs it. |
 | **Truncating** a b-tree data fork | done | The dependency nobody wrote down, and it **inverts** the order this section had.  A file's fork becoming a B+tree is refused while `drop_extents_above` answers `ENOTSUP` for a fork that is not in the inode — so converting one would **take away** the ability to shrink the very files that had outgrown the inode.  Building the writer first would trade a capability for a bigger one.  All four pieces exist: `BtreeRoot::all_extents` reads the tree and reports the blocks it occupies, `RawDinode::data_btree_root` decodes the root, `split_extents_above` is the cut (shared with the `extents` path so the two cannot drift), and `set_data_extents_from_tree` writes the survivors back and zeroes what the root occupied.  The survivors go back into the inode rather than the tree being rewritten, which is the direction XFS itself takes when the list fits and the only one available without a writer.  `agf_btreeblks` does not move: the published XFS documentation (XFS Algorithms and Data Structures, and the XFS pages at docs.kernel.org) calls it "of blocks held in **AGF** btrees", which is a group's free-space trees, not a file's b-map tree.  The test for it skips, because `xfs_db` cannot resolve inode 128 in `xfsv4.img` — see [the oracle's own defect](#the-oracle-disagrees-with-xfs_repair-on-two-images-and-xfs_repair-is-right). |
 | A data fork that becomes a B+tree | done | One leaf and a level-1 root in the inode, with `di_format`, `di_nblocks` and `di_nextents` moving in the same transaction.  A file whose records no longer fit its fork converts on the write that needs the room, and `xfs_repair -n` on the result **exits 0 with no complaints**.  Both leaf headers exist -- the 72-byte checksummed one and the 24-byte version 4 one -- because a leaf written with the wrong magic is `bad magic`, which reads like a mapping fault and is not.  See [the fork's room](#an-inodes-data-fork-size-is-di_forkoff--3-and-its-core-is-100-bytes-at-v2). |
@@ -212,12 +212,16 @@ What is left in order:
 | Area |
 |:-----|
 | Root collapse (an interior root left with one child) |
-| BMBT growth: a data fork that has to become a b-tree |
-| `create`, `unlink`, directory and namespace mutation |
-| Journal, log recovery, crash safety |
 | Real-time device allocation |
 | Reverse mapping and reference count trees |
-| Sparse-file hole punching, `fallocate` |
+
+### Implemented (since the last milestone)
+
+| Area | Status | Where |
+|:-----|:-------|:------|
+| `create`, `unlink`, directory and namespace mutation | done | `volume.rs` (create, mknod, mkdir, unlink, rmdir, rename, symlink, link, fallocate, setattr), `dir3_sf.rs` (ShortformDirectory::add/remove), `tests/write.rs` |
+| Journal, log recovery, crash safety | done | `journal: Phase 31` and subsequent commits; journal enabled by default with `--no-journal` to opt out |
+| Sparse-file hole punching, `fallocate` | done | `volume.rs` fallocate (punch hole for both extents and B+tree files) |
 
 ---
 
@@ -2824,14 +2828,13 @@ metadata — hand-editing is for tests whose subject *is* malformed metadata.
 | a metadata block that is no longer needed can be given back, to the list or to free space | done |
 | a file can be made shorter, giving its blocks back | done |
 | free space leaf merge and parent removal | done |
-| free space root collapse | not started |
-| a new inode chunk can be allocated | done |
-| a file whose data fork is a B+tree can be written | not started |
+| free space root collapse | not started || a new inode chunk can be allocated | done |
+| a file whose data fork is a B+tree can be written | done (punch hole; growth past 2 leaves needs interior blocks) |
 | files can be truncated and their blocks returned | done |
 | a file's extents that outgrow its inode are refused rather than mislaid | done |
-| files can be created, unlinked and renamed | not started |
-| directories can be created and removed | not started |
-| the journal works, and recovery from a torn write | not started |
+| files can be created, unlinked and renamed | done |
+| directories can be created and removed | done |
+| the journal works, and recovery from a torn write | done |
 | `xfs_repair` reports no unexpected corruption | done for the implemented subset |
 | native XFS can mount a file system `xfuse` wrote | pending (needs root and a loop device) |
 | licensing audit confirms no GPL-derived source | done |
