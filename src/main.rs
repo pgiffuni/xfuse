@@ -189,17 +189,7 @@ fn main() {
     let mut config = fuser::Config::default();
     config.mount_options = opts;
     config.acl = acl;
-    // fuser 0.18.0 rejects `n_threads != 1` on non-Linux platforms.
-    // Warn and fall back on FreeBSD.
-    if app.threads != 1 && !cfg!(target_os = "linux") {
-        eprintln!(
-            "warning: --threads={} is not supported on this platform; using single-threaded mode",
-            app.threads
-        );
-        config.n_threads = None;
-    } else {
-        config.n_threads = Some(app.threads);
-    }
+    config.n_threads = Some(app.threads);
     config.clone_fd = false;
     mount(vol, &app.mountpoint, &config).unwrap();
 }

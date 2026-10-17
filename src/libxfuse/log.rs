@@ -700,9 +700,9 @@ impl<'a> LogWriter<'a> {
             2, // version
             data_len,
             lsn,
-            lsn,                                   // tail_lsn points to this record
-            0,                                    // crc - computed below before writing
-            0,                  // prev_block
+            lsn, // tail_lsn points to this record
+            0,   // crc - computed below before writing
+            0,   // prev_block
             self.op_count,
             0, // fmt
         );
@@ -766,15 +766,13 @@ impl<'a> LogWriter<'a> {
         // Build the record header
         let lsn = XlogLsn::new(self.cycle, (self.pos / XLOG_HEADER_SIZE as u64) as u32);
         let rec_header = XlogRecHeader::encode(
-            self.cycle,
-            2, // version
+            self.cycle, 2, // version
             0, // no data
-            lsn,
-            lsn,              // tail_lsn points to this record
-            0,                // crc - computed below
-            0,                  // prev_block
-            1,                  // num_logops
-            0, // fmt
+            lsn, lsn, // tail_lsn points to this record
+            0,   // crc - computed below
+            0,   // prev_block
+            1,   // num_logops
+            0,   // fmt
         );
 
         // Compute CRC over first 32 bytes, patch into record
@@ -1279,7 +1277,9 @@ mod tests {
         assert!(
             pos2 >= pos1 + XLOG_HEADER_SIZE as u64 + 256,
             "second record at {} overlaps first record at {} (first record spans to {})",
-            pos2, pos1, pos1 + XLOG_HEADER_SIZE as u64 + 256
+            pos2,
+            pos1,
+            pos1 + XLOG_HEADER_SIZE as u64 + 256
         );
 
         // Both records should have valid magic numbers
