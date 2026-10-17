@@ -48,20 +48,21 @@ struct App {
     #[arg(short)]
     foreground: bool,
 
-    /// Use the XFS journal for crash-safe writes.
+    /// Disable the XFS journal for crash-safe writes.
     ///
-    /// xfuse mounts read-write by default.  Without a journal, a crash (power
-    /// loss, SIGKILL, etc.) mid-write can leave the filesystem inconsistent.
-    /// Pass `--journal` to enable write-ahead logging for crash-safe writes.
-    #[arg(long = "journal")]
-    journal: bool,
+    /// xfuse mounts read-write by default with journaling enabled, which
+    /// writes changes to the XFS log first for crash safety.  Pass `--no-journal`
+    /// to disable write-ahead logging; a crash (power loss, SIGKILL, etc.)
+    /// mid-write can then leave the filesystem inconsistent.
+    #[arg(long = "no-journal")]
+    no_journal: bool,
 
     /// Use an external device for the XFS journal.
     ///
-    /// When set (with `--journal`), the log is written to the specified
-    /// file instead of the internal log region in the main image.  This is
-    /// useful for separating log I/O from data I/O for performance, or for
-    /// using a separate device with higher write endurance.
+    /// When set, the log is written to the specified file instead of the
+    /// internal log region in the main image.  This is useful for separating
+    /// log I/O from data I/O for performance, or for using a separate device
+    /// with higher write endurance.
     #[arg(long = "journal-device", value_name = "DEVICE")]
     log_device: Option<PathBuf>,
 
@@ -111,12 +112,13 @@ fn main() {
         MountOption::Subtype("xfs".to_string()),
     ];
 
-    if app.journal {
+    let journal = !app.no_journal;
+    if journal {
         eprintln!("journaling enabled: writes will be protected by the XFS log");
     } else {
         eprintln!(
-            "warning: mounting read-write without --journal.  A crash (power loss, SIGKILL, etc.) \
-             mid-write can leave the filesystem inconsistent. Use --journal for crash-safe writes."
+            "warning: mounting read-write without --no-journal.  A crash (power loss, \
+             SIGKILL, etc.) mid-write can leave the filesystem inconsistent."
         );
     }
 
@@ -173,7 +175,7 @@ fn main() {
     // unwritable image, an image whose features this build cannot maintain --
     // is reported to whoever ran the command.
     let logdev = app.log_device.as_ref();
-    let vol = match Volume::new(&app.device, rtdev.as_ref(), logdev, !readonly, app.journal) {
+    let vol = match Volume::new(&app.device, rtdev.as_ref(), logdev, !readonly, journal) {
         Ok(vol) => vol,
         Err(e) => {
             eprintln!("xfs-fuse: {e}");

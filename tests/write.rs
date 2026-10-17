@@ -192,13 +192,13 @@ fn mount(image: &Path, tag: &str, writable: bool, journal: bool) -> Mounted {
     std::fs::create_dir_all(&mnt)
         .unwrap_or_else(|e| panic!("creating the mountpoint {mnt:?}: {e}"));
 
-    let mut opts = vec!["-f".to_string()];
+     let mut opts = vec!["-f".to_string()];
     if !writable {
         opts.push("-o".to_string());
         opts.push("ro".to_string());
     }
-    if journal {
-        opts.push("--journal".to_string());
+    if !journal {
+        opts.push("--no-journal".to_string());
     }
     let mut command = Command::new(env!("CARGO_BIN_EXE_xfs-fuse"));
     for opt in &opts {

@@ -289,6 +289,7 @@ struct Harness {
 fn harness(img: &Path, rtimg: Option<&Path>) -> Harness {
     let d = tempdir().unwrap();
     let mut cmd = Command::new(cargo_bin!("xfs-fuse"));
+    cmd.arg("-o").arg("ro");
     if let Some(rtpath) = rtimg {
         cmd.arg("-o").arg(format!("rtdev={}", rtpath.display()));
     }
@@ -514,6 +515,7 @@ mod dev {
             .unwrap();
         let d = tempdir().unwrap();
         let child = Command::new(cargo_bin!("xfs-fuse"))
+            .arg("-o").arg("ro")
             .arg(md.path())
             .arg(d.path())
             .spawn()
@@ -778,6 +780,7 @@ fn daemonize() {
 
     let d = tempdir().unwrap();
     let mut child = Command::new(cargo_bin!("xfs-fuse"))
+        .arg("-o").arg("ro")
         .arg(GOLDEN1K.as_path())
         .arg(d.path())
         .spawn()

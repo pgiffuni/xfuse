@@ -57,7 +57,7 @@
 //!   image is left with some of the operation applied and the rest missing.  It
 //!   exists so that the operations above this layer can be written and tested
 //!   before the journal exists, and it is reachable only behind
-//!   `--journal`.
+//!   `--no-journal`.
 //!
 //! # Algorithm reference
 //!
