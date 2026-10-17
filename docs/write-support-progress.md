@@ -2822,7 +2822,18 @@ adjacent dirty ranges into larger extents to reduce fragmentation.
 * 22 unit tests covering: delayed/hole/unwritten classification, reservation
   accounting, adjacent-write coalescing, overlap overwriting, gap handling,
   sequential writes, EOF extension, failure rollback.
-* `cargo +nightly test --lib` — 256 unit tests pass (including 22 new).
+* 6 integration tests in `tests/write.rs` (C6): short write past EOF,
+  sequential writes forming contiguous file, partial block write preserves
+  zeros, sparse write creates hole, hole punching in grown file, truncate.
+* Bug fix in `split_extents_in_range` (`inode.rs:1087`): the "straddles
+  endoff" case was keeping the extent portion inside the hole and freeing
+  the portion after it — the two were swapped. Fixed to keep the tail
+  after the hole and free the in-hole portion.
+* Bug fix in PUNCH_HOLE on Extents format (`volume.rs:3828`): `di_nblocks`
+  was not updated after freeing blocks, causing `xfs_repair` to report
+  "bad nblocks". Now `set_nblocks(kept_blocks)` is called.
+* `cargo +nightly test --bin xfs-fuse` — 256 unit tests pass.
+* `cargo +nightly test --test write` — 46 integration tests pass (6 new).
 * `cargo +nightly fmt` and `cargo +nightly clippy -- -D warnings` — clean.
 
 ### Next

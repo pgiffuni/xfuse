@@ -1076,14 +1076,21 @@ impl RawDinode {
                 let freed_len = end - startoff;
                 freed.push((e.br_startblock + kept_blocks, freed_len as u32));
             } else if end > endoff {
-                // Straddles endoff - trim end
-                let mut trimmed = *e;
-                let kept_blocks = endoff - e.br_startoff;
-                trimmed.br_blockcount = kept_blocks;
-                kept.push(trimmed);
+                // Straddles endoff: the extent starts inside the hole and
+                // extends past it.  Keep the tail after the hole, free the
+                // part inside the hole.
+                //   extent:    [br_startoff, end)
+                //   hole:      [startoff, endoff)
+                //   kept:      [endoff, end)   — shifted to start at endoff
+                //   freed:     [br_startoff, endoff)
+                let freed_len = endoff - e.br_startoff;
+                freed.push((e.br_startblock, freed_len as u32));
 
-                let freed_len = end - endoff;
-                freed.push((e.br_startblock + kept_blocks, freed_len as u32));
+                let mut kept_extent = *e;
+                kept_extent.br_startoff = endoff;
+                kept_extent.br_startblock = e.br_startblock + freed_len;
+                kept_extent.br_blockcount = end - endoff;
+                kept.push(kept_extent);
             } else {
                 // Fully inside hole - free entirely
                 freed.push((e.br_startblock, e.br_blockcount as u32));

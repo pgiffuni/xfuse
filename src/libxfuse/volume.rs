@@ -3832,7 +3832,9 @@ impl Filesystem for Volume {
                     return;
                 }
 
-                // Update inode metadata
+                // Update accounting: nblocks reflects only kept data blocks.
+                let kept_blocks: u64 = kept.iter().map(|e| e.br_blockcount).sum();
+                raw_inode.set_nblocks(kept_blocks);
                 raw_inode.set_mtime(std::time::SystemTime::now());
                 raw_inode.set_ctime(std::time::SystemTime::now());
                 raw_inode.finalise();

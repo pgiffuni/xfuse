@@ -45,7 +45,7 @@ use std::{
     ffi::CString,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, io::AsRawFd},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -2204,6 +2204,204 @@ fn rename_within_directory_without_ftype() {
             std::path::Path::new(&mnt.join("sf/renamed")).exists(),
             "new name should exist"
         );
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
+
+// ---------------------------------------------------------------------------
+// Workstream C: delayed allocation integration tests
+// ---------------------------------------------------------------------------
+
+/// A short write that extends a file past its end is stored correctly and
+/// survives a clean unmount/remount.  This exercises the data path for
+/// small writes that would be candidates for delayed allocation.
+#[test]
+fn short_write_past_eof() {
+    require_fusefs!();
+    eprintln!("=== short_write_past_eof ===");
+    let image = writable_copy(&GOLDENV4, "short-write");
+    let size_before = with_rw_mount_at(&image, "short-write", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let before = std::fs::metadata(&file).unwrap().len() as usize;
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::End(0)).unwrap();
+        // Write just a few bytes past EOF.
+        f.write_all(b"Hi!").unwrap();
+        drop(f);
+        before
+    });
+    with_ro_mount(&image, "short-write-ro", |mnt| {
+        let content = read_file(&mnt.join("files/hello.txt"));
+        assert_eq!(content.len(), size_before + 3);
+        assert_eq!(&content[..size_before], b"Hello, World!\n");
+        assert_eq!(&content[size_before..], b"Hi!");
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
+
+/// Multiple sequential writes to a growing file produce a single contiguous
+/// region of data that reads back correctly after remount.
+#[test]
+fn sequential_writes_form_contiguous_file() {
+    require_fusefs!();
+    eprintln!("=== sequential_writes_form_contiguous_file ===");
+    let image = writable_copy(&GOLDENV4, "seq-write");
+    with_rw_mount_at(&image, "seq-write", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::End(0)).unwrap();
+        // Write 4 blocks of data sequentially.
+        for i in 0..4u64 {
+            let block = [b'A' + (i % 26) as u8; 4096];
+            f.write_all(&block).unwrap();
+        }
+        drop(f);
+    });
+    with_ro_mount(&image, "seq-write-ro", |mnt| {
+        let content = read_file(&mnt.join("files/hello.txt"));
+        // The original 14 bytes + 4 * 4096 bytes.
+        assert_eq!(content.len(), 14 + 4 * 4096);
+        assert_eq!(&content[..14], b"Hello, World!\n");
+        for i in 0..4 {
+            let offset = 14 + i * 4096;
+            let byte = b'A' + (i % 26) as u8;
+            assert!(
+                content[offset..offset + 4096].iter().all(|b| *b == byte),
+                "block {i} did not survive"
+            );
+        }
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
+
+/// A write that partially fills a block keeps the unwritten bytes as zeroes
+/// and does not corrupt neighbouring data.
+#[test]
+fn partial_block_write_preserves_zeros() {
+    require_fusefs!();
+    eprintln!("=== partial_block_write_preserves_zeros ===");
+    let image = writable_copy(&GOLDENV4, "partial-block");
+    with_rw_mount_at(&image, "partial-block", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::End(0)).unwrap();
+        // Write 10 bytes — less than a block.
+        f.write_all(b"0123456789").unwrap();
+        drop(f);
+    });
+    with_ro_mount(&image, "partial-block-ro", |mnt| {
+        let content = read_file(&mnt.join("files/hello.txt"));
+        let written_start = 14;
+        let written_end = written_start + 10;
+        assert_eq!(&content[..written_start], b"Hello, World!\n");
+        assert_eq!(&content[written_start..written_end], b"0123456789");
+        // The file ends at the write; there is no data beyond 24 bytes.
+        assert_eq!(content.len(), written_end);
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
+
+/// A write that creates a sparse gap (writing past the current EOF with a hole
+/// in between) produces a file where the gap reads as zeroes.
+#[test]
+fn sparse_write_creates_hole() {
+    require_fusefs!();
+    eprintln!("=== sparse_write_creates_hole ===");
+    let image = writable_copy(&GOLDENV4, "sparse-write");
+    with_rw_mount_at(&image, "sparse-write", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let mut f = open_rw(&file);
+        // Write at a position well past the end of the current 14-byte file.
+        f.seek(SeekFrom::Start(8192)).unwrap();
+        f.write_all(b"far").unwrap();
+        drop(f);
+    });
+    with_ro_mount(&image, "sparse-write-ro", |mnt| {
+        let content = read_file(&mnt.join("files/hello.txt"));
+        // File is now 8195 bytes.
+        assert_eq!(content.len(), 8195);
+        assert_eq!(&content[..14], b"Hello, World!\n");
+        // Bytes 14..8192 should be zeroes (the hole).
+        assert!(
+            content[14..8192].iter().all(|b| *b == 0),
+            "the hole did not read as zeroes"
+        );
+        assert_eq!(&content[8192..], b"far");
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
+
+/// A hole punched in a file is reflected as zeroes when read back through a
+/// fresh mount, and `xfs_repair` accepts the result.
+#[test]
+fn punch_hole_in_grown_file() {
+    require_fusefs!();
+    eprintln!("=== punch_hole_in_grown_file ===");
+    let image = writable_copy(&GOLDENV4, "punch-hole");
+    // First grow a file.
+    with_rw_mount_at(&image, "punch-hole-grow", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let mut f = open_rw(&file);
+        f.seek(SeekFrom::End(0)).unwrap();
+        f.write_all(&[b'X'; 4096 * 4]).unwrap();
+        drop(f);
+    });
+    // Then punch a hole in the middle of the grown region.
+    with_rw_mount_at(&image, "punch-hole-punch", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        let mut f = open_rw(&file);
+        // Punch from block 1 to block 2 (bytes 4096..12288).
+        let ret = unsafe {
+            libc::fallocate(
+                f.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                4096,
+                4096 * 2,
+            )
+        };
+        assert_eq!(ret, 0, "fallocate punch_hole failed");
+    });
+    with_ro_mount(&image, "punch-hole-ro", |mnt| {
+        let content = read_file(&mnt.join("files/hello.txt"));
+        // Original content preserved.
+        assert_eq!(&content[..14], b"Hello, World!\n");
+        // Blocks 0 (before 4096) has 'X' for the remainder of its first block.
+        assert!(content[14..4096].iter().all(|b| *b == b'X'));
+        // Punched region is zeroes.
+        assert!(
+            content[4096..12288].iter().all(|b| *b == 0),
+            "the punched hole did not read as zeroes"
+        );
+        // After the hole, 'X' continues.
+        assert!(
+            content[12288..].iter().all(|b| *b == b'X'),
+            "data after the hole was corrupted"
+        );
+    });
+    xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
+}
+
+/// A file can be truncated (made shorter), and the freed blocks are
+/// visible as a smaller file after remount.  `xfs_repair -n` accepts the
+/// result.
+#[test]
+fn truncate_shrinks_file() {
+    require_fusefs!();
+    eprintln!("=== truncate_shrinks_file ===");
+    let image = writable_copy(&GOLDENV4, "trunc");
+    with_rw_mount_at(&image, "trunc-grow", |mnt| {
+        let file = mnt.join("files/hello.txt");
+        {
+            let mut f = open_rw(&file);
+            f.seek(SeekFrom::End(0)).unwrap();
+            f.write_all(&[b'X'; 4096 * 4]).unwrap();
+        }
+        // Truncate back to a small size.
+        std::fs::write(&file, b"short").unwrap();
+    });
+    with_ro_mount(&image, "trunc-ro", |mnt| {
+        let content = read_file(&mnt.join("files/hello.txt"));
+        assert_eq!(content, b"short");
     });
     xfs_repair_check(&image).unwrap_or_else(|e| panic!("xfs_repair failed: {e}"));
 }
