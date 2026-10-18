@@ -39,15 +39,16 @@
 //!
 //! For the root directory, parent = 2 (points to itself).
 
-use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use crc::{Crc, CRC_32_ISCSI};
+
 use crate::libxfuse::{
-    dir3_sf::{ShortformDirectory, SfEntry},
     definitions::XFS_DINODE_MAGIC,
+    dir3_sf::{SfEntry, ShortformDirectory},
     inode::offset as ino_offset,
 };
-use crc::{Crc, CRC_32_ISCSI};
 
 /// The mode for a directory: S_IFDIR | 0755
 pub const DIR_MODE: u16 = 0o40755;
@@ -87,7 +88,11 @@ pub fn build_root_inode_chunk(plan: &crate::libxfuse::format::FormatPlan) -> Box
 
     // Write root inode at slot 2.
     let root_offset = (root_slot as usize) * inodesize;
-    build_root_inode(plan, &mut block[root_offset..root_offset + inodesize], inode_version);
+    build_root_inode(
+        plan,
+        &mut block[root_offset..root_offset + inodesize],
+        inode_version,
+    );
 
     // Write placeholder inodes at slots 0, 1 (and all unused slots).
     // In XFS, a free inode slot has version=0, which means "no inode".
@@ -141,11 +146,7 @@ pub fn build_root_inode_chunk(plan: &crate::libxfuse::format::FormatPlan) -> Box
 }
 
 /// Build a single root directory inode in the given buffer.
-fn build_root_inode(
-    plan: &crate::libxfuse::format::FormatPlan,
-    buf: &mut [u8],
-    inode_version: i8,
-) {
+fn build_root_inode(plan: &crate::libxfuse::format::FormatPlan, buf: &mut [u8], inode_version: i8) {
     let inodesize = plan.inodesize as usize;
     assert!(buf.len() >= inodesize);
 
@@ -182,7 +183,10 @@ fn build_root_inode(
     BigEndian::write_u32(&mut buf[ino_offset::NEXTENTS32..], 0);
 
     // next_unlinked: mark as end of reuse list
-    BigEndian::write_u32(&mut buf[ino_offset::NEXT_UNLINKED..], ino_offset::NO_UNLINKED);
+    BigEndian::write_u32(
+        &mut buf[ino_offset::NEXT_UNLINKED..],
+        ino_offset::NO_UNLINKED,
+    );
 
     // Set timestamps to current time
     let now = SystemTime::now();
@@ -214,7 +218,10 @@ fn build_root_inode(
         BigEndian::write_u32(&mut buf[ino_offset::CRTIME + 4..], nsecs);
 
         // ino (the inode number itself)
-        BigEndian::write_u64(&mut buf[ino_offset::INO..], crate::libxfuse::format::reserved_inodes::ROOT);
+        BigEndian::write_u64(
+            &mut buf[ino_offset::INO..],
+            crate::libxfuse::format::reserved_inodes::ROOT,
+        );
 
         // uuid
         buf[ino_offset::UUID..ino_offset::UUID + 16].copy_from_slice(&plan.uuid);
@@ -256,11 +263,11 @@ fn build_root_inode(
         panic!("root directory data too large for inode");
     }
 
-     // Set the data fork offset (forkoff) - this indicates where the attribute
-     // fork starts relative to the literal area (offset 96 for v2, 176 for v3).
-     // forkoff = 0 means: split remaining space between data and attr forks.
-     // For a local directory with no attributes, this is the correct value.
-     buf[ino_offset::FORKOFF] = 0;
+    // Set the data fork offset (forkoff) - this indicates where the attribute
+    // fork starts relative to the literal area (offset 96 for v2, 176 for v3).
+    // forkoff = 0 means: split remaining space between data and attr forks.
+    // For a local directory with no attributes, this is the correct value.
+    buf[ino_offset::FORKOFF] = 0;
 
     // Attribute format: extents (0 = dev, but 2 = extents for attr)
     // Wait, aformat values: 0=none, 1=local, 2=extents, 3=btree, 4=uuid, 5=rmap
@@ -309,9 +316,9 @@ fn build_root_directory_data(plan: &crate::libxfuse::format::FormatPlan) -> Vec<
     // The root directory contains "." -> itself (ino 2).
     // The parent is also ino 2 (the root is its own parent).
     let dir = ShortformDirectory {
-        parent:  crate::libxfuse::format::reserved_inodes::ROOT,
+        parent: crate::libxfuse::format::reserved_inodes::ROOT,
         i8count,
-        ftype:   plan.has_ftype,
+        ftype: plan.has_ftype,
         entries: vec![SfEntry {
             name:    b".".to_vec(),
             ftype:   FT_DIR,
@@ -360,15 +367,15 @@ mod tests {
 
     fn make_plan() -> crate::libxfuse::format::FormatPlan {
         let opts = crate::libxfuse::format::FormatOptions {
-            path: "/tmp/test.img".into(),
-            size: Some(300 * 1024 * 1024),
+            path:      "/tmp/test.img".into(),
+            size:      Some(300 * 1024 * 1024),
             blocksize: 4096,
-            sectsize: 512,
+            sectsize:  512,
             inodesize: 256,
-            crc: true,
-            ftype: true,
-            force: true,
-            uuid: [0xcd; 16],
+            crc:       true,
+            ftype:     true,
+            force:     true,
+            uuid:      [0xcd; 16],
         };
         crate::libxfuse::format::FormatPlan::new(&opts).expect("plan should succeed")
     }
@@ -427,15 +434,15 @@ mod tests {
     #[test]
     fn root_inode_crc_is_valid_for_v3() {
         let opts = crate::libxfuse::format::FormatOptions {
-            path: "/tmp/test.img".into(),
-            size: Some(300 * 1024 * 1024),
+            path:      "/tmp/test.img".into(),
+            size:      Some(300 * 1024 * 1024),
             blocksize: 4096,
-            sectsize: 512,
+            sectsize:  512,
             inodesize: 512, // larger inode = v3
-            crc: true,
-            ftype: true,
-            force: true,
-            uuid: [0xcd; 16],
+            crc:       true,
+            ftype:     true,
+            force:     true,
+            uuid:      [0xcd; 16],
         };
         let plan = crate::libxfuse::format::FormatPlan::new(&opts).expect("plan should succeed");
         let chunk = build_root_inode_chunk(&plan);
@@ -464,23 +471,14 @@ mod tests {
         let inodesize = plan.inodesize as usize;
         // Slot 0 should be all zeros (version = 0 means "no inode").
         let slot0 = &chunk[0..inodesize];
-        assert!(
-            slot0.iter().all(|&b| b == 0),
-            "slot 0 should be all zeros"
-        );
+        assert!(slot0.iter().all(|&b| b == 0), "slot 0 should be all zeros");
 
         // Slot 1 should also be zeros.
         let slot1 = &chunk[inodesize..2 * inodesize];
-        assert!(
-            slot1.iter().all(|&b| b == 0),
-            "slot 1 should be all zeros"
-        );
+        assert!(slot1.iter().all(|&b| b == 0), "slot 1 should be all zeros");
 
         // Slot 3 should be zeros (unused).
         let slot3 = &chunk[3 * inodesize..4 * inodesize];
-        assert!(
-            slot3.iter().all(|&b| b == 0),
-            "slot 3 should be all zeros"
-        );
+        assert!(slot3.iter().all(|&b| b == 0), "slot 3 should be all zeros");
     }
 }

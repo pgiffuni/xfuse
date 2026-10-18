@@ -42,10 +42,12 @@
 
 use std::path::PathBuf;
 
-use byteorder::{BigEndian, LittleEndian, ByteOrder};
+use byteorder::{BigEndian, ByteOrder, LittleEndian};
 
-use crate::libxfuse::definitions::{XFS_SB_MAGIC, XFS_AGF_MAGIC, XFS_AGI_MAGIC, XFS_AGFL_MAGIC};
-use crate::libxfuse::format::{FormatOptions, FormatPlan};
+use crate::libxfuse::{
+    definitions::{XFS_AGFL_MAGIC, XFS_AGF_MAGIC, XFS_AGI_MAGIC, XFS_SB_MAGIC},
+    format::{FormatOptions, FormatPlan},
+};
 
 /// The sector within an AG that holds the AGF.
 const AGF_SECTOR: u32 = 1;
@@ -93,9 +95,9 @@ pub struct FsckChecker {
 #[derive(Clone, Debug)]
 pub struct CheckOptions {
     /// Path to the image or block device.
-    pub path:    PathBuf,
+    pub path:  PathBuf,
     /// Suppress some warnings.
-    pub quiet:   bool,
+    pub quiet: bool,
 }
 
 impl FsckChecker {
@@ -107,7 +109,10 @@ impl FsckChecker {
     pub fn new(options: CheckOptions) -> Result<Self, String> {
         let data = std::fs::read(&options.path)
             .map_err(|e| format!("failed to read {}: {}", options.path.display(), e))?;
-        Ok(Self { data, opts: options })
+        Ok(Self {
+            data,
+            opts: options,
+        })
     }
 
     /// Run all checks and return the result.
@@ -149,7 +154,10 @@ impl FsckChecker {
         }) {
             Ok(p) => p,
             Err(e) => {
-                return CheckStatus::OperationalFailure(format!("failed to parse superblock: {}", e));
+                return CheckStatus::OperationalFailure(format!(
+                    "failed to parse superblock: {}",
+                    e
+                ));
             }
         };
 
@@ -232,7 +240,10 @@ impl FsckChecker {
         use crc::{Crc, CRC_32_ISCSI};
 
         if self.data.len() < sectsize {
-            return Err(CheckError::new("superblock", "image too small for CRC check"));
+            return Err(CheckError::new(
+                "superblock",
+                "image too small for CRC check",
+            ));
         }
 
         let crc_algo = Crc::<u32>::new(&CRC_32_ISCSI);
@@ -248,7 +259,10 @@ impl FsckChecker {
         if computed != stored {
             return Err(CheckError::new(
                 "superblock",
-                &format!("CRC mismatch: computed 0x{:08x}, stored 0x{:08x}", computed, stored),
+                &format!(
+                    "CRC mismatch: computed 0x{:08x}, stored 0x{:08x}",
+                    computed, stored
+                ),
             ));
         }
 
@@ -274,7 +288,10 @@ impl FsckChecker {
         if self.data.len() < 4 * sectsize {
             errors.push(CheckError::new(
                 "ag_headers",
-                &format!("image too small for AG headers (need {} bytes)", 4 * sectsize),
+                &format!(
+                    "image too small for AG headers (need {} bytes)",
+                    4 * sectsize
+                ),
             ));
             return errors;
         }
@@ -305,7 +322,10 @@ impl FsckChecker {
         if agfl_magic != XFS_AGFL_MAGIC {
             errors.push(CheckError::new(
                 "agfl",
-                &format!("bad AGFL magic 0x{:08x} at offset {}", agfl_magic, agfl_offset),
+                &format!(
+                    "bad AGFL magic 0x{:08x} at offset {}",
+                    agfl_magic, agfl_offset
+                ),
             ));
         }
 
@@ -313,7 +333,11 @@ impl FsckChecker {
     }
 
     /// Read the AGF's free_blocks field directly from the data.
-    fn read_agf_free_blocks(&self, plan: &FormatPlan, ag: &crate::libxfuse::format::AgGeometry) -> u32 {
+    fn read_agf_free_blocks(
+        &self,
+        plan: &FormatPlan,
+        ag: &crate::libxfuse::format::AgGeometry,
+    ) -> u32 {
         let blocksize = plan.blocksize as usize;
         let agf_offset = ag.start * blocksize as u64 + AGF_SECTOR as u64 * plan.sectsize as u64;
         if self.data.len() >= agf_offset as usize + 56 {
@@ -324,33 +348,51 @@ impl FsckChecker {
     }
 
     /// Read the AGF's BNO root block number.
-    fn read_agf_bno_root(&self, plan: &FormatPlan, ag: &crate::libxfuse::format::AgGeometry) -> Option<u32> {
+    fn read_agf_bno_root(
+        &self,
+        plan: &FormatPlan,
+        ag: &crate::libxfuse::format::AgGeometry,
+    ) -> Option<u32> {
         let blocksize = plan.blocksize as usize;
         let agf_offset = ag.start * blocksize as u64 + AGF_SECTOR as u64 * plan.sectsize as u64;
         if self.data.len() >= agf_offset as usize + 20 {
-            Some(BigEndian::read_u32(&self.data[agf_offset as usize + 16..agf_offset as usize + 20]))
+            Some(BigEndian::read_u32(
+                &self.data[agf_offset as usize + 16..agf_offset as usize + 20],
+            ))
         } else {
             None
         }
     }
 
     /// Read the AGF's CNT root block number.
-    fn read_agf_cnt_root(&self, plan: &FormatPlan, ag: &crate::libxfuse::format::AgGeometry) -> Option<u32> {
+    fn read_agf_cnt_root(
+        &self,
+        plan: &FormatPlan,
+        ag: &crate::libxfuse::format::AgGeometry,
+    ) -> Option<u32> {
         let blocksize = plan.blocksize as usize;
         let agf_offset = ag.start * blocksize as u64 + AGF_SECTOR as u64 * plan.sectsize as u64;
         if self.data.len() >= agf_offset as usize + 24 {
-            Some(BigEndian::read_u32(&self.data[agf_offset as usize + 20..agf_offset as usize + 24]))
+            Some(BigEndian::read_u32(
+                &self.data[agf_offset as usize + 20..agf_offset as usize + 24],
+            ))
         } else {
             None
         }
     }
 
     /// Read the AGI's inobt root block number.
-    fn read_agi_inobt_root(&self, plan: &FormatPlan, ag: &crate::libxfuse::format::AgGeometry) -> Option<u32> {
+    fn read_agi_inobt_root(
+        &self,
+        plan: &FormatPlan,
+        ag: &crate::libxfuse::format::AgGeometry,
+    ) -> Option<u32> {
         let blocksize = plan.blocksize as usize;
         let agi_offset = ag.start * blocksize as u64 + AGI_SECTOR as u64 * plan.sectsize as u64;
         if self.data.len() >= agi_offset as usize + 24 {
-            Some(BigEndian::read_u32(&self.data[agi_offset as usize + 20..agi_offset as usize + 24]))
+            Some(BigEndian::read_u32(
+                &self.data[agi_offset as usize + 20..agi_offset as usize + 24],
+            ))
         } else {
             None
         }
@@ -389,7 +431,10 @@ impl FsckChecker {
             if bno_offset + 8 > self.data.len() as u64 {
                 errors.push(CheckError::new(
                     "free_space",
-                    &format!("AG {} BNO root at offset {} is out of bounds", ag.agno, bno_offset),
+                    &format!(
+                        "AG {} BNO root at offset {} is out of bounds",
+                        ag.agno, bno_offset
+                    ),
                 ));
                 continue;
             }
@@ -398,7 +443,11 @@ impl FsckChecker {
             let bno_start = bno_offset as usize;
             let magic = BigEndian::read_u32(&self.data[bno_start..bno_start + 4]);
             // XFS_AB3B_MAGIC = 0x41423342 for v5, XFS_ABTB_MAGIC = 0x41425442 for v4
-            let expected = if plan.has_crc { 0x41423342u32 } else { 0x41425442u32 };
+            let expected = if plan.has_crc {
+                0x41423342u32
+            } else {
+                0x41425442u32
+            };
             if magic != expected {
                 errors.push(CheckError::new(
                     "free_space",
@@ -452,13 +501,20 @@ impl FsckChecker {
             if cnt_offset + 8 > self.data.len() as u64 {
                 errors.push(CheckError::new(
                     "free_space",
-                    &format!("AG {} CNT root at offset {} is out of bounds", ag.agno, cnt_offset),
+                    &format!(
+                        "AG {} CNT root at offset {} is out of bounds",
+                        ag.agno, cnt_offset
+                    ),
                 ));
                 continue;
             }
             let cnt_start = cnt_offset as usize;
             let cnt_magic = BigEndian::read_u32(&self.data[cnt_start..cnt_start + 4]);
-            let cnt_expected = if plan.has_crc { 0x41423343u32 } else { 0x41425443u32 };
+            let cnt_expected = if plan.has_crc {
+                0x41423343u32
+            } else {
+                0x41425443u32
+            };
             if cnt_magic != cnt_expected {
                 errors.push(CheckError::new(
                     "free_space",
@@ -491,14 +547,21 @@ impl FsckChecker {
             if inobt_offset + 8 > self.data.len() as u64 {
                 errors.push(CheckError::new(
                     "inobt",
-                    &format!("AG {} inobt root at offset {} is out of bounds", ag.agno, inobt_offset),
+                    &format!(
+                        "AG {} inobt root at offset {} is out of bounds",
+                        ag.agno, inobt_offset
+                    ),
                 ));
                 continue;
             }
 
             let off = inobt_offset as usize;
             let magic = BigEndian::read_u32(&self.data[off..off + 4]);
-            let expected = if plan.has_crc { 0x49414233u32 } else { 0x49414254u32 };
+            let expected = if plan.has_crc {
+                0x49414233u32
+            } else {
+                0x49414254u32
+            };
             if magic != expected {
                 errors.push(CheckError::new(
                     "inobt",
@@ -545,7 +608,8 @@ impl FsckChecker {
         // startino(4) + freecount(4) + free(8)
         let record_size = 16;
         let numrecs = if self.data.len() >= (inobt_offset as usize) + 8 {
-            BigEndian::read_u16(&self.data[inobt_offset as usize + 6..inobt_offset as usize + 8]) as usize
+            BigEndian::read_u16(&self.data[inobt_offset as usize + 6..inobt_offset as usize + 8])
+                as usize
         } else {
             0
         };
@@ -575,7 +639,10 @@ impl FsckChecker {
         // Root inode is at slot 2 within the chunk.
         let root_offset = chunk_offset as usize + 2 * plan.inodesize as usize;
         if root_offset + 4 > self.data.len() {
-            return Err(CheckError::new("root_inode", "root inode offset is out of bounds"));
+            return Err(CheckError::new(
+                "root_inode",
+                "root inode offset is out of bounds",
+            ));
         }
         Ok(root_offset)
     }
@@ -626,7 +693,10 @@ impl FsckChecker {
         if format != 1 {
             errors.push(CheckError::new(
                 "root_inode",
-                &format!("root inode format {} should be local (1) for shortform dir", format),
+                &format!(
+                    "root inode format {} should be local (1) for shortform dir",
+                    format
+                ),
             ));
         }
 
@@ -651,7 +721,10 @@ impl FsckChecker {
             if count > 2 {
                 errors.push(CheckError::new(
                     "root_inode",
-                    &format!("root inode shortform dir has unexpected entry count: {}", count),
+                    &format!(
+                        "root inode shortform dir has unexpected entry count: {}",
+                        count
+                    ),
                 ));
             }
         }
@@ -659,4 +732,3 @@ impl FsckChecker {
         errors
     }
 }
-

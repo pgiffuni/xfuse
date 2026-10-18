@@ -28,26 +28,28 @@
 
 use std::fs;
 
-use xfs_fuse::libxfuse::check::{CheckOptions, CheckStatus, FsckChecker};
-use xfs_fuse::libxfuse::format::{FormatOptions, format};
+use xfs_fuse::libxfuse::{
+    check::{CheckOptions, CheckStatus, FsckChecker},
+    format::{format, FormatOptions},
+};
 
 /// Format a small filesystem and check it.
 fn format_and_check(path: &str, size: u64) -> (Vec<u8>, CheckStatus) {
     let opts = FormatOptions {
-        path: std::path::PathBuf::from(path),
-        size: Some(size),
+        path:      std::path::PathBuf::from(path),
+        size:      Some(size),
         blocksize: 4096,
-        sectsize: 512,
+        sectsize:  512,
         inodesize: 256,
-        crc: true,
-        ftype: true,
-        force: true,
-        uuid: [0xab; 16],
+        crc:       true,
+        ftype:     true,
+        force:     true,
+        uuid:      [0xab; 16],
     };
     format(&opts).expect("format should succeed");
 
     let options = CheckOptions {
-        path: std::path::PathBuf::from(path),
+        path:  std::path::PathBuf::from(path),
         quiet: false,
     };
     let checker = FsckChecker::new(options).expect("checker should succeed");
@@ -60,7 +62,11 @@ fn format_and_check(path: &str, size: u64) -> (Vec<u8>, CheckStatus) {
 fn clean_filesystem_is_clean() {
     let path = "/tmp/xfs_fsk_test_clean.img";
     let (_data, status) = format_and_check(path, 300 * 1024 * 1024);
-    assert!(matches!(status, CheckStatus::Clean), "filesystem should be clean: {:?}", status);
+    assert!(
+        matches!(status, CheckStatus::Clean),
+        "filesystem should be clean: {:?}",
+        status
+    );
     fs::remove_file(path).ok();
 }
 
@@ -68,25 +74,29 @@ fn clean_filesystem_is_clean() {
 fn v4_filesystem_check() {
     let path = "/tmp/xfs_fsk_test_v4.img";
     let opts = FormatOptions {
-        path: std::path::PathBuf::from(path),
-        size: Some(300 * 1024 * 1024),
+        path:      std::path::PathBuf::from(path),
+        size:      Some(300 * 1024 * 1024),
         blocksize: 4096,
-        sectsize: 512,
+        sectsize:  512,
         inodesize: 256,
-        crc: false,
-        ftype: true,
-        force: true,
-        uuid: [0xcd; 16],
+        crc:       false,
+        ftype:     true,
+        force:     true,
+        uuid:      [0xcd; 16],
     };
     format(&opts).expect("format should succeed");
 
     let options = CheckOptions {
-        path: std::path::PathBuf::from(path),
+        path:  std::path::PathBuf::from(path),
         quiet: false,
     };
     let checker = FsckChecker::new(options).expect("checker should succeed");
     let status = checker.check();
-    assert!(matches!(status, CheckStatus::Clean), "v4 filesystem should be clean: {:?}", status);
+    assert!(
+        matches!(status, CheckStatus::Clean),
+        "v4 filesystem should be clean: {:?}",
+        status
+    );
 
     fs::remove_file(path).ok();
 }
@@ -101,7 +111,7 @@ fn corrupted_superblock_magic_detected() {
     fs::write(path, &data).expect("should write");
 
     let options = CheckOptions {
-        path: std::path::PathBuf::from(path),
+        path:  std::path::PathBuf::from(path),
         quiet: false,
     };
     let checker = FsckChecker::new(options).expect("checker should succeed");
@@ -126,7 +136,7 @@ fn corrupted_superblock_crc_detected() {
     fs::write(path, &data).expect("should write");
 
     let options = CheckOptions {
-        path: std::path::PathBuf::from(path),
+        path:  std::path::PathBuf::from(path),
         quiet: false,
     };
     let checker = FsckChecker::new(options).expect("checker should succeed");
@@ -151,7 +161,7 @@ fn corrupted_agf_magic_detected() {
     fs::write(path, &data).expect("should write");
 
     let options = CheckOptions {
-        path: std::path::PathBuf::from(path),
+        path:  std::path::PathBuf::from(path),
         quiet: false,
     };
     let checker = FsckChecker::new(options).expect("checker should succeed");
@@ -177,7 +187,7 @@ fn corrupted_root_inode_detected() {
     fs::write(path, &data).expect("should write");
 
     let options = CheckOptions {
-        path: std::path::PathBuf::from(path),
+        path:  std::path::PathBuf::from(path),
         quiet: false,
     };
     let checker = FsckChecker::new(options).expect("checker should succeed");

@@ -35,8 +35,10 @@
 //!   4 — filesystem has errors that were corrected (not yet implemented)
 //!   8 — operational failure (I/O error, unreadable)
 
-use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::{
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use clap::Parser;
 use xfs_fuse::libxfuse::check::{CheckOptions, CheckStatus, FsckChecker};
@@ -66,7 +68,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let options = CheckOptions {
-        path: cli.target.clone(),
+        path:  cli.target.clone(),
         quiet: cli.quiet,
     };
 

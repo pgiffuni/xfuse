@@ -47,22 +47,26 @@
 //! ...
 //! ```
 
-use std::fs::OpenOptions;
-use std::io::{Seek, SeekFrom, Write};
+use std::{
+    fs::OpenOptions,
+    io::{Seek, SeekFrom, Write},
+};
 
-use super::ag_headers::{encode_agf, encode_agi, encode_agfl};
-use super::free_space::{FreeRun, build_free_space_leaf};
-use super::inobt::{build_inobt_ag0, build_inobt_other_ag};
-use super::log::initialize_log;
-use super::plan::{FormatError, FormatOptions, FormatPlan};
-use super::root_inode::{build_inode_chunk_ag0, build_inode_chunk_other_ag};
-use super::superblock::encode_superblock;
+use super::{
+    ag_headers::{encode_agf, encode_agfl, encode_agi},
+    free_space::{build_free_space_leaf, FreeRun},
+    inobt::{build_inobt_ag0, build_inobt_other_ag},
+    log::initialize_log,
+    plan::{FormatError, FormatOptions, FormatPlan},
+    root_inode::{build_inode_chunk_ag0, build_inode_chunk_other_ag},
+    superblock::encode_superblock,
+};
 
 /// The result of formatting a filesystem.
 #[derive(Debug)]
 pub struct FormatResult {
     pub blocks_written: u64,
-    pub uuid:          [u8; 16],
+    pub uuid:           [u8; 16],
 }
 
 /// The sector within an AG that holds the superblock.
@@ -120,7 +124,7 @@ pub fn format(opts: &FormatOptions) -> Result<FormatResult, FormatError> {
         };
         let free_run = FreeRun {
             start: free_start,
-            len: free_len,
+            len:   free_len,
         };
 
         // Write the AGB tree leaves (BNO and CNT free space trees).
@@ -191,14 +195,7 @@ pub fn format(opts: &FormatOptions) -> Result<FormatResult, FormatError> {
         } else {
             crate::libxfuse::format::reserved_inodes::INODES_PER_CHUNK
         };
-        encode_agi(
-            &plan,
-            ag,
-            ino_count,
-            free_inos,
-            inobt_block,
-            &mut agi_buf,
-        );
+        encode_agi(&plan, ag, ino_count, free_inos, inobt_block, &mut agi_buf);
         let agi_sector_offset = AGI_SECTOR as usize * sectsize as usize;
         block0[agi_sector_offset..agi_sector_offset + sectsize as usize]
             .copy_from_slice(&agi_buf[..sectsize as usize]);
@@ -250,7 +247,8 @@ fn write_superblock(plan: &FormatPlan, file: &mut std::fs::File) -> Result<(), F
 
 /// Write `data` to the file at `offset`.
 fn write_at(file: &mut std::fs::File, offset: u64, data: &[u8]) -> Result<(), FormatError> {
-    file.seek(SeekFrom::Start(offset)).map_err(FormatError::Io)?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(FormatError::Io)?;
     file.write_all(data).map_err(FormatError::Io)?;
     Ok(())
 }
@@ -261,15 +259,15 @@ mod tests {
 
     fn make_plan() -> FormatPlan {
         let opts = FormatOptions {
-            path: "/tmp/test_format.img".into(),
-            size: Some(300 * 1024 * 1024),
+            path:      "/tmp/test_format.img".into(),
+            size:      Some(300 * 1024 * 1024),
             blocksize: 4096,
-            sectsize: 512,
+            sectsize:  512,
             inodesize: 256,
-            crc: true,
-            ftype: true,
-            force: true,
-            uuid: [0xab; 16],
+            crc:       true,
+            ftype:     true,
+            force:     true,
+            uuid:      [0xab; 16],
         };
         FormatPlan::new(&opts).expect("plan should succeed")
     }
@@ -277,15 +275,15 @@ mod tests {
     #[test]
     fn format_writes_superblock_magic() {
         let opts = FormatOptions {
-            path: "/tmp/test_format.img".into(),
-            size: Some(300 * 1024 * 1024),
+            path:      "/tmp/test_format.img".into(),
+            size:      Some(300 * 1024 * 1024),
             blocksize: 4096,
-            sectsize: 512,
+            sectsize:  512,
             inodesize: 256,
-            crc: true,
-            ftype: true,
-            force: true,
-            uuid: [0xab; 16],
+            crc:       true,
+            ftype:     true,
+            force:     true,
+            uuid:      [0xab; 16],
         };
         let result = format(&opts);
         assert!(result.is_ok(), "format should succeed: {:?}", result.err());
@@ -302,15 +300,15 @@ mod tests {
     #[test]
     fn format_produces_correct_size() {
         let opts = FormatOptions {
-            path: "/tmp/test_format_size.img".into(),
-            size: Some(100 * 1024 * 1024),
+            path:      "/tmp/test_format_size.img".into(),
+            size:      Some(100 * 1024 * 1024),
             blocksize: 4096,
-            sectsize: 512,
+            sectsize:  512,
             inodesize: 256,
-            crc: true,
-            ftype: true,
-            force: true,
-            uuid: [0; 16],
+            crc:       true,
+            ftype:     true,
+            force:     true,
+            uuid:      [0; 16],
         };
         let result = format(&opts);
         assert!(result.is_ok(), "format should succeed: {:?}", result.err());

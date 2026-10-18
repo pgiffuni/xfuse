@@ -52,44 +52,44 @@ pub struct FreeRun {
 }
 
 /// Magic numbers for the free space btrees.
-const XFS_ABTB_MAGIC: u32  = 0x4142_5442; // "ABTB" - BNO leaf v4
-const XFS_ABTC_MAGIC: u32  = 0x4142_5443; // "ABTC" - CNT leaf v4
-const XFS_AB3B_MAGIC: u32  = 0x4142_3342; // "AB3B" - BNO leaf v5 (CRC)
-const XFS_AB3C_MAGIC: u32  = 0x4142_3343; // "AB3C" - CNT leaf v5 (CRC)
+const XFS_ABTB_MAGIC: u32 = 0x4142_5442; // "ABTB" - BNO leaf v4
+const XFS_ABTC_MAGIC: u32 = 0x4142_5443; // "ABTC" - CNT leaf v4
+const XFS_AB3B_MAGIC: u32 = 0x4142_3342; // "AB3B" - BNO leaf v5 (CRC)
+const XFS_AB3C_MAGIC: u32 = 0x4142_3343; // "AB3C" - CNT leaf v5 (CRC)
 
 /// Offsets for a v5 free space btree leaf (with CRC header).
 mod v5_offset {
     /// Magic number.
-    pub const MAGIC:     usize = 0;
+    pub const MAGIC: usize = 0;
     /// Level (0 = leaf).
-    pub const LEVEL:     usize = 4;
+    pub const LEVEL: usize = 4;
     /// Number of records.
-    pub const NUMRECS:   usize = 6;
+    pub const NUMRECS: usize = 6;
     /// Left sibling block (or NULL_AGBLOCK).
-    pub const LEFTSIB:   usize = 8;
+    pub const LEFTSIB: usize = 8;
     /// Right sibling block (or NULL_AGBLOCK).
-    pub const RIGHTSIB:  usize = 12;
+    pub const RIGHTSIB: usize = 12;
     /// LSN (v5 only).
-    pub const LSN:       usize = 16;
+    pub const LSN: usize = 16;
     /// Owner (v5 only).
-    pub const OWNER:     usize = 24;
+    pub const OWNER: usize = 24;
     /// UUID (v5 only).
-    pub const UUID:      usize = 32;
+    pub const UUID: usize = 32;
     /// CRC (v5 only).
-    pub const CRC:       usize = 48;
+    pub const CRC: usize = 48;
     /// Records start here.
-    pub const RECORDS:   usize = 56;
+    pub const RECORDS: usize = 56;
 }
 
 /// Offsets for a v4 free space btree leaf (no CRC header).
 mod v4_offset {
-    pub const MAGIC:     usize = 0;
-    pub const LEVEL:     usize = 4;
-    pub const NUMRECS:   usize = 6;
-    pub const LEFTSIB:   usize = 8;
-    pub const RIGHTSIB:  usize = 12;
+    pub const MAGIC: usize = 0;
+    pub const LEVEL: usize = 4;
+    pub const NUMRECS: usize = 6;
+    pub const LEFTSIB: usize = 8;
+    pub const RIGHTSIB: usize = 12;
     /// Records start here.
-    pub const RECORDS:   usize = 16;
+    pub const RECORDS: usize = 16;
 }
 
 /// The null block marker.
@@ -174,11 +174,25 @@ enum HeaderOffsets {
 }
 
 impl HeaderOffsets {
-    fn magic(&self) -> usize { 0 }
-    fn level(&self) -> usize { 4 }
-    fn numrecs(&self) -> usize { 6 }
-    fn leftsib(&self) -> usize { 8 }
-    fn rightsib(&self) -> usize { 12 }
+    fn magic(&self) -> usize {
+        0
+    }
+
+    fn level(&self) -> usize {
+        4
+    }
+
+    fn numrecs(&self) -> usize {
+        6
+    }
+
+    fn leftsib(&self) -> usize {
+        8
+    }
+
+    fn rightsib(&self) -> usize {
+        12
+    }
 
     fn lsn(&self) -> usize {
         match self {
@@ -186,24 +200,28 @@ impl HeaderOffsets {
             HeaderOffsets::V5 => 16,
         }
     }
+
     fn owner(&self) -> usize {
         match self {
             HeaderOffsets::V4 => 16, // no owner in v4, maps to records start
             HeaderOffsets::V5 => 24,
         }
     }
+
     fn uuid(&self) -> usize {
         match self {
             HeaderOffsets::V4 => 16, // no uuid in v4
             HeaderOffsets::V5 => 32,
         }
     }
+
     fn crc(&self) -> usize {
         match self {
             HeaderOffsets::V4 => 16, // no crc in v4, maps to records start
             HeaderOffsets::V5 => 48,
         }
     }
+
     fn records(&self) -> usize {
         match self {
             HeaderOffsets::V4 => 16,
@@ -244,15 +262,15 @@ mod tests {
 
     fn make_plan() -> FormatPlan {
         let opts = crate::libxfuse::format::FormatOptions {
-            path: "/tmp/test.img".into(),
-            size: Some(300 * 1024 * 1024),
+            path:      "/tmp/test.img".into(),
+            size:      Some(300 * 1024 * 1024),
             blocksize: 4096,
-            sectsize: 512,
+            sectsize:  512,
             inodesize: 256,
-            crc: true,
-            ftype: true,
-            force: true,
-            uuid: [0xab; 16],
+            crc:       true,
+            ftype:     true,
+            force:     true,
+            uuid:      [0xab; 16],
         };
         FormatPlan::new(&opts).expect("plan should succeed")
     }
@@ -260,7 +278,10 @@ mod tests {
     #[test]
     fn bno_leaf_has_correct_magic_and_record() {
         let plan = make_plan();
-        let run = FreeRun { start: 7, len: 1000 };
+        let run = FreeRun {
+            start: 7,
+            len:   1000,
+        };
         let buf = build_free_space_leaf(&plan, true, run, 4);
 
         assert_eq!(
@@ -273,11 +294,7 @@ mod tests {
             0,
             "should be a leaf (level 0)"
         );
-        assert_eq!(
-            BigEndian::read_u16(&buf[6..8]),
-            1,
-            "should have 1 record"
-        );
+        assert_eq!(BigEndian::read_u16(&buf[6..8]), 1, "should have 1 record");
         assert_eq!(
             BigEndian::read_u32(&buf[56..60]),
             run.start,
@@ -299,7 +316,10 @@ mod tests {
     #[test]
     fn cnt_leaf_uses_different_magic() {
         let plan = make_plan();
-        let run = FreeRun { start: 7, len: 1000 };
+        let run = FreeRun {
+            start: 7,
+            len:   1000,
+        };
         let buf = build_free_space_leaf(&plan, false, run, 4);
 
         assert_eq!(
@@ -312,18 +332,21 @@ mod tests {
     #[test]
     fn v4_leaf_no_crc() {
         let opts = crate::libxfuse::format::FormatOptions {
-            path: "/tmp/test.img".into(),
-            size: Some(300 * 1024 * 1024),
+            path:      "/tmp/test.img".into(),
+            size:      Some(300 * 1024 * 1024),
             blocksize: 4096,
-            sectsize: 512,
+            sectsize:  512,
             inodesize: 256,
-            crc: false,
-            ftype: true,
-            force: true,
-            uuid: [0; 16],
+            crc:       false,
+            ftype:     true,
+            force:     true,
+            uuid:      [0; 16],
         };
         let plan = FormatPlan::new(&opts).expect("plan should succeed");
-        let run = FreeRun { start: 7, len: 1000 };
+        let run = FreeRun {
+            start: 7,
+            len:   1000,
+        };
         let buf = build_free_space_leaf(&plan, true, run, 4);
 
         assert_eq!(

@@ -55,10 +55,7 @@ const LOG_SECTSIZE: u64 = 512;
 ///
 /// Writes a clean log: the log area is zeroed, and a dummy log record header
 /// is written at the start to mark it as a valid (empty) log.
-pub fn initialize_log(
-    plan: &FormatPlan,
-    mut write_block: impl FnMut(u64, &[u8]),
-) {
+pub fn initialize_log(plan: &FormatPlan, mut write_block: impl FnMut(u64, &[u8])) {
     let blocksize = plan.blocksize as usize;
     let log_offset_bytes = plan.log.offset;
     let log_blocks = plan.log.blocks as usize;
@@ -106,15 +103,15 @@ mod tests {
 
     fn make_plan() -> FormatPlan {
         let opts = FormatOptions {
-            path: "/tmp/test.img".into(),
-            size: Some(300 * 1024 * 1024),
+            path:      "/tmp/test.img".into(),
+            size:      Some(300 * 1024 * 1024),
             blocksize: 4096,
-            sectsize: 512,
+            sectsize:  512,
             inodesize: 256,
-            crc: true,
-            ftype: true,
-            force: true,
-            uuid: [0xef; 16],
+            crc:       true,
+            ftype:     true,
+            force:     true,
+            uuid:      [0xef; 16],
         };
         FormatPlan::new(&opts).expect("plan should succeed")
     }

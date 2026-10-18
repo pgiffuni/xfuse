@@ -46,28 +46,28 @@ use crc::{Crc, CRC_32_ISCSI};
 use super::plan::FormatPlan;
 
 /// Inode btree magic numbers.
-const XFS_INOBT_MAGIC: u32    = 0x4941_4254; // "IABT" - v4
+const XFS_INOBT_MAGIC: u32 = 0x4941_4254; // "IABT" - v4
 const XFS_INOBT_CRC_MAGIC: u32 = 0x4941_4233; // "IAB3" - v5 (CRC)
 
 /// Byte offsets within an inode btree node.
 mod offset {
-    pub const MAGIC:      usize = 0;
-    pub const LEVEL:      usize = 4;
-    pub const NUMRECS:    usize = 6;
-    pub const LEFTSIB:    usize = 8;
-    pub const RIGHTSIB:   usize = 12;
+    pub const MAGIC: usize = 0;
+    pub const LEVEL: usize = 4;
+    pub const NUMRECS: usize = 6;
+    pub const LEFTSIB: usize = 8;
+    pub const RIGHTSIB: usize = 12;
     /// Records start here for v4.
     pub const BODY_NO_CRC: usize = 16;
     /// Records start here for v5.
-    pub const BODY_CRC:   usize = 56;
+    pub const BODY_CRC: usize = 56;
     /// LSN starts here for v5.
-    pub const LSN:        usize = 16;
+    pub const LSN: usize = 16;
     /// Owner starts here for v5.
-    pub const OWNER:      usize = 24;
+    pub const OWNER: usize = 24;
     /// UUID starts here for v5.
-    pub const UUID:       usize = 32;
+    pub const UUID: usize = 32;
     /// CRC starts here for v5.
-    pub const CRC:        usize = 48;
+    pub const CRC: usize = 48;
 }
 
 /// The null block marker for sibling pointers.
@@ -196,7 +196,7 @@ pub fn build_inobt_ag0(
     // inode 2 is slot 2 within it.
 
     let chunk_start_ino: u64 = 0; // First chunk starts at inode 0 within the group.
-    // Ino 2 (root dir) is used: bit 2.
+                                  // Ino 2 (root dir) is used: bit 2.
     let used_mask: u64 = 1u64 << 2; // bit 2 = ino 2 (relative to chunk start)
 
     let buf = build_inobt_leaf(plan, agno, inobt_block, chunk_start_ino, used_mask);
@@ -226,15 +226,15 @@ mod tests {
 
     fn make_plan() -> FormatPlan {
         let opts = crate::libxfuse::format::FormatOptions {
-            path: "/tmp/test.img".into(),
-            size: Some(300 * 1024 * 1024),
+            path:      "/tmp/test.img".into(),
+            size:      Some(300 * 1024 * 1024),
             blocksize: 4096,
-            sectsize: 512,
+            sectsize:  512,
             inodesize: 256,
-            crc: true,
-            ftype: true,
-            force: true,
-            uuid: [0xba; 16],
+            crc:       true,
+            ftype:     true,
+            force:     true,
+            uuid:      [0xba; 16],
         };
         FormatPlan::new(&opts).expect("plan should succeed")
     }
@@ -288,15 +288,15 @@ mod tests {
     #[test]
     fn v4_inobt_leaf_no_crc() {
         let opts = crate::libxfuse::format::FormatOptions {
-            path: "/tmp/test.img".into(),
-            size: Some(300 * 1024 * 1024),
+            path:      "/tmp/test.img".into(),
+            size:      Some(300 * 1024 * 1024),
             blocksize: 4096,
-            sectsize: 512,
+            sectsize:  512,
             inodesize: 256,
-            crc: false,
-            ftype: true,
-            force: true,
-            uuid: [0; 16],
+            crc:       false,
+            ftype:     true,
+            force:     true,
+            uuid:      [0; 16],
         };
         let plan = FormatPlan::new(&opts).expect("plan should succeed");
         let buf = build_inobt_leaf(&plan, 0, 6, 0, 1u64 << 2);

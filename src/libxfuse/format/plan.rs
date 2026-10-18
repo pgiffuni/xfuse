@@ -37,8 +37,10 @@
 //! for the on-disk layout, and [`docs/xfs-algorithms.md`](../../../docs/xfs-algorithms.md)
 //! for the algorithm map.
 
-use crate::libxfuse::alloc::free_space::GroupGeometry;
-use crate::libxfuse::definitions::{XfsAgblock, XfsFsblock};
+use crate::libxfuse::{
+    alloc::free_space::GroupGeometry,
+    definitions::{XfsAgblock, XfsFsblock},
+};
 
 /// The log position within the image.
 #[derive(Clone, Copy, Debug)]
@@ -46,40 +48,40 @@ pub struct LogGeometry {
     /// The first filesystem block of the log.
     pub start_block: u64,
     /// How many filesystem blocks the log spans.
-    pub blocks:    u32,
+    pub blocks:      u32,
     /// The offset in bytes where the log starts.
-    pub offset:    u64,
+    pub offset:      u64,
 }
 
 /// The geometry of one allocation group's metadata.
 #[derive(Clone, Copy, Debug)]
 pub struct AgGeometry {
     /// The allocation group number.
-    pub agno:     u32,
+    pub agno:         u32,
     /// The first filesystem block of the group.
-    pub start:    u64,
+    pub start:        u64,
     /// How many blocks the group has.
-    pub blocks:   u32,
+    pub blocks:       u32,
     /// Block 0: superblock (v4 always, v5 only for ag 0).
-    pub sb_block: u32,
+    pub sb_block:     u32,
     /// Block 1: AGF.
-    pub agf:      u32,
+    pub agf:          u32,
     /// Block 2: AGI.
-    pub agi:      u32,
+    pub agi:          u32,
     /// Block 3: AGFL.
-    pub agfl:     u32,
+    pub agfl:         u32,
     /// Block 4: free space BNO tree root.
-    pub bno_root: u32,
+    pub bno_root:     u32,
     /// Block 5: free space CNT tree root.
-    pub cnt_root: u32,
+    pub cnt_root:     u32,
     /// Block 6+: inode btree root.
-    pub inobt:    u32,
+    pub inobt:        u32,
     /// First inode chunk block (typically after the 3 btree roots).
-    pub chunk_start: u32,
+    pub chunk_start:  u32,
     /// First free data block.
-    pub data_start: u32,
+    pub data_start:   u32,
     /// How many free blocks the AG has.
-    pub free_blocks: u32,
+    pub free_blocks:  u32,
     /// How many blocks are reserved for metadata btrees.
     pub btree_blocks: u32,
 }
@@ -88,57 +90,57 @@ pub struct AgGeometry {
 #[derive(Clone, Debug)]
 pub struct FormatPlan {
     /// Filesystem geometry.
-    pub blocksize:   u32,
-    pub sectsize:    u16,
-    pub agblocks:    u32,
-    pub agcount:     u32,
-    pub inodesize:   u16,
+    pub blocksize:    u32,
+    pub sectsize:     u16,
+    pub agblocks:     u32,
+    pub agcount:      u32,
+    pub inodesize:    u16,
     pub total_blocks: u64,
 
     /// Feature flags.
-    pub has_crc:     bool,
-    pub has_ftype:   bool,
+    pub has_crc:   bool,
+    pub has_ftype: bool,
 
     /// Inode geometry.
-    pub inode_version: i8,
+    pub inode_version:    i8,
     pub inodes_per_block: u32,
 
-        /// Free space geometry.
-        pub group_geometry: GroupGeometry,
+    /// Free space geometry.
+    pub group_geometry: GroupGeometry,
 
     /// Allocation group layout.
-    pub ags:         Vec<AgGeometry>,
+    pub ags: Vec<AgGeometry>,
 
     /// Log.
-    pub log:         LogGeometry,
+    pub log: LogGeometry,
 
     /// Inode allocation.
     /// Number of inode chunks per AG (typically 1 for small filesystems).
     pub chunks_per_ag: u32,
 
     /// Root inode number.
-    pub root_ino:    u64,
+    pub root_ino: u64,
 
     /// UUID.
-    pub uuid:        [u8; 16],
+    pub uuid: [u8; 16],
 
     /// Sector size log2.
-    pub sectlog:     u8,
+    pub sectlog: u8,
 
     /// Block size log2.
-    pub blocklog:    u8,
+    pub blocklog: u8,
 
     /// Inode size log2.
-    pub inodelog:    u8,
+    pub inodelog: u8,
 
     /// Inodes per block log2.
-    pub inopblog:    u8,
+    pub inopblog: u8,
 
     /// AG blocks log2.
-    pub agblklog:    u8,
+    pub agblklog: u8,
 
     /// Directory block log2.
-    pub dirblklog:   u8,
+    pub dirblklog: u8,
 
     /// sb_fdblocks: total free data blocks across all groups.
     pub free_blocks: u64,
@@ -150,10 +152,10 @@ pub struct FormatPlan {
     pub free_inodes: u64,
 
     /// sb_logblocks
-    pub log_blocks:  u32,
+    pub log_blocks: u32,
 
     /// sb_logstart
-    pub log_start:   u64,
+    pub log_start: u64,
 }
 
 /// The reserved inode numbers.
@@ -313,12 +315,12 @@ impl FormatPlan {
             let chunk_blocks = ((INODES_PER_CHUNK - 1) / inopblock as u32) + 1;
             // Align chunk start to a block boundary.
             let chunk_start = reserved_per_ag + 3; // skip 4 btree roots? No...
-            // Actually: blocks 0-3 are headers, block 4 is BNO root, block 5 is CNT root,
-            // block 6+ is the inode chunk area.
-            // Need to account for the fact that the first chunk needs chunk_blocks blocks.
-            // The inode btree root is typically inline in the AGI, or at block 6.
-            // For a single-chunk AG, the inobt root is at block 6 and the first chunk
-            // is at block 7+.
+                                                   // Actually: blocks 0-3 are headers, block 4 is BNO root, block 5 is CNT root,
+                                                   // block 6+ is the inode chunk area.
+                                                   // Need to account for the fact that the first chunk needs chunk_blocks blocks.
+                                                   // The inode btree root is typically inline in the AGI, or at block 6.
+                                                   // For a single-chunk AG, the inobt root is at block 6 and the first chunk
+                                                   // is at block 7+.
 
             // For simplicity, let's use: blocks 0-3 = headers, block 4 = BNO root leaf,
             // block 5 = CNT root leaf, block 6 = inobt root leaf, block 7..7+chunk_blocks =
@@ -402,14 +404,12 @@ impl FormatPlan {
             has_ftype,
             inode_version,
             inodes_per_block: inopblock as u32,
-            group_geometry: GroupGeometry::new(
-                agblocks, has_crc, true,
-            ),
+            group_geometry: GroupGeometry::new(agblocks, has_crc, true),
             ags,
             log: LogGeometry {
                 start_block: log_start,
-                blocks: log_blocks,
-                offset: log_start * blocksize as u64,
+                blocks:      log_blocks,
+                offset:      log_start * blocksize as u64,
             },
             chunks_per_ag: 1,
             root_ino: reserved_inodes::ROOT,
@@ -447,16 +447,13 @@ impl FormatPlan {
     /// The inode number for a given AG, block, and slot.
     pub fn make_ino(&self, agno: u32, agbno: u32, slot: u16) -> u64 {
         let block_bits = self.agblklog + self.inopblog;
-        (u64::from(agno) << block_bits)
-            | (u64::from(agbno) << self.inopblog)
-            | u64::from(slot)
+        (u64::from(agno) << block_bits) | (u64::from(agbno) << self.inopblog) | u64::from(slot)
     }
 
     /// The byte offset of an inode.
     pub fn inode_offset(&self, ino: u64) -> u64 {
         let agno = ino >> (self.agblklog + self.inopblog);
-        let agbno =
-            (ino >> self.inopblog) & ((1u64 << self.agblklog) - 1);
+        let agbno = (ino >> self.inopblog) & ((1u64 << self.agblklog) - 1);
         let slot = ino & ((1u64 << self.inopblog) - 1);
         agno * self.fsb_to_offset(self.agblocks as u64)
             + agbno * self.blocksize as u64
@@ -489,27 +486,19 @@ impl FormatPlan {
         let agbno = (ino >> self.inopblog) & ((1u64 << self.agblklog) - 1);
         let slot = ino & ((1u64 << self.inopblog) - 1);
         InodeLocation {
-            agno: agno as u32,
+            agno:  agno as u32,
             agbno: agbno as u32,
-            slot: slot as u16,
+            slot:  slot as u16,
         }
     }
 
     /// The free space tree geometry for this filesystem.
     pub fn by_block_geometry(&self) -> GroupGeometry {
-        GroupGeometry::new(
-            self.agblocks,
-            self.has_crc,
-            true,
-        )
+        GroupGeometry::new(self.agblocks, self.has_crc, true)
     }
 
     pub fn by_size_geometry(&self) -> GroupGeometry {
-        GroupGeometry::new(
-            self.agblocks,
-            self.has_crc,
-            false,
-        )
+        GroupGeometry::new(self.agblocks, self.has_crc, false)
     }
 
     /// Whether the ftype feature is enabled (for v5: in sb_features_incompat).
@@ -551,10 +540,7 @@ fn is_valid_inodesize(inodesize: u16, blocksize: u32) -> bool {
 }
 
 /// Compute allocation group geometry.
-fn compute_ag_geometry(
-    total_blocks: u64,
-    _blocksize: u32,
-) -> Result<(u32, u32), FormatError> {
+fn compute_ag_geometry(total_blocks: u64, _blocksize: u32) -> Result<(u32, u32), FormatError> {
     // XFS minimum AG size: at least 24000 blocks for the smallest valid FS,
     // but in practice mkfs.xfs uses larger minimums.
     // For small filesystems, use fewer AGs.
@@ -622,37 +608,37 @@ fn _compute_log_start(
 #[derive(Clone, Debug)]
 pub struct FormatOptions {
     /// Target image path.
-    pub path:    std::path::PathBuf,
+    pub path:      std::path::PathBuf,
     /// Filesystem size in bytes (if None, from the target file).
-    pub size:    Option<u64>,
+    pub size:      Option<u64>,
     /// Block size in bytes.
     pub blocksize: u32,
     /// Sector size in bytes.
-    pub sectsize: u16,
+    pub sectsize:  u16,
     /// Inode size in bytes.
     pub inodesize: u16,
     /// Whether to enable CRC (requires v5).
-    pub crc:     bool,
+    pub crc:       bool,
     /// Whether to enable ftype (directory entry file types).
-    pub ftype:   bool,
+    pub ftype:     bool,
     /// Force format even if target exists.
-    pub force:   bool,
+    pub force:     bool,
     /// UUID for the filesystem.
-    pub uuid:    [u8; 16],
+    pub uuid:      [u8; 16],
 }
 
 impl Default for FormatOptions {
     fn default() -> Self {
         Self {
-            path:       std::path::PathBuf::new(),
-            size:       None,
-            blocksize:  4096,
-            sectsize:   512,
-            inodesize:  256,
-            crc:        true,
-            ftype:      true,
-            force:      false,
-            uuid:       [0; 16],
+            path:      std::path::PathBuf::new(),
+            size:      None,
+            blocksize: 4096,
+            sectsize:  512,
+            inodesize: 256,
+            crc:       true,
+            ftype:     true,
+            force:     false,
+            uuid:      [0; 16],
         }
     }
 }
@@ -690,15 +676,15 @@ mod tests {
     #[test]
     fn minimal_format_plan_succeeds() {
         let opts = FormatOptions {
-            path: "/tmp/test_xfs.img".into(),
-            size: Some(300 * 1024 * 1024), // 300MB
+            path:      "/tmp/test_xfs.img".into(),
+            size:      Some(300 * 1024 * 1024), // 300MB
             blocksize: 4096,
-            sectsize: 512,
+            sectsize:  512,
             inodesize: 256,
-            crc: true,
-            ftype: true,
-            force: true,
-            uuid: [0; 16],
+            crc:       true,
+            ftype:     true,
+            force:     true,
+            uuid:      [0; 16],
         };
         let plan = FormatPlan::new(&opts);
         assert!(plan.is_ok(), "plan should succeed: {:?}", plan.err());
@@ -712,15 +698,15 @@ mod tests {
     #[test]
     fn too_small_filesystem_rejected() {
         let opts = FormatOptions {
-            path: "/tmp/test_xfs.img".into(),
-            size: Some(1024 * 1024), // 1MB - too small
+            path:      "/tmp/test_xfs.img".into(),
+            size:      Some(1024 * 1024), // 1MB - too small
             blocksize: 4096,
-            sectsize: 512,
+            sectsize:  512,
             inodesize: 256,
-            crc: true,
-            ftype: true,
-            force: true,
-            uuid: [0; 16],
+            crc:       true,
+            ftype:     true,
+            force:     true,
+            uuid:      [0; 16],
         };
         let plan = FormatPlan::new(&opts);
         assert!(plan.is_err(), "should reject too-small filesystem");

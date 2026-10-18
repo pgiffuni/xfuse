@@ -92,24 +92,24 @@
 //! | 224    | 4    | sb_crc (v5 only)    |
 //! | 228    | ...  | sb_crc_terminator / padding to sector size |
 
-use byteorder::{BigEndian, LittleEndian, ByteOrder};
+use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use crc::{Crc, CRC_32_ISCSI};
 
 use super::plan::FormatPlan;
 
 /// sb_features2 bit flags.
 const SB_FEAT2_LAZYSBCOUNT: u32 = 0x00000002;
-const SB_FEAT2_CRC: u32    = 0x00000100;
-const SB_FEAT2_FTYPE: u32  = 0x00000200;
+const SB_FEAT2_CRC: u32 = 0x00000100;
+const SB_FEAT2_FTYPE: u32 = 0x00000200;
 
 /// sb_features_incompat bit flags.
-const SB_FEAT_INCOMPAT_FTYPE: u32    = 0x00000001;
+const SB_FEAT_INCOMPAT_FTYPE: u32 = 0x00000001;
 const SB_FEAT_INCOMPAT_SPINODES: u32 = 0x00000002;
-const SB_FEAT_INCOMPAT_BIGTIME: u32  = 0x00000008;
+const SB_FEAT_INCOMPAT_BIGTIME: u32 = 0x00000008;
 
 /// sb_features_ro_compat bit flags.
-const SB_FEAT_RO_LAZYSBCOUNT: u32     = 0x00000001;
-const SB_FEAT_RO_METADATA_CRC: u32    = 0x00000004;
+const SB_FEAT_RO_LAZYSBCOUNT: u32 = 0x00000001;
+const SB_FEAT_RO_METADATA_CRC: u32 = 0x00000004;
 
 /// sb_flags bit flags.
 const SB_FLAG_READONLY: u8 = 0x01;
@@ -312,8 +312,8 @@ pub fn encode_superblock(plan: &FormatPlan, buf: &mut [u8]) {
         // field itself zeroed.
         let crc_algo = Crc::<u32>::new(&CRC_32_ISCSI);
         let mut digest = crc_algo.digest();
-        digest.update(&buf[..224]);      // bytes before CRC field
-        digest.update(&[0u8; 4]);         // the CRC field itself, zeroed
+        digest.update(&buf[..224]); // bytes before CRC field
+        digest.update(&[0u8; 4]); // the CRC field itself, zeroed
         if sectsize > 228 {
             digest.update(&buf[228..sectsize]); // tail after CRC field
         }
@@ -342,15 +342,15 @@ mod tests {
     #[test]
     fn superblock_encodes_and_parses() {
         let opts = super::super::plan::FormatOptions {
-            path: "/tmp/test.img".into(),
-            size: Some(300 * 1024 * 1024),
+            path:      "/tmp/test.img".into(),
+            size:      Some(300 * 1024 * 1024),
             blocksize: 4096,
-            sectsize: 512,
+            sectsize:  512,
             inodesize: 256,
-            crc: true,
-            ftype: true,
-            force: true,
-            uuid: [0; 16],
+            crc:       true,
+            ftype:     true,
+            force:     true,
+            uuid:      [0; 16],
         };
         let plan = FormatPlan::new(&opts).expect("plan should succeed");
 
@@ -358,17 +358,10 @@ mod tests {
         encode_superblock(&plan, &mut buf);
 
         // Verify magic number.
-        assert_eq!(
-            BigEndian::read_u32(&buf[0..4]),
-            0x58465342,
-            "bad magic"
-        );
+        assert_eq!(BigEndian::read_u32(&buf[0..4]), 0x58465342, "bad magic");
 
         // Verify block size.
-        assert_eq!(
-            BigEndian::read_u32(&buf[4..8]),
-            4096
-        );
+        assert_eq!(BigEndian::read_u32(&buf[4..8]), 4096);
 
         // Verify version number.
         let ver = BigEndian::read_u16(&buf[100..102]);
@@ -383,15 +376,15 @@ mod tests {
     #[test]
     fn v4_superblock_encodes() {
         let opts = super::super::plan::FormatOptions {
-            path: "/tmp/test.img".into(),
-            size: Some(300 * 1024 * 1024),
+            path:      "/tmp/test.img".into(),
+            size:      Some(300 * 1024 * 1024),
             blocksize: 4096,
-            sectsize: 512,
+            sectsize:  512,
             inodesize: 256,
-            crc: false,
-            ftype: true,
-            force: true,
-            uuid: [0; 16],
+            crc:       false,
+            ftype:     true,
+            force:     true,
+            uuid:      [0; 16],
         };
         let plan = FormatPlan::new(&opts).expect("plan should succeed");
 

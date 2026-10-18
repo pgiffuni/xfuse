@@ -48,55 +48,55 @@ use crate::libxfuse::definitions::XfsAgblock;
 /// AGF field offsets (within the 4-byte-aligned header).
 /// These match the offsets used in `crate::libxfuse::alloc::agf`.
 mod agf_offset {
-    pub const MAGIC:     usize = 0;
-    pub const VERSION:   usize = 4;
-    pub const SEQNO:     usize = 8;
-    pub const LENGTH:    usize = 12;
-    pub const BNOROOT:   usize = 16;
-    pub const CNTROOT:   usize = 20;
+    pub const MAGIC: usize = 0;
+    pub const VERSION: usize = 4;
+    pub const SEQNO: usize = 8;
+    pub const LENGTH: usize = 12;
+    pub const BNOROOT: usize = 16;
+    pub const CNTROOT: usize = 20;
     pub const BNORELEVEL: usize = 28;
     pub const CNTRELEVEL: usize = 32;
-    pub const FLFIRST:   usize = 40;
-    pub const FLLAST:    usize = 44;
-    pub const FLCOUNT:   usize = 48;
-    pub const FREEBLKS:  usize = 52;
-    pub const LONGEST:   usize = 56;
+    pub const FLFIRST: usize = 40;
+    pub const FLLAST: usize = 44;
+    pub const FLCOUNT: usize = 48;
+    pub const FREEBLKS: usize = 52;
+    pub const LONGEST: usize = 56;
     pub const BTREEBLKS: usize = 60;
-    pub const UUID:      usize = 64;
-    pub const LSN:       usize = 208;
-    pub const CRC:       usize = 216;
+    pub const UUID: usize = 64;
+    pub const LSN: usize = 208;
+    pub const CRC: usize = 216;
     /// The number of bytes the structure occupies, checksum and trailing uuid included.
     pub const LENGTH_OF_STRUCT: usize = 236;
 }
 
 /// AGI field offsets.
 mod agi_offset {
-    pub const MAGIC:     usize = 0;
-    pub const VERSION:   usize = 4;
-    pub const SEQNO:     usize = 8;
-    pub const LENGTH:    usize = 12;
-    pub const ILENGTH:   usize = 16;
+    pub const MAGIC: usize = 0;
+    pub const VERSION: usize = 4;
+    pub const SEQNO: usize = 8;
+    pub const LENGTH: usize = 12;
+    pub const ILENGTH: usize = 16;
     pub const INOBT_ROOT: usize = 20;
     pub const INOBT_LEVEL: usize = 24;
     pub const FREECOUNT: usize = 28;
-    pub const NEWINO:    usize = 32;
-    pub const _PAD:      usize = 36; // padding
-    pub const UUID:      usize = 40; // v5 adds UUID after the common part
+    pub const NEWINO: usize = 32;
+    pub const _PAD: usize = 36; // padding
+    pub const UUID: usize = 40; // v5 adds UUID after the common part
 }
 
 /// AGFL field offsets.
 mod agfl_offset {
-    pub const MAGIC:  usize = 0;
-    pub const SEQNO:  usize = 4;
-    pub const UUID:   usize = 8;
-    pub const LSN:    usize = 24;
+    pub const MAGIC: usize = 0;
+    pub const SEQNO: usize = 4;
+    pub const UUID: usize = 8;
+    pub const LSN: usize = 24;
     /// The checksum, on a file system that has one.
-    pub const CRC:    usize = 32;
+    pub const CRC: usize = 32;
     /// Where the array of block numbers begins on a file system that has no
     /// checksum.
     pub const ARRAY_NO_CRC: usize = 32;
     /// Where it begins on a file system that has one.
-    pub const ARRAY:    usize = 36;
+    pub const ARRAY: usize = 36;
 }
 
 /// The AGF magic number.
@@ -200,15 +200,15 @@ pub fn encode_agf(
 
 /// AGI field offsets - re-defined from the actual layout in agi.rs.
 mod agi_real_offset {
-    pub const MAGIC:     usize = 0;
-    pub const VERSION:   usize = 4;
-    pub const SEQNO:     usize = 8;
-    pub const LENGTH:    usize = 12;
-    pub const ILENGTH:   usize = 16;
+    pub const MAGIC: usize = 0;
+    pub const VERSION: usize = 4;
+    pub const SEQNO: usize = 8;
+    pub const LENGTH: usize = 12;
+    pub const ILENGTH: usize = 16;
     pub const INOBT_ROOT: usize = 20;
     pub const INOBT_LEVEL: usize = 24;
     pub const FREECOUNT: usize = 28;
-    pub const NEWINO:    usize = 32;
+    pub const NEWINO: usize = 32;
 }
 
 /// Encode the AGI header for a group into `buf`.
@@ -282,11 +282,7 @@ pub fn encode_agi(
 /// The AGFL is a fixed-size block that holds an array of free block numbers.
 /// The free list array starts at different offsets depending on whether CRC
 /// is enabled.
-pub fn encode_agfl(
-    plan: &FormatPlan,
-    ag: &AgGeometry,
-    buf: &mut [u8],
-) {
+pub fn encode_agfl(plan: &FormatPlan, ag: &AgGeometry, buf: &mut [u8]) {
     let blocksize = plan.blocksize as usize;
     assert!(buf.len() >= blocksize, "AGFL buffer too small");
 
@@ -353,15 +349,15 @@ mod tests {
 
     fn make_plan() -> FormatPlan {
         let opts = crate::libxfuse::format::FormatOptions {
-            path: "/tmp/test.img".into(),
-            size: Some(300 * 1024 * 1024),
+            path:      "/tmp/test.img".into(),
+            size:      Some(300 * 1024 * 1024),
             blocksize: 4096,
-            sectsize: 512,
+            sectsize:  512,
             inodesize: 256,
-            crc: true,
-            ftype: true,
-            force: true,
-            uuid: [0xab; 16],
+            crc:       true,
+            ftype:     true,
+            force:     true,
+            uuid:      [0xab; 16],
         };
         FormatPlan::new(&opts).expect("plan should succeed")
     }
@@ -374,16 +370,25 @@ mod tests {
         encode_agf(&plan, ag, 1000, 1000, 3, 4, 5, &mut buf);
 
         // Check magic
-        assert_eq!(BigEndian::read_u32(&buf[agf_offset::MAGIC..]), XFS_AGF_MAGIC);
+        assert_eq!(
+            BigEndian::read_u32(&buf[agf_offset::MAGIC..]),
+            XFS_AGF_MAGIC
+        );
 
         // Check version
-        assert_eq!(BigEndian::read_u32(&buf[agf_offset::VERSION..]), AGF_VERSION);
+        assert_eq!(
+            BigEndian::read_u32(&buf[agf_offset::VERSION..]),
+            AGF_VERSION
+        );
 
         // Check seqno
         assert_eq!(BigEndian::read_u32(&buf[agf_offset::SEQNO..]), ag.agno);
 
         // Check length
-        assert_eq!(BigEndian::read_u32(&buf[agf_offset::LENGTH..]), plan.agblocks);
+        assert_eq!(
+            BigEndian::read_u32(&buf[agf_offset::LENGTH..]),
+            plan.agblocks
+        );
 
         // Check free blocks
         assert_eq!(BigEndian::read_u32(&buf[agf_offset::FREEBLKS..]), 1000);
@@ -406,8 +411,14 @@ mod tests {
         let mut buf = vec![0u8; 4096];
         encode_agi(&plan, ag, 64, 63, 6, &mut buf);
 
-        assert_eq!(BigEndian::read_u32(&buf[agi_real_offset::MAGIC..]), XFS_AGI_MAGIC);
-        assert_eq!(BigEndian::read_u32(&buf[agi_real_offset::VERSION..]), AGI_VERSION);
+        assert_eq!(
+            BigEndian::read_u32(&buf[agi_real_offset::MAGIC..]),
+            XFS_AGI_MAGIC
+        );
+        assert_eq!(
+            BigEndian::read_u32(&buf[agi_real_offset::VERSION..]),
+            AGI_VERSION
+        );
         assert_eq!(BigEndian::read_u32(&buf[agi_real_offset::ILENGTH..]), 64);
         assert_eq!(BigEndian::read_u32(&buf[agi_real_offset::FREECOUNT..]), 63);
         assert_eq!(BigEndian::read_u32(&buf[agi_real_offset::NEWINO..]), 10);
@@ -420,7 +431,10 @@ mod tests {
         let mut buf = vec![0u8; 4096];
         encode_agfl(&plan, ag, &mut buf);
 
-        assert_eq!(BigEndian::read_u32(&buf[agfl_offset::MAGIC..]), XFS_AGFL_MAGIC);
+        assert_eq!(
+            BigEndian::read_u32(&buf[agfl_offset::MAGIC..]),
+            XFS_AGFL_MAGIC
+        );
         assert_eq!(BigEndian::read_u32(&buf[agfl_offset::SEQNO..]), ag.agno);
         assert_eq!(&buf[agfl_offset::UUID..agfl_offset::UUID + 16], &[0xab; 16]);
 

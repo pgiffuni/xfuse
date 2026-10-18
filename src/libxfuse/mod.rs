@@ -52,14 +52,12 @@ mod bmbt_rec;
 mod btree;
 #[allow(dead_code)]
 mod capabilities;
+#[allow(dead_code)]
+pub mod check;
 mod da_btree;
 mod definitions;
 #[allow(dead_code)]
 mod delayed_alloc;
-#[allow(dead_code)]
-pub mod format;
-#[allow(dead_code)]
-pub mod check;
 mod dinode;
 mod dinode_core;
 mod dir3;
@@ -70,6 +68,8 @@ mod dir3_sf;
 mod error;
 #[allow(dead_code)]
 mod extent;
+#[allow(dead_code)]
+pub mod format;
 #[allow(dead_code)]
 mod inode;
 #[allow(dead_code)]

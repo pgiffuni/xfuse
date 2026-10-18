@@ -26,23 +26,22 @@
  */
 //! Integration tests for the `newfs.xfs` formatter binary.
 
-use std::fs;
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
-use xfs_fuse::libxfuse::format::{FormatOptions, FormatPlan, format};
+use xfs_fuse::libxfuse::format::{format, FormatOptions, FormatPlan};
 
 /// Create format options for a small test filesystem.
 fn test_opts(path: &str, size: u64) -> FormatOptions {
     FormatOptions {
-        path: PathBuf::from(path),
-        size: Some(size),
+        path:      PathBuf::from(path),
+        size:      Some(size),
         blocksize: 4096,
-        sectsize: 512,
+        sectsize:  512,
         inodesize: 256,
-        crc: true,
-        ftype: true,
-        force: true,
-        uuid: [0xab; 16],
+        crc:       true,
+        ftype:     true,
+        force:     true,
+        uuid:      [0xab; 16],
     }
 }
 
@@ -131,15 +130,15 @@ fn format_writes_agf_at_correct_offset() {
 fn format_v4_works() {
     let path = "/tmp/xfs_format_test_v4.img";
     let opts = FormatOptions {
-        path: PathBuf::from(path),
-        size: Some(300 * 1024 * 1024),
+        path:      PathBuf::from(path),
+        size:      Some(300 * 1024 * 1024),
         blocksize: 4096,
-        sectsize: 512,
+        sectsize:  512,
         inodesize: 256,
-        crc: false,
-        ftype: true,
-        force: true,
-        uuid: [0xcd; 16],
+        crc:       false,
+        ftype:     true,
+        force:     true,
+        uuid:      [0xcd; 16],
     };
     let result = format(&opts);
     assert!(result.is_ok(), "format v4 failed: {:?}", result.err());
@@ -151,7 +150,10 @@ fn format_v4_works() {
     assert_eq!(version, 4, "v4 filesystem should have version 4");
     // v4 has no features2 CRC bit.
     let features2 = u32::from_be_bytes(data[200..204].try_into().unwrap());
-    assert!(features2 & 0x100 == 0, "v4 filesystem should not have CRC feature");
+    assert!(
+        features2 & 0x100 == 0,
+        "v4 filesystem should not have CRC feature"
+    );
 
     fs::remove_file(path).ok();
 }
@@ -166,5 +168,8 @@ fn format_dry_run_does_not_write() {
     assert!(plan.is_ok(), "plan should succeed");
 
     // The file should not exist yet.
-    assert!(!std::path::Path::new(path).exists(), "file should not be created on dry run");
+    assert!(
+        !std::path::Path::new(path).exists(),
+        "file should not be created on dry run"
+    );
 }

@@ -30,11 +30,10 @@
 //! This is a simplified reimplementation of the userspace `mkfs.xfs` tool,
 //! with no dependency on xfsprogs.
 
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::{path::PathBuf, process::ExitCode};
 
 use clap::Parser;
-use xfs_fuse::libxfuse::format::{FormatOptions, format, FormatPlan};
+use xfs_fuse::libxfuse::format::{format, FormatOptions, FormatPlan};
 
 /// Format a file or device with an XFS filesystem.
 #[derive(Parser, Debug)]
@@ -61,7 +60,12 @@ struct Cli {
     blocksize: u32,
 
     /// Sector size in bytes (512 or 4096).
-    #[arg(short = 'S', long = "sectsize", default_value_t = 512, requires = "force")]
+    #[arg(
+        short = 'S',
+        long = "sectsize",
+        default_value_t = 512,
+        requires = "force"
+    )]
     sectsize: u16,
 
     /// Inode size in bytes (256, 512, etc.).
@@ -81,15 +85,15 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let opts = FormatOptions {
-        path: cli.target.clone(),
-        size: cli.size.or(Some(1024 * 1024 * 1024)),
+        path:      cli.target.clone(),
+        size:      cli.size.or(Some(1024 * 1024 * 1024)),
         blocksize: cli.blocksize,
-        sectsize: cli.sectsize,
+        sectsize:  cli.sectsize,
         inodesize: cli.inodesize,
-        crc: cli.crc,
-        ftype: cli.ftype,
-        force: cli.force,
-        uuid: generate_uuid(),
+        crc:       cli.crc,
+        ftype:     cli.ftype,
+        force:     cli.force,
+        uuid:      generate_uuid(),
     };
 
     // Validate the plan.
