@@ -16,8 +16,8 @@
 //!
 //! Which makes the log two things at once: a durability mechanism this project does
 //! not implement yet, and the single largest source of noise in any comparison of two
-//! images.  Hence [XLOG_HEADER_MAGIC_NUM] and [Sb::log_blocks()] -- see
-//! [`crate::sb::Sb`] -- which together let an image comparison *exclude* a journal
+//! images.  Hence `XLOG_HEADER_MAGIC_NUM` and `Sb::log_blocks` -- see
+//! `Sb` -- which together let an image comparison *exclude* a journal
 //! instead of subtracting 2048 blocks by hand.
 //!
 //! # Source, and what is taken from it

@@ -941,8 +941,8 @@ impl Sb {
     /// so a sector number is a byte offset divided by the sector size rather
     /// than a block number.
     ///
-    /// Which sector holds which header is [`agf_sector`], [`agi_sector`] and
-    /// [`agfl_sector`].
+    /// Which sector holds which header is `agf_sector`, `agi_sector` and
+    /// `agfl_sector`.
     #[allow(dead_code)] // The allocator that calls this is the next phase.
     pub fn ag_header_offset(&self, agno: u32, sector: u32) -> u64 {
         self.ag_offset(agno) + sector as u64 * self.sb_sectsize as u64

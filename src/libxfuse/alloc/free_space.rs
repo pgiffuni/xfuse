@@ -43,7 +43,7 @@
 //!
 //! # Algorithm reference
 //!
-//! See [`docs/xfs-algorithms.md`] section 2 (Free-space management) for the
+//! See `docs/xfs-algorithms.md` section 2 (Free-space management) for the
 //! algorithm map with DOCUMENTED/MEASURED/IMPLEMENTED/HYPOTHESIS labels.
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
@@ -1009,7 +1009,7 @@ impl FreeSpaceNode {
     /// bound of the last child's keyspace -- which is only known once the
     /// children are in place, since it comes from their last run.  So building a
     /// node from scratch is pointers first and separators second, and the
-    /// separators are filled in by [`Self::refresh`]-style descent rather than
+    /// separators are filled in by `refresh`-style descent rather than
     /// guessed.
     pub fn set_child_pointers(&mut self, children: &[XfsAgblock]) -> FsResult<()> {
         if self.is_leaf() {

@@ -37,7 +37,7 @@
 //!
 //! # Algorithm reference
 //!
-//! See [`docs/xfs-algorithms.md`] section 4 (Inode B-trees) for the algorithm map
+//! See `docs/xfs-algorithms.md` section 4 (Inode B-trees) for the algorithm map
 //! with DOCUMENTED/MEASURED/IMPLEMENTED/HYPOTHESIS labels.
 
 use crate::libxfuse::{

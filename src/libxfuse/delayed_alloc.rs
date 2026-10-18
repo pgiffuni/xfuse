@@ -62,8 +62,8 @@
 //! # What this module does not do
 //!
 //! It does not allocate blocks, write to the image, or manipulate the on-disk
-//! extent map. The flush logic that consumes [`DelayedAlloc`] lives in
-//! [`crate::volume`] once it is integrated. This module owns only the
+//! extent map. The flush logic that consumes `DelayedAlloc` lives in
+//! `crate::volume` once it is integrated. This module owns only the
 //! in-memory bookkeeping, matching the project's pattern of keeping format
 //! knowledge in one testable place.
 

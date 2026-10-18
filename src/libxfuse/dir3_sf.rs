@@ -34,7 +34,7 @@
 //!
 //! # Algorithm reference
 //!
-//! See [`docs/xfs-algorithms.md`] section 7 (Directories) for the algorithm map
+//! See `docs/xfs-algorithms.md` section 7 (Directories) for the algorithm map
 //! with DOCUMENTED/MEASURED/IMPLEMENTED/HYPOTHESIS labels.
 use std::{
     ffi::{OsStr, OsString},

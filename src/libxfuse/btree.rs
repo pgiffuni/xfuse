@@ -33,7 +33,7 @@
 //!
 //! # Algorithm reference
 //!
-//! See [`docs/xfs-algorithms.md`] sections 5--6 (File extent maps, BMBT
+//! See `docs/xfs-algorithms.md` sections 5--6 (File extent maps, BMBT
 //! algorithms) for the algorithm map with DOCUMENTED/MEASURED/IMPLEMENTED/
 //! HYPOTHESIS labels.
 use std::{
@@ -315,8 +315,8 @@ impl BmbtLeafRecord {
 
     /// The record that records this extent, which is its inverse.
     ///
-    /// The scale and the bit layout are [`startoff`]'s, [`startblock`]'s and
-    /// [`blockcount`]'s read backwards, and the one that is easy to get wrong is
+    /// The scale and the bit layout are `startoff`'s, `startblock`'s and
+    /// `blockcount`'s read backwards, and the one that is easy to get wrong is
     /// the start block: it is written into `l1`'s high bits **already scaled**, so
     /// it is `l1 >> 21` and not a value assembled from both words.  `l0`'s low nine
     /// bits -- nominally the block number's low bits -- are left zero, which is
@@ -808,7 +808,7 @@ impl BmbtLeafBlock {
     ///
     /// Not `chunks(max)`, which fills every leaf and leaves a remainder: the
     /// remainder becomes the last leaf, and a last leaf holding less than
-    /// [`min_records`] is exactly what `xfs_repair` complains about.  So the
+    /// `min_records` is exactly what `xfs_repair` complains about.  So the
     /// number of leaves is fixed first and the records spread evenly over them,
     /// which keeps every leaf inside the range the format's occupancy rule
     /// describes.

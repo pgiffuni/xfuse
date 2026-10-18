@@ -54,7 +54,7 @@
 //! sector 3            the group free list
 //! ```
 //!
-//! See [`Sb::ag_header_offset`](super::sb::Sb::ag_header_offset).
+//! See [`Sb::ag_header_offset`](crate::libxfuse::sb::Sb::ag_header_offset).
 //!
 //! # What it holds, and why the allocator cares
 //!
@@ -63,7 +63,7 @@
 //!   free space at all means walking that btree.
 //! * `flfirst`, `fllast` and `flcount` describe a window of the group's free
 //!   list, which is a flat array of block numbers in
-//!   [`Agfl`](super::alloc::agfl::Agfl).  It is a small, pre-extracted supply
+//!   [`Agfl`](crate::libxfuse::alloc::agfl::Agfl).  It is a small, pre-extracted supply
 //!   of free blocks: taking one is a matter of moving the window, while
 //!   searching the btree is a matter of a walk.  A group with an empty window
 //!   has to be refilled from the btree.
@@ -91,7 +91,7 @@
 //! preserved by construction rather than by remembering to copy them.
 //!
 //! Anything that changes it must go through a
-//! [`Transaction`](super::transaction::Transaction), and the group file is one
+//! [`Transaction`](crate::libxfuse::transaction::Transaction), and the group file is one
 //! of the structures the journal will have to log, because a change to it that
 //! is not logged would be undone by recovery while its effects on the free
 //! space survive.

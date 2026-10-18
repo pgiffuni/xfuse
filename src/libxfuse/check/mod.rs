@@ -104,7 +104,7 @@ pub struct CheckOptions {
 }
 
 /// Geometry fields extracted from the superblock, used as a lightweight
-/// view over the image's layout.  Unlike [`FormatPlan`], this does not
+/// view over the image's layout.  Unlike `FormatPlan`, this does not
 /// make formatter-specific layout assumptions; it only reads the fields
 /// needed for verification.
 struct SbGeometry {

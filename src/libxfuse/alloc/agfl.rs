@@ -55,7 +55,7 @@
 //! The array is as long as the file system block allows, and the group header
 //! says which slice of it is live: `flfirst ..= fllast`, holding `flcount`
 //! entries.  Slots outside that window are the
-//! [null block](super::alloc::agf::NULL_AGBLOCK), which is how the tail of the
+//! [null block](crate::libxfuse::alloc::agf::NULL_AGBLOCK), which is how the tail of the
 //! array is distinguished from real blocks.
 //!
 //! # Invariants

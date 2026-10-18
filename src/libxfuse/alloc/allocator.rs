@@ -28,7 +28,7 @@
 //!
 //! # What this is
 //!
-//! [`FreeSpace`](super::free_space::FreeSpace) knows how to take blocks out of a
+//! [`FreeSpace`] knows how to take blocks out of a
 //! group's two free space trees, and is given a group in memory because that is
 //! what makes an allocation testable.  This is the other half: the group as it is
 //! actually stored, where every block read and written goes through a
@@ -65,7 +65,7 @@
 //!
 //! # Algorithm reference
 //!
-//! See [`docs/xfs-algorithms.md`] sections 1--3 (Allocation groups, Free-space
+//! See `docs/xfs-algorithms.md` sections 1--3 (Allocation groups, Free-space
 //! management, Inode allocation) for the algorithm map with
 //! DOCUMENTED/MEASURED/IMPLEMENTED/HYPOTHESIS labels.
 

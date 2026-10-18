@@ -61,7 +61,7 @@
 //!
 //! # Algorithm reference
 //!
-//! See [`docs/xfs-algorithms.md`] section 10 (Transactions) for the algorithm
+//! See `docs/xfs-algorithms.md` section 10 (Transactions) for the algorithm
 //! map with DOCUMENTED/MEASURED/IMPLEMENTED/HYPOTHESIS labels.
 //!
 //! # Delayed allocation / deferred freeing
