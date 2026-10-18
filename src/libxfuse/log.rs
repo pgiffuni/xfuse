@@ -396,9 +396,9 @@ pub struct LogRecord {
 ///
 /// ## Usage
 ///
-/// ```no_run
-/// # use crate::libxfuse::log::LogWalker;
-/// # use crate::libxfuse::sb::Sb;
+/// ```ignore
+/// # use xfs_fuse::libxfuse::log::LogWalker;
+/// # use xfs_fuse::libxfuse::sb::Sb;
 /// # use std::io::BufRead;
 /// # use std::io::Seek;
 /// # let image = std::fs::File::open("image.img").unwrap();

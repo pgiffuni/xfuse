@@ -58,6 +58,61 @@ Some canned golden images are checked into the repository, in the `resources`
 directory.  They contain a variety of file and directory types.  Run
 `scripts/mkimg.sh` to rebuild them.
 
+## Filesystem creation and checking (experimental)
+
+xfuse also includes two standalone tools that do not depend on xfsprogs:
+
+### newfs.xfs — Native XFS formatter
+
+Creates a fresh XFS filesystem on a file or block device:
+
+```sh
+# Format a 300 MB filesystem on a regular file (dry-run first)
+$ newfs.xfs -N -s 314572800 /tmp/xfs.img
+$ newfs.xfs -f /tmp/xfs.img
+
+# Format a block device
+$ newfs.xfs -f /dev/sdb1
+```
+
+Options:
+- `-f` / `--force`: overwrite existing target
+- `-N` / `--dry-run`: validate geometry without writing
+- `-s` / `--size`: filesystem size in bytes (default: 1 GB)
+- `-b` / `--blocksize`: block size (default: 4096)
+- `-S` / `--sectsize`: sector size (default: 512)
+- `-i` / `--inodesize`: inode size (default: 256)
+- `--crc`: enable CRCs and v5 features (default: enabled)
+- `--ftype`: enable directory entry file types (default: enabled)
+
+### fsck.xfs — Read-only consistency checker
+
+Validates the on-disk structure of an XFS filesystem image:
+
+```sh
+# Check an image (read-only, does not modify)
+$ fsck.xfs /tmp/xfs.img
+
+# Quiet mode (only exit code matters)
+$ fsck.xfs -q /tmp/xfs.img
+
+# Verbose output for debugging
+$ fsck.xfs -v /tmp/xfs.img
+```
+
+Exit codes follow the conventional fsck convention:
+- `0` — filesystem is clean
+- `1` — filesystem has errors (unrepaired)
+- `8` — operational failure (I/O error, unreadable image)
+
+Checks performed:
+1. Superblock magic, version, and CRC (v5)
+2. AGF, AGI, AGFL header magic numbers
+3. BNO and CNT free space btree magic and record counts
+4. Cross-reference of free block counts between BNO tree and AGF
+5. Inode btree (inobt) magic and record count
+6. Root inode (inode 2) validation: magic, mode, format, forkoff, shortform directory
+
 ## License
 
 BSD-2-clause
