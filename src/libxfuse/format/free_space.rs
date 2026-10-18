@@ -31,6 +31,10 @@
 //! filesystem, each group has a single free extent covering all data blocks
 //! after the metadata.
 //!
+//! XFS maintains two free space B+trees per allocation group:
+//! - **BNO tree**: keyed by starting block number (`XFS_ABTB_MAGIC` "ABTB").
+//! - **CNT tree**: keyed by extent size in blocks (`XFS_ABTC_MAGIC` "ABTC").
+//!
 //! # B+tree layout (leaf node)
 //!
 //! A leaf node is a block containing:
@@ -38,6 +42,14 @@
 //! - Records: pairs of (startblock, blockcount), 8 bytes each
 //!
 //! For v5, the header is larger (includes LSN, UUID, CRC).
+//!
+//! # Free space record
+//!
+//! Each BNO leaf record is `(startblock, blockcount)` — 4 + 4 = 8 bytes.
+//! Each CNT leaf record is `(blockcount, startblock)` — the order is
+//! swapped so the tree sorts by size.
+//!
+//! **Source:** [XFS Filesystem Structure — Allocation Groups](https://xfs.org/docs/xfsdocs-xml-dev/XFS_Filesystem_Structure/tmp/en/US/html/Allocation_Groups.html)
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use crc::{Crc, CRC_32_ISCSI};

@@ -30,6 +30,28 @@
 //! containing `.` and `..` entries, and initializes the inode chunk with
 //! the root inode in slot 2 and all other slots left as free/unused.
 //!
+//! # On-disk inode structure
+//!
+//! An XFS inode is divided into 3 parts (see XFS Filesystem Structure, Chapter 4):
+//! - **Core**: stat data and fork descriptors (mode, nlink, size, timestamps,
+//!   fork offsets).
+//! - **Data fork** (literal area): file data, extent map, directory data, or
+//!   symbolic link target, depending on `di_format`.
+//! - **Attribute fork** (optional): extended attribute data.
+//!
+//! The field `di_forkoff` in the core marks the split point between the two forks
+//! in 64-bit (8-byte) units from the end of the core.
+//!
+//! # Inode data formats (`di_format`)
+//!
+//! | Value | Format | Description |
+//! |-------|--------|-------------|
+//! | 0 | `XFS_DIFMT_LOCAL` | "Local" data fits in the inode itself (shortform directory, symlink) |
+//! | 1 | `XFS_DIFMT_EXTENTS` | Up to 3 extents stored as an array in the fork |
+//! | 2 | `XFS_DIFMT_BTREE` | Extent map stored in a B+tree rooted in the inode |
+//! | 3 | `XFS_DIFMT_DEV` | Device-special file (character/block device) |
+//! | 4 | `XFS_DIFMT_DEFAULT` | Not yet formatted |
+//!
 //! # Shortform directory layout for the root
 //!
 //! The root directory is always a shortform (local) directory in XFS.
@@ -38,6 +60,14 @@
 //! - `..` points to the parent inode, stored in the header's `parent` field.
 //!
 //! For the root directory, parent = 2 (points to itself).
+//!
+//! # Inode B+tree record
+//!
+//! The inode btree (`IABT`/`IAB3`) tracks inode chunks of `INODES_PER_CHUNK`
+//! (typically 64) inodes. Each record contains `ir_startino`, `ir_freecount`,
+//! and an 8-byte `ir_free` bitmask (1 bit per inode).
+//!
+//! **Source:** [XFS Filesystem Structure — On-disk Inode](https://xfs.org/docs/xfsdocs-xml-dev/XFS_Filesystem_Structure/tmp/en/US/html/On-disk_Inode.html)
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

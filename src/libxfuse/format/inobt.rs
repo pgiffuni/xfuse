@@ -39,6 +39,19 @@
 //! - `ir_free` (u64, 8 bytes): free mask, one bit per inode.
 //!
 //! Total record size: 16 bytes.
+//!
+//! # Magic numbers
+//!
+//! | Version | Magic | Constant |
+//! |---------|-------|----------|
+//! | v4 | 0x49414254 | "IABT" (`XFS_INOBT_MAGIC`) |
+//! | v5 | 0x49414233 | "IAB3" (`XFS_INOBT_CRC_MAGIC`) |
+//!
+//! The `ir_free` bitmask has bit 0 set when inode 0 within the chunk is free,
+//! bit 1 for inode 1, etc. For a freshly formatted filesystem, only the root
+//! inode (slot 2 in the first chunk) is used; the remaining 63 slots are free.
+//!
+//! **Source:** [XFS Filesystem Structure — Inodes](https://xfs.org/docs/xfsdocs-xml-dev/XFS_Filesystem_Structure/tmp/en/US/html/On-disk_Inode.html)
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use crc::{Crc, CRC_32_ISCSI};

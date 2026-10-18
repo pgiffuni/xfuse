@@ -38,6 +38,56 @@
 //! | 2      | AGI (allocation group inode header) |
 //! | 3      | AGFL (allocation group free list) |
 //! | 4+     | Free space btrees, inode btree, etc. |
+//!
+//! After `mkfs.xfs`, the primary AG (AG 0) has this layout; subsequent AGs
+//! do not have any inodes allocated. Secondary superblocks are only used by
+//! `xfs_repair` when the primary superblock is corrupted.
+//!
+//! **Source:** [XFS Filesystem Structure — Allocation Groups](https://xfs.org/docs/xfsdocs-xml-dev/XFS_Filesystem_Structure/tmp/en/US/html/Allocation_Groups.html)
+//!
+//! # AGF — free space header
+//!
+//! | Field | Offset | Size | Description |
+//! |-------|--------|------|-------------|
+//! | magic | 0 | 4 | `XFS_AGF_MAGIC` = 0x58464147 ("XAGF") |
+//! | version | 4 | 4 | Header version |
+//! | seqno | 8 | 4 | AG number this header belongs to |
+//! | length | 12 | 4 | Bytes after the magic not covered by the header |
+//! | bnoroot | 16 | 4 | BNO free space btree root block |
+//! | cntroot | 20 | 4 | CNT free space btree root block |
+//! | bnorelevel | 24 | 4 | BNO btree height |
+//! | cntrelevel | 28 | 4 | CNT btree height |
+//! | flfirst | 32 | 4 | First AGFL entry |
+//! | fllast | 36 | 4 | Last AGFL entry |
+//! | flcount | 40 | 4 | Number of AGFL entries in use |
+//! | freeblks | 44 | 4 | Total free blocks (may be lazy) |
+//! | longest | 48 | 4 | Largest free extent (blocks) |
+//! | treeblks | 52 | 4 | Blocks used by free space btrees |
+//! | uuid | 64 | 16 | v5 only: copy of sb_uuid |
+//! | lsn | 208 | 8 | v5 only: log sequence number |
+//! | crc | 216 | 8 | v5 only: CRC-32C (little-endian) |
+//!
+//! # AGI — inode header
+//!
+//! | Field | Offset | Size | Description |
+//! |-------|--------|------|-------------|
+//! | magic | 0 | 4 | `XFS_AGI_MAGIC` = 0x58464941 ("XAGI") |
+//! | version | 4 | 4 | Header version |
+//! | seqno | 8 | 4 | AG number |
+//! | length | 12 | 4 | Length of AGI header |
+//! | inobt_root | 20 | 4 | Inode btree root block |
+//! | inobt_level | 24 | 4 | Inode btree height |
+//! | freecount | 28 | 4 | Free inodes in this AG |
+//! | newino | 32 | 4 | Next unallocated inode number hint |
+//! | uuid | 40 | 16 | v5 only: copy of sb_uuid |
+//!
+//! # AGFL — free list
+//!
+//! The AGFL is a simple array of block numbers stored at sector 3 of the AG.
+//! Each entry is 8 bytes (u32 block number, zero-padded). The AGF's
+//! `flfirst`/`fllast`/`flcount` fields index into this array. Blocks 4..8
+//! of the AG FL entries are written into the first block of the AGFL area.
+//! The `flfirst` and `fllast` fields track the next free slot at either end.
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use crc::{Crc, CRC_32_ISCSI};

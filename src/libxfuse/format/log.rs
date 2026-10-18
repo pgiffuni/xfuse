@@ -40,6 +40,30 @@
 //!
 //! For v4 filesystems, `sb_logtail` (offset 404) records the tail LSN.
 //! For v5 filesystems, there is no log tail in the superblock.
+//!
+//! # Log header (first 512 bytes)
+//!
+//! | Offset | Size | Field |
+//! |--------|------|-------|
+//! | 0 | 4 | lh_magic |
+//! | 4 | 4 | lh_cycle |
+//! | 8 | 4 | lh_version |
+//! | 12 | 4 | lh_data_len |
+//! | 16 | 8 | lh_lsn |
+//! | 24 | 8 | lh_tail_lsn |
+//!
+//! - `lh_magic`: Always `XLOG_HEADER_MAGIC_NUM` = `0xFEEEEBAB` ("XLOG" magic
+//!   in big-endian). Actually stored as `0xFEEED_BABE` in native byte order.
+//! - `lh_cycle`: 1 for the first log cycle.
+//! - `lh_version`: 2 (`XLOG_VERSION_2`).
+//! - `lh_lsn`: Log sequence number = (cycle=1, block=0), encoded as
+//!   `(1u64 << 32)`.
+//! - `lh_tail_lsn`: Same as `lh_lsn` for a clean empty log.
+//!
+//! The minimum log size is 128 MB for v5 filesystems; smaller logs are
+//! scaled for v4.
+//!
+//! **Source:** [XFS Filesystem Structure — Journaling Log](https://xfs.org/docs/xfsdocs-xml-dev/XFS_Filesystem_Structure/tmp/en/US/html/index.html)
 
 use super::plan::FormatPlan;
 use crate::libxfuse::log::XLOG_HEADER_MAGIC_NUM;

@@ -37,6 +37,8 @@
 //! Offsets shown for sector size 512; for larger sectors the layout is
 //! the same but padded out to the sector size.
 //!
+//! **Source:** [XFS File System Structure — Superblocks](https://xfs.org/docs/xfsdocs-xml-dev/XFS_Filesystem_Structure/tmp/en/US/html/Allocation_Groups.html)
+//!
 //! | Offset | Size | Field                |
 //! |--------|------|----------------------|
 //! | 0      | 4    | sb_magicnum          |
@@ -91,6 +93,30 @@
 //! | 220    | 4    | sb_features_log_incompat |
 //! | 224    | 4    | sb_crc (v5 only)    |
 //! | 228    | ...  | sb_crc_terminator / padding to sector size |
+//!
+//! # Field notes
+//!
+//! - `sb_magicnum`: Must be `XFS_SB_MAGIC` = `0x58465342` ("XFSB").
+//! - `sb_blocksize`: Block size in bytes, 512–65536 (typically 4096).
+//! - `sb_sectsize`: I/O sector size in bytes, divides `sb_blocksize`.
+//! - `sb_agblocks`: Blocks per allocation group.
+//! - `sb_agcount`: Number of allocation groups.
+//! - `sb_agblklog`: Log₂ of `sb_agblocks`, used to compute `agno = fsbno >> sb_agblklog`.
+//! - `sb_logstart`: For an internal log, the first filesystem block of the log.
+//!   A value of 0 means the log is in an external device.
+//! - `sb_logblocks`: Number of blocks for the internal log.
+//! - `sb_icount` / `sb_ifree` / `sb_fdblocks`: Total inodes, free inodes, and
+//!   free data blocks. `sb_fdblocks` is maintained lazily when
+//!   `sb_features2 & SB_FEAT2_LAZYSBCOUNT` is set.
+//! - `sb_rootino`: Root inode number (2 for a standard filesystem).
+//! - `sb_features2`: Feature flags. Bit 0 (`0x2`) = `lazysbcount`,
+//!   bit 8 (`0x100`) = `crc`, bit 9 (`0x200`) = `ftype`.
+//! - `sb_features_incompat`: Incompatible feature flags. Bit 0 = `ftype`,
+//!   bit 1 = `spinodes`, bit 3 = `bigtime`.
+//! - `sb_features_ro_compat`: Read-only compatible feature flags. Bit 0 =
+//!   `lazysbcount`, bit 2 = `metadata_crc`.
+//! - For v5 superblocks, `sb_crc` (at offset 224) is a CRC-32C computed over
+//!   the superblock with the CRC field zeroed, stored little-endian.
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use crc::{Crc, CRC_32_ISCSI};
