@@ -42,10 +42,11 @@ On FreeBSD: `pkg install fusefs-libs pkgconf`.
 
 ## Example Usage
 ```sh
-# Read-only mount (default behavior, safe for all images)
-$ xfs-fuse /dev/sdb1 /mnt
+# Read-only mount (safe for all images, including those with reflink/COW)
+$ xfs-fuse -o ro /dev/sdb1 /mnt
 
-# Read-write mount with journaling (crash-safe, default for writable)
+# Read-write mount with journaling (crash-safe, default behavior)
+# Refused if the image has unsupported features (reflink, rmapbt, bigtime, etc.)
 $ xfs-fuse /dev/sdb1 /mnt
 
 # Read-write mount without journaling (experimental, not crash-safe)
