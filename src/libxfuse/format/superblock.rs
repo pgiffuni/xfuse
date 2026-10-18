@@ -143,7 +143,7 @@ pub fn encode_superblock(plan: &FormatPlan, buf: &mut [u8]) {
     BigEndian::write_u32(&mut buf[4..8], plan.blocksize);
 
     // sb_dblocks (offset 8)
-    BigEndian::write_u64(&mut buf[8..16], plan.total_blocks as u64);
+    BigEndian::write_u64(&mut buf[8..16], plan.total_blocks);
 
     // sb_rblocks (offset 16)
     BigEndian::write_u64(&mut buf[16..24], 0);

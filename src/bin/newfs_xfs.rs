@@ -82,7 +82,7 @@ fn main() -> ExitCode {
 
     let opts = FormatOptions {
         path: cli.target.clone(),
-        size: cli.size.or(Some(1 * 1024 * 1024 * 1024)),
+        size: cli.size.or(Some(1024 * 1024 * 1024)),
         blocksize: cli.blocksize,
         sectsize: cli.sectsize,
         inodesize: cli.inodesize,
@@ -152,9 +152,9 @@ fn format_uuid(uuid: &[u8; 16]) -> String {
     format!(
         "{}-{}-{}-{}-{}",
         hex[0..4].join(""),
-        format!("{}{}", hex[4], hex[5]),
-        format!("{}{}", hex[6], hex[7]),
-        format!("{}{}", hex[8], hex[9]),
+        format_args!("{}{}", hex[4], hex[5]),
+        format_args!("{}{}", hex[6], hex[7]),
+        format_args!("{}{}", hex[8], hex[9]),
         hex[10..16].join(""),
     )
 }

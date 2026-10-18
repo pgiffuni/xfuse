@@ -185,9 +185,9 @@ pub fn format(opts: &FormatOptions) -> Result<FormatResult, FormatError> {
             .copy_from_slice(&agf_buf[..sectsize as usize]);
 
         let mut agi_buf = vec![0u8; blocksize as usize];
-        let ino_count = crate::libxfuse::format::reserved_inodes::INODES_PER_CHUNK as u32;
+        let ino_count = crate::libxfuse::format::reserved_inodes::INODES_PER_CHUNK;
         let free_inos = if ag.agno == 0 {
-            crate::libxfuse::format::reserved_inodes::INODES_PER_CHUNK - 1 // root inode used
+            crate::libxfuse::format::reserved_inodes::INODES_PER_CHUNK - 1
         } else {
             crate::libxfuse::format::reserved_inodes::INODES_PER_CHUNK
         };
@@ -195,7 +195,7 @@ pub fn format(opts: &FormatOptions) -> Result<FormatResult, FormatError> {
             &plan,
             ag,
             ino_count,
-            free_inos as u32,
+            free_inos,
             inobt_block,
             &mut agi_buf,
         );
@@ -233,7 +233,7 @@ pub fn format(opts: &FormatOptions) -> Result<FormatResult, FormatError> {
     // Flush.
     file.flush().map_err(FormatError::Io)?;
 
-    let blocks_written = (file_size / blocksize as u64) as u64;
+    let blocks_written = file_size / blocksize as u64;
     Ok(FormatResult {
         blocks_written,
         uuid: plan.uuid,

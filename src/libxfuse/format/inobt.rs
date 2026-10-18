@@ -136,7 +136,7 @@ pub fn build_inobt_leaf(
     BigEndian::write_u32(&mut buf[body_offset + REC_STARTINO..], startino);
 
     // ir_freecount: number of free inodes (bits set in ir_free, excluding reserved)
-    let free_count = used_mask.count_zeros() as u32;
+    let free_count = used_mask.count_zeros();
     // Actually, free = bits set in ir_free means the inode is FREE.
     // used_mask has bits set for USED inodes. So ir_free should have
     // bits set for FREE inodes = !used_mask (within the 64-bit range).

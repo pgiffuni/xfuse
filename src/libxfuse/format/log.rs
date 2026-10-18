@@ -60,15 +60,15 @@ pub fn initialize_log(
     mut write_block: impl FnMut(u64, &[u8]),
 ) {
     let blocksize = plan.blocksize as usize;
-    let log_offset_bytes = plan.log.offset as usize;
+    let log_offset_bytes = plan.log.offset;
     let log_blocks = plan.log.blocks as usize;
     let _log_size = log_blocks * blocksize;
 
     // Zero the entire log area.
     let zero_block = vec![0u8; blocksize];
     for i in 0..log_blocks {
-        let offset = log_offset_bytes + i * blocksize;
-        write_block(offset as u64, &zero_block);
+        let offset = log_offset_bytes + i as u64 * blocksize as u64;
+        write_block(offset, &zero_block);
     }
 
     // Write the log header magic at the start of the first log block.
@@ -81,11 +81,12 @@ pub fn initialize_log(
     header[8..12].copy_from_slice(&2u32.to_be_bytes());
     // data_len = 0 (no log records).
     // The LSN is (cycle=1, block=0).
-    header[16..24].copy_from_slice(&((1u64 << 32) | 0u64).to_be_bytes());
+    let lsn = 1u64 << 32;
+    header[16..24].copy_from_slice(&lsn.to_be_bytes());
     // tail_lsn = same as lsn (empty log, no records to replay).
-    header[24..32].copy_from_slice(&((1u64 << 32) | 0u64).to_be_bytes());
+    header[24..32].copy_from_slice(&lsn.to_be_bytes());
 
-    write_block(log_offset_bytes as u64, &header);
+    write_block(log_offset_bytes, &header);
 }
 
 /// Compute the log geometry for a filesystem.
@@ -127,7 +128,7 @@ mod tests {
         });
 
         // Check that the first log block has the magic number.
-        let log_start_offset = plan.log.offset as u64;
+        let log_start_offset = plan.log.offset;
         let first_block = blocks.get(&log_start_offset).expect("first log block");
         let magic = u32::from_be_bytes(first_block[0..4].try_into().unwrap());
         assert_eq!(magic, XLOG_HEADER_MAGIC_NUM, "log magic should be present");

@@ -35,7 +35,7 @@
 //!   4 — filesystem has errors that were corrected (not yet implemented)
 //!   8 — operational failure (I/O error, unreadable)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -104,7 +104,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn print_result(path: &PathBuf, status: &CheckStatus, _fast: bool, verbose: bool) {
+fn print_result(path: &Path, status: &CheckStatus, _fast: bool, verbose: bool) {
     match status {
         CheckStatus::Clean => {
             println!("{}: clean", path.display());

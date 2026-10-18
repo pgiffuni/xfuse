@@ -122,9 +122,9 @@ impl FsckChecker {
         }
 
         // Extract geometry from the superblock before creating a plan.
-        let blocksize = BigEndian::read_u32(&self.data[4..8]) as u32;
-        let sectsize = BigEndian::read_u16(&self.data[102..104]) as u16;
-        let inodesize = BigEndian::read_u16(&self.data[104..106]) as u16;
+        let blocksize = BigEndian::read_u32(&self.data[4..8]);
+        let sectsize = BigEndian::read_u16(&self.data[102..104]);
+        let inodesize = BigEndian::read_u16(&self.data[104..106]);
         let version = BigEndian::read_u16(&self.data[100..102]) & 0xF;
         let has_crc = version == 5 && {
             let features2 = BigEndian::read_u32(&self.data[200..204]);
@@ -259,7 +259,7 @@ impl FsckChecker {
     fn detect_sectsize(&self) -> usize {
         if self.data.len() >= 104 {
             let sectsize = BigEndian::read_u16(&self.data[102..104]) as usize;
-            if sectsize >= 512 && sectsize <= 4096 && (sectsize & (sectsize - 1)) == 0 {
+            if (512..=4096).contains(&sectsize) && (sectsize & (sectsize - 1)) == 0 {
                 return sectsize;
             }
         }

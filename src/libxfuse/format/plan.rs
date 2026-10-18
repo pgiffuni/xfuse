@@ -227,7 +227,7 @@ impl FormatPlan {
                 "sector size cannot exceed block size".into(),
             ));
         }
-        if blocksize % u32::from(sectsize) != 0 {
+        if !blocksize.is_multiple_of(u32::from(sectsize)) {
             return Err(FormatError::InvalidGeometry(
                 "sector size must divide block size".into(),
             ));
@@ -344,7 +344,7 @@ impl FormatPlan {
             // The AGF must account for all blocks used by metadata in this AG.
             // Metadata: headers (4 blocks) + bno root (1) + cnt root (1) + inobt root (1)
             //           + first inode chunk (chunk_blocks)
-            let meta_blocks = data_start as u32;
+            let meta_blocks = data_start;
 
             let free = (this_ag_blocks - meta_blocks as u64) as u32;
             let _longest = free;
@@ -423,7 +423,7 @@ impl FormatPlan {
             free_blocks,
             total_inodes: ag_inodes_total,
             free_inodes: ag_free_inodes,
-            log_blocks: log_blocks as u32,
+            log_blocks,
             log_start,
         })
     }
@@ -535,14 +535,11 @@ impl FormatPlan {
 
 /// Validate a block size.
 fn is_valid_blocksize(blocksize: u32) -> bool {
-    blocksize.is_power_of_two()
-        && blocksize >= 512
-        && blocksize <= 65536
+    blocksize.is_power_of_two() && (512..=65536).contains(&blocksize)
 }
 
-/// Validate a sector size.
 fn is_valid_sectsize(sectsize: u16) -> bool {
-    sectsize.is_power_of_two() && sectsize >= 512 && sectsize <= 4096
+    sectsize.is_power_of_two() && (512..=4096).contains(&sectsize)
 }
 
 /// Validate an inode size against the block size.
@@ -571,18 +568,15 @@ fn compute_ag_geometry(
 
     // Aim for 4-32 AGs, each at least min_ag_size.
     let target_ag_blocks = 64_000u64; // ~64K blocks per AG
-    let ideal_agcount = (total_blocks / target_ag_blocks)
-        .max(4)
-        .min(32);
-    let agblocks = (total_blocks / ideal_agcount) as u32;
-    let agcount = ((total_blocks + agblocks as u64 - 1) / agblocks as u64) as u32;
-
-    // agblocks must fit in 32 bits.
-    if agblocks > u32::MAX {
+    let ideal_agcount = (total_blocks / target_ag_blocks).clamp(4, 32);
+    let agblocks_u64 = total_blocks / ideal_agcount;
+    if agblocks_u64 > u32::MAX as u64 {
         return Err(FormatError::InvalidGeometry(
             "agblocks exceeds 32-bit range".into(),
         ));
     }
+    let agblocks = agblocks_u64 as u32;
+    let agcount = total_blocks.div_ceil(agblocks_u64) as u32;
 
     Ok((agblocks, agcount))
 }

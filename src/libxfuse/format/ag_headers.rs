@@ -123,6 +123,7 @@ const UUID_LEN: usize = 16;
 ///
 /// `buf` must be at least `blocksize` bytes. The AGF occupies the sector
 /// at offset 1 within the group's first block.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_agf(
     plan: &FormatPlan,
     ag: &AgGeometry,
@@ -379,7 +380,7 @@ mod tests {
         assert_eq!(BigEndian::read_u32(&buf[agf_offset::VERSION..]), AGF_VERSION);
 
         // Check seqno
-        assert_eq!(BigEndian::read_u32(&buf[agf_offset::SEQNO..]), ag.agno as u32);
+        assert_eq!(BigEndian::read_u32(&buf[agf_offset::SEQNO..]), ag.agno);
 
         // Check length
         assert_eq!(BigEndian::read_u32(&buf[agf_offset::LENGTH..]), plan.agblocks);
@@ -420,7 +421,7 @@ mod tests {
         encode_agfl(&plan, ag, &mut buf);
 
         assert_eq!(BigEndian::read_u32(&buf[agfl_offset::MAGIC..]), XFS_AGFL_MAGIC);
-        assert_eq!(BigEndian::read_u32(&buf[agfl_offset::SEQNO..]), ag.agno as u32);
+        assert_eq!(BigEndian::read_u32(&buf[agfl_offset::SEQNO..]), ag.agno);
         assert_eq!(&buf[agfl_offset::UUID..agfl_offset::UUID + 16], &[0xab; 16]);
 
         // Check CRC at offset 32
