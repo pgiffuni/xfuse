@@ -56,7 +56,7 @@
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use crc::{Crc, CRC_32_ISCSI};
 
-use super::plan::FormatPlan;
+use super::plan::{FormatError, FormatPlan};
 
 /// Inode btree magic numbers.
 const XFS_INOBT_MAGIC: u32 = 0x4941_4254; // "IABT" - v4
@@ -181,8 +181,8 @@ pub fn build_inobt_ag0(
     plan: &FormatPlan,
     agno: u32,
     inobt_block: u32,
-    mut write_block: impl FnMut(u64, &[u8]),
-) {
+    mut write_block: impl FnMut(u64, &[u8]) -> Result<(), FormatError>,
+) -> Result<(), FormatError> {
     let _ = plan.blocksize;
 
     // The first inode block in AG 0 is at `data_start` from AgGeometry.
@@ -214,7 +214,7 @@ pub fn build_inobt_ag0(
 
     let buf = build_inobt_leaf(plan, agno, inobt_block, chunk_start_ino, used_mask);
     let offset = plan.ag_block_offset(agno, inobt_block);
-    write_block(offset, &buf);
+    write_block(offset, &buf)
 }
 
 /// Build the inode btree for a non-root AG.
@@ -223,14 +223,14 @@ pub fn build_inobt_other_ag(
     plan: &FormatPlan,
     agno: u32,
     inobt_block: u32,
-    mut write_block: impl FnMut(u64, &[u8]),
-) {
+    mut write_block: impl FnMut(u64, &[u8]) -> Result<(), FormatError>,
+) -> Result<(), FormatError> {
     let chunk_start_ino: u64 = 0;
     let used_mask: u64 = 0; // No inodes used.
 
     let buf = build_inobt_leaf(plan, agno, inobt_block, chunk_start_ino, used_mask);
     let offset = plan.ag_block_offset(agno, inobt_block);
-    write_block(offset, &buf);
+    write_block(offset, &buf)
 }
 
 #[cfg(test)]

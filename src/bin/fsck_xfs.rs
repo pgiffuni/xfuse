@@ -69,10 +69,11 @@ fn main() -> ExitCode {
 
     let options = CheckOptions {
         path:  cli.target.clone(),
+        fast:  cli.fast,
         quiet: cli.quiet,
     };
 
-    let checker = match FsckChecker::new(options) {
+    let mut checker = match FsckChecker::new(options) {
         Ok(c) => c,
         Err(e) => {
             if !cli.quiet {
@@ -85,7 +86,7 @@ fn main() -> ExitCode {
     let result = checker.check();
 
     if !cli.quiet {
-        print_result(&cli.target, &result, cli.fast, cli.verbose);
+        print_result(&cli.target, &result, cli.verbose);
     }
 
     match result {
@@ -106,7 +107,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn print_result(path: &Path, status: &CheckStatus, _fast: bool, verbose: bool) {
+fn print_result(path: &Path, status: &CheckStatus, verbose: bool) {
     match status {
         CheckStatus::Clean => {
             println!("{}: clean", path.display());

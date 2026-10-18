@@ -88,20 +88,28 @@ const INOBT_ROOT_BLOCK: u32 = 6;
 const FIRST_INODE_BLOCK: u32 = 7;
 
 /// Format a filesystem image at the given path.
+///
+/// This function performs all validation before writing any data.
+/// It rejects targets that are not regular files or block devices,
+/// requires `--force` for existing targets, and only truncates/opens
+/// for writing after validation succeeds.
+///
+/// For regular files, the file is created/truncated to the planned size.
+/// For block devices, the device size is queried via the OS and the
+/// planned filesystem size must not exceed it.
 pub fn format(opts: &FormatOptions) -> Result<FormatResult, FormatError> {
     let plan = FormatPlan::new(opts)?;
+
+    ValidateTarget::validate(opts)?;
+
     let blocksize = plan.blocksize;
     let sectsize = plan.sectsize;
 
-    // Open and size the file.
-    let file_size = plan.total_blocks * blocksize as u64;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&opts.path)
-        .map_err(FormatError::Io)?;
-    file.set_len(file_size).map_err(FormatError::Io)?;
+    // Open and size the target, handling regular files and block devices
+    // differently.
+    let target = Target::open(&opts.path, opts.force, plan.total_blocks * blocksize as u64)?;
+    let file_size = target.file_size;
+    let mut file = target.file;
 
     // Write the superblock.
     write_superblock(&plan, &mut file)?;
@@ -142,15 +150,13 @@ pub fn format(opts: &FormatOptions) -> Result<FormatResult, FormatError> {
         // The inobt root is at INOBT_ROOT_BLOCK.
         let inobt_block = INOBT_ROOT_BLOCK;
         if ag.agno == 0 {
-            // AG 0 has the root inode at chunk slot 2.
             build_inobt_ag0(&plan, ag.agno, inobt_block, |offset, data| {
-                let _ = write_at(&mut file, offset, data);
-            });
+                write_at(&mut file, offset, data)
+            })?;
         } else {
-            // Other AGs have no used inodes.
             build_inobt_other_ag(&plan, ag.agno, inobt_block, |offset, data| {
-                let _ = write_at(&mut file, offset, data);
-            });
+                write_at(&mut file, offset, data)
+            })?;
         }
 
         // Write the AGF, AGI, and AGFL headers at their sector offsets.
@@ -212,23 +218,20 @@ pub fn format(opts: &FormatOptions) -> Result<FormatResult, FormatError> {
 
         // Write the inode chunk.
         if ag.agno == 0 {
-            build_inode_chunk_ag0(&plan, |offset, data| {
-                let _ = write_at(&mut file, offset, data);
-            });
+            build_inode_chunk_ag0(&plan, |offset, data| write_at(&mut file, offset, data))?;
         } else {
             build_inode_chunk_other_ag(&plan, ag.agno, |offset, data| {
-                let _ = write_at(&mut file, offset, data);
-            });
+                write_at(&mut file, offset, data)
+            })?;
         }
     }
 
     // Initialize the log.
-    initialize_log(&plan, |offset, data| {
-        let _ = write_at(&mut file, offset, data);
-    });
+    initialize_log(&plan, |offset, data| write_at(&mut file, offset, data))?;
 
-    // Flush.
+    // Flush to the OS and request durability.
     file.flush().map_err(FormatError::Io)?;
+    file.sync_all().map_err(FormatError::Io)?;
 
     let blocks_written = file_size / blocksize as u64;
     Ok(FormatResult {
@@ -251,6 +254,189 @@ fn write_at(file: &mut std::fs::File, offset: u64, data: &[u8]) -> Result<(), Fo
         .map_err(FormatError::Io)?;
     file.write_all(data).map_err(FormatError::Io)?;
     Ok(())
+}
+
+/// Validate the formatting target before any writes occur.
+///
+/// This checks that:
+/// - If the target exists, `--force` is set to authorize overwriting.
+/// - Targets that exist are only allowed when `force` is set.
+struct ValidateTarget;
+
+impl ValidateTarget {
+    fn validate(opts: &FormatOptions) -> Result<(), FormatError> {
+        if opts.force {
+            return Ok(());
+        }
+
+        match std::fs::metadata(&opts.path) {
+            Ok(_) => Err(FormatError::TargetExists(format!(
+                "{}: file exists; use --force to overwrite",
+                opts.path.display()
+            ))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(FormatError::Io(e)),
+        }
+    }
+}
+
+/// The type of target being formatted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetType {
+    /// A regular file (image file).
+    Regular,
+    /// A block device (e.g., /dev/sdb1).
+    BlockDevice,
+}
+
+/// Information about an opened formatting target.
+struct Target {
+    file:        std::fs::File,
+    file_size:   u64,
+    target_type: TargetType,
+}
+
+impl Target {
+    /// Open the target for writing, handling regular files and block devices.
+    ///
+    /// For regular files: creates/truncates the file to the planned size.
+    /// For block devices: opens read-write, queries device capacity via OS,
+    /// and verifies the planned size fits.
+    fn open(path: &std::path::Path, force: bool, planned_size: u64) -> Result<Self, FormatError> {
+        let target_type = detect_target_type(path)?;
+
+        match target_type {
+            TargetType::Regular => {
+                // Regular file: truncate or create to the planned size.
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)
+                    .map_err(FormatError::Io)?;
+                file.set_len(planned_size).map_err(FormatError::Io)?;
+                Ok(Self {
+                    file,
+                    file_size: planned_size,
+                    target_type,
+                })
+            }
+            TargetType::BlockDevice => {
+                // Block device: must have force to proceed.
+                if !force {
+                    return Err(FormatError::TargetExists(format!(
+                        "{}: block device; use --force to format",
+                        path.display()
+                    )));
+                }
+
+                let file = OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .map_err(FormatError::Io)?;
+
+                // Query the device size.
+                let dev_size = device_size(&file)?;
+                if planned_size > dev_size {
+                    return Err(FormatError::InvalidGeometry(format!(
+                        "planned size {} exceeds device size {}",
+                        planned_size, dev_size
+                    )));
+                }
+
+                Ok(Self {
+                    file,
+                    file_size: dev_size,
+                    target_type,
+                })
+            }
+        }
+    }
+}
+
+/// Detect whether a path is a regular file or a block device.
+#[cfg(unix)]
+fn detect_target_type(path: &std::path::Path) -> Result<TargetType, FormatError> {
+    #![allow(clippy::unnecessary_cast)]
+    use std::os::unix::fs::MetadataExt;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let mode = meta.mode();
+            if (mode & libc::S_IFMT as u32) == libc::S_IFBLK as u32 {
+                Ok(TargetType::BlockDevice)
+            } else if (mode & libc::S_IFMT as u32) == libc::S_IFREG as u32 {
+                Ok(TargetType::Regular)
+            } else {
+                Err(FormatError::NotARegularFile(format!(
+                    "{}: not a regular file or block device (mode 0x{:o})",
+                    path.display(),
+                    mode
+                )))
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Target does not exist yet — it will be created as a regular file.
+            Ok(TargetType::Regular)
+        }
+        Err(e) => Err(FormatError::Io(e)),
+    }
+}
+
+#[cfg(not(unix))]
+fn detect_target_type(path: &std::path::Path) -> Result<TargetType, FormatError> {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            if meta.is_file() {
+                Ok(TargetType::Regular)
+            } else {
+                Err(FormatError::NotARegularFile(format!(
+                    "{}: not a regular file",
+                    path.display()
+                )))
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TargetType::Regular),
+        Err(e) => Err(FormatError::Io(e)),
+    }
+}
+
+/// Query the size of a block device in bytes.
+#[cfg(target_os = "linux")]
+fn device_size(file: &std::fs::File) -> Result<u64, FormatError> {
+    use std::os::fd::AsRawFd;
+
+    let fd = file.as_raw_fd();
+    let mut size: u64 = 0;
+    // BLKGETSIZE64: get device size in bytes (Linux).
+    const BLKGETSIZE64: libc::c_ulong = 0x80081272;
+    let ret = unsafe { libc::ioctl(fd, BLKGETSIZE64, &mut size as *mut u64) };
+    if ret < 0 {
+        return Err(FormatError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(size)
+}
+
+#[cfg(target_os = "freebsd")]
+fn device_size(file: &std::fs::File) -> Result<u64, FormatError> {
+    use std::os::fd::AsRawFd;
+
+    let fd = file.as_raw_fd();
+    let mut size: u64 = 0;
+    // DIOCGMEDIASIZE: get device size in bytes (FreeBSD).
+    const DIOCGMEDIASIZE: libc::c_ulong = 0x40086401;
+    let ret = unsafe { libc::ioctl(fd, DIOCGMEDIASIZE, &mut size as *mut u64) };
+    if ret < 0 {
+        return Err(FormatError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(size)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+fn device_size(_file: &std::fs::File) -> Result<u64, FormatError> {
+    Err(FormatError::InvalidGeometry(
+        "block device size queries are not supported on this platform".into(),
+    ))
 }
 
 #[cfg(test)]

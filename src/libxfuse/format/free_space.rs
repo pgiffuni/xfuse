@@ -54,7 +54,7 @@
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use crc::{Crc, CRC_32_ISCSI};
 
-use super::plan::{AgGeometry, FormatPlan};
+use super::plan::{AgGeometry, FormatError, FormatPlan};
 
 /// Free space record: (start block, length in blocks).
 #[derive(Clone, Copy, Debug)]
@@ -252,8 +252,8 @@ pub fn build_free_space_tree(
     ag: &AgGeometry,
     run: FreeRun,
     root_block: u32,
-    mut write_block: impl FnMut(u64, &[u8]),
-) {
+    mut write_block: impl FnMut(u64, &[u8]) -> Result<(), FormatError>,
+) -> Result<(), FormatError> {
     // Build both BNO and CNT trees. They share the same layout for a single
     // record, just with different magic numbers and key ordering.
     let bno_bytes = build_free_space_leaf(plan, true, run, root_block);
@@ -261,11 +261,11 @@ pub fn build_free_space_tree(
 
     // Write the BNO root at the AG's bno_root block.
     let bno_offset = plan.ag_block_offset(ag.agno, ag.bno_root);
-    write_block(bno_offset, &bno_bytes);
+    write_block(bno_offset, &bno_bytes)?;
 
     // Write the CNT root at the AG's cnt_root block.
     let cnt_offset = plan.ag_block_offset(ag.agno, ag.cnt_root);
-    write_block(cnt_offset, &cnt_bytes);
+    write_block(cnt_offset, &cnt_bytes)
 }
 
 #[cfg(test)]

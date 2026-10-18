@@ -368,27 +368,24 @@ fn build_root_directory_data(plan: &crate::libxfuse::format::FormatPlan) -> Vec<
 /// The inobt record tracks this chunk as "used" (startino=0, the chunk is allocated).
 pub fn build_inode_chunk_ag0(
     plan: &crate::libxfuse::format::FormatPlan,
-    mut write_block: impl FnMut(u64, &[u8]),
-) {
+    mut write_block: impl FnMut(u64, &[u8]) -> Result<(), crate::libxfuse::format::FormatError>,
+) -> Result<(), crate::libxfuse::format::FormatError> {
     let chunk = build_root_inode_chunk(plan);
-    // Write at the first inode chunk block in AG 0.
     let ag = &plan.ags[0];
     let offset = plan.ag_block_offset(0, ag.chunk_start);
-    write_block(offset, &chunk);
+    write_block(offset, &chunk)
 }
 
-/// Build a clean inode chunk for AGs without the root directory.
-/// All slots are zeroed (version=0 = no inode).
 pub fn build_inode_chunk_other_ag(
     plan: &crate::libxfuse::format::FormatPlan,
     agno: u32,
-    mut write_block: impl FnMut(u64, &[u8]),
-) {
+    mut write_block: impl FnMut(u64, &[u8]) -> Result<(), crate::libxfuse::format::FormatError>,
+) -> Result<(), crate::libxfuse::format::FormatError> {
     let blocksize = plan.blocksize as usize;
     let ag = &plan.ags[agno as usize];
     let chunk = vec![0u8; blocksize];
     let offset = plan.ag_block_offset(agno, ag.chunk_start);
-    write_block(offset, &chunk);
+    write_block(offset, &chunk)
 }
 
 #[cfg(test)]

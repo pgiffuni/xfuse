@@ -50,9 +50,10 @@ fn format_and_check(path: &str, size: u64) -> (Vec<u8>, CheckStatus) {
 
     let options = CheckOptions {
         path:  std::path::PathBuf::from(path),
+        fast:  false,
         quiet: false,
     };
-    let checker = FsckChecker::new(options).expect("checker should succeed");
+    let mut checker = FsckChecker::new(options).expect("checker should succeed");
     let status = checker.check();
     let data = fs::read(path).expect("should read file");
     (data, status)
@@ -88,9 +89,10 @@ fn v4_filesystem_check() {
 
     let options = CheckOptions {
         path:  std::path::PathBuf::from(path),
+        fast:  false,
         quiet: false,
     };
-    let checker = FsckChecker::new(options).expect("checker should succeed");
+    let mut checker = FsckChecker::new(options).expect("checker should succeed");
     let status = checker.check();
     assert!(
         matches!(status, CheckStatus::Clean),
@@ -112,9 +114,10 @@ fn corrupted_superblock_magic_detected() {
 
     let options = CheckOptions {
         path:  std::path::PathBuf::from(path),
+        fast:  false,
         quiet: false,
     };
-    let checker = FsckChecker::new(options).expect("checker should succeed");
+    let mut checker = FsckChecker::new(options).expect("checker should succeed");
     let status = checker.check();
 
     assert!(
@@ -137,9 +140,10 @@ fn corrupted_superblock_crc_detected() {
 
     let options = CheckOptions {
         path:  std::path::PathBuf::from(path),
+        fast:  false,
         quiet: false,
     };
-    let checker = FsckChecker::new(options).expect("checker should succeed");
+    let mut checker = FsckChecker::new(options).expect("checker should succeed");
     let status = checker.check();
 
     assert!(
@@ -162,9 +166,10 @@ fn corrupted_agf_magic_detected() {
 
     let options = CheckOptions {
         path:  std::path::PathBuf::from(path),
+        fast:  false,
         quiet: false,
     };
-    let checker = FsckChecker::new(options).expect("checker should succeed");
+    let mut checker = FsckChecker::new(options).expect("checker should succeed");
     let status = checker.check();
 
     assert!(
@@ -188,14 +193,69 @@ fn corrupted_root_inode_detected() {
 
     let options = CheckOptions {
         path:  std::path::PathBuf::from(path),
+        fast:  false,
         quiet: false,
     };
-    let checker = FsckChecker::new(options).expect("checker should succeed");
+    let mut checker = FsckChecker::new(options).expect("checker should succeed");
     let status = checker.check();
 
     assert!(
         matches!(status, CheckStatus::Corrupt(_)),
         "corrupted root inode should be detected: {:?}",
+        status
+    );
+
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn fast_mode_only_checks_superblock() {
+    let path = "/tmp/xfs_fsk_test_fast.img";
+    let (mut data, _) = format_and_check(path, 300 * 1024 * 1024);
+
+    // Corrupt an AGF header (not the superblock).
+    data[512] = 0xFF;
+    fs::write(path, &data).expect("should write");
+
+    let options = CheckOptions {
+        path:  std::path::PathBuf::from(path),
+        fast:  true,
+        quiet: false,
+    };
+    let mut checker = FsckChecker::new(options).expect("checker should succeed");
+    let status = checker.check();
+
+    // In fast mode, only the superblock is checked, so the corrupted AGF
+    // should not be detected.
+    assert!(
+        matches!(status, CheckStatus::Clean),
+        "fast mode should skip AGF check: {:?}",
+        status
+    );
+
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn fast_mode_detects_superblock_corruption() {
+    let path = "/tmp/xfs_fsk_test_fast_corrupt.img";
+    let (mut data, _) = format_and_check(path, 300 * 1024 * 1024);
+
+    // Corrupt the superblock magic.
+    data[0] = 0xFF;
+    fs::write(path, &data).expect("should write");
+
+    let options = CheckOptions {
+        path:  std::path::PathBuf::from(path),
+        fast:  true,
+        quiet: false,
+    };
+    let mut checker = FsckChecker::new(options).expect("checker should succeed");
+    let status = checker.check();
+
+    assert!(
+        matches!(status, CheckStatus::Corrupt(_)),
+        "fast mode should detect superblock corruption: {:?}",
         status
     );
 

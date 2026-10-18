@@ -33,6 +33,7 @@
 use std::{path::PathBuf, process::ExitCode};
 
 use clap::Parser;
+use uuid::Uuid;
 use xfs_fuse::libxfuse::format::{format, FormatOptions, FormatPlan};
 
 /// Format a file or device with an XFS filesystem.
@@ -60,12 +61,7 @@ struct Cli {
     blocksize: u32,
 
     /// Sector size in bytes (512 or 4096).
-    #[arg(
-        short = 'S',
-        long = "sectsize",
-        default_value_t = 512,
-        requires = "force"
-    )]
+    #[arg(short = 'S', long = "sectsize", default_value_t = 512)]
     sectsize: u16,
 
     /// Inode size in bytes (256, 512, etc.).
@@ -93,7 +89,7 @@ fn main() -> ExitCode {
         crc:       cli.crc,
         ftype:     cli.ftype,
         force:     cli.force,
-        uuid:      generate_uuid(),
+        uuid:      *Uuid::new_v4().as_bytes(),
     };
 
     // Validate the plan.
@@ -108,14 +104,6 @@ fn main() -> ExitCode {
     if cli.dry_run {
         print_plan(&plan);
         return ExitCode::SUCCESS;
-    }
-
-    if !cli.force && std::fs::metadata(&cli.target).is_ok() {
-        eprintln!(
-            "newfs.xfs: {}: file exists; use -f to force",
-            cli.target.display()
-        );
-        return ExitCode::from(1);
     }
 
     match format(&opts) {
@@ -161,20 +149,4 @@ fn format_uuid(uuid: &[u8; 16]) -> String {
         format_args!("{}{}", hex[8], hex[9]),
         hex[10..16].join(""),
     )
-}
-
-/// Generate a deterministic UUID for testing (in production, use a proper UUID generator).
-fn generate_uuid() -> [u8; 16] {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut uuid = [0u8; 16];
-    let bytes = now.to_be_bytes();
-    uuid[0..8].copy_from_slice(&bytes[..8]);
-    // Set version 4 (random) and variant bits.
-    uuid[6] = (uuid[6] & 0x0f) | 0x40;
-    uuid[8] = (uuid[8] & 0x3f) | 0x80;
-    uuid
 }

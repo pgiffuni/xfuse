@@ -65,7 +65,7 @@
 //!
 //! **Source:** [XFS Filesystem Structure — Journaling Log](https://xfs.org/docs/xfsdocs-xml-dev/XFS_Filesystem_Structure/tmp/en/US/html/index.html)
 
-use super::plan::FormatPlan;
+use super::plan::{FormatError, FormatPlan};
 use crate::libxfuse::log::XLOG_HEADER_MAGIC_NUM;
 
 /// The minimum log size in bytes (128 MB, as required by XFS).
@@ -79,7 +79,10 @@ const LOG_SECTSIZE: u64 = 512;
 ///
 /// Writes a clean log: the log area is zeroed, and a dummy log record header
 /// is written at the start to mark it as a valid (empty) log.
-pub fn initialize_log(plan: &FormatPlan, mut write_block: impl FnMut(u64, &[u8])) {
+pub fn initialize_log(
+    plan: &FormatPlan,
+    mut write_block: impl FnMut(u64, &[u8]) -> Result<(), FormatError>,
+) -> Result<(), FormatError> {
     let blocksize = plan.blocksize as usize;
     let log_offset_bytes = plan.log.offset;
     let log_blocks = plan.log.blocks as usize;
@@ -89,7 +92,7 @@ pub fn initialize_log(plan: &FormatPlan, mut write_block: impl FnMut(u64, &[u8])
     let zero_block = vec![0u8; blocksize];
     for i in 0..log_blocks {
         let offset = log_offset_bytes + i as u64 * blocksize as u64;
-        write_block(offset, &zero_block);
+        write_block(offset, &zero_block)?;
     }
 
     // Write the log header magic at the start of the first log block.
@@ -107,7 +110,7 @@ pub fn initialize_log(plan: &FormatPlan, mut write_block: impl FnMut(u64, &[u8])
     // tail_lsn = same as lsn (empty log, no records to replay).
     header[24..32].copy_from_slice(&lsn.to_be_bytes());
 
-    write_block(log_offset_bytes, &header);
+    write_block(log_offset_bytes, &header)
 }
 
 /// Compute the log geometry for a filesystem.
@@ -146,7 +149,9 @@ mod tests {
         let mut blocks = std::collections::HashMap::<u64, Vec<u8>>::new();
         initialize_log(&plan, |offset, data| {
             blocks.insert(offset, data.to_vec());
-        });
+            Ok(())
+        })
+        .expect("log init should succeed");
 
         // Check that the first log block has the magic number.
         let log_start_offset = plan.log.offset;

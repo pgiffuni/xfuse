@@ -649,6 +649,10 @@ pub enum FormatError {
     InvalidGeometry(String),
     Io(std::io::Error),
     Overflow(String),
+    /// The target is not a regular file or block device.
+    NotARegularFile(String),
+    /// The target already exists; use `--force` to overwrite.
+    TargetExists(String),
 }
 
 impl std::fmt::Display for FormatError {
@@ -657,6 +661,10 @@ impl std::fmt::Display for FormatError {
             FormatError::InvalidGeometry(msg) => write!(f, "invalid geometry: {msg}"),
             FormatError::Io(e) => write!(f, "I/O error: {e}"),
             FormatError::Overflow(msg) => write!(f, "overflow: {msg}"),
+            FormatError::NotARegularFile(msg) => {
+                write!(f, "target is not a regular file or block device: {msg}")
+            }
+            FormatError::TargetExists(msg) => write!(f, "target already exists: {msg}"),
         }
     }
 }

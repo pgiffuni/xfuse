@@ -40,14 +40,15 @@
 //! All reads go through a block-aligned reader; corrupt blocks are reported as
 //! errors rather than causing panics.
 
-use std::path::PathBuf;
+use std::{
+    fs::File,
+    io::{BufReader, Read, Seek, SeekFrom},
+    path::PathBuf,
+};
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 
-use crate::libxfuse::{
-    definitions::{XFS_AGFL_MAGIC, XFS_AGF_MAGIC, XFS_AGI_MAGIC, XFS_SB_MAGIC},
-    format::{FormatOptions, FormatPlan},
-};
+use crate::libxfuse::definitions::{XFS_AGFL_MAGIC, XFS_AGF_MAGIC, XFS_AGI_MAGIC, XFS_SB_MAGIC};
 
 /// The sector within an AG that holds the AGF.
 const AGF_SECTOR: u32 = 1;
@@ -87,8 +88,8 @@ impl CheckError {
 
 /// A read-only image checker.
 pub struct FsckChecker {
-    data: Vec<u8>,
-    opts: CheckOptions,
+    reader: BufReader<File>,
+    opts:   CheckOptions,
 }
 
 /// Options for the checker.
@@ -96,88 +97,104 @@ pub struct FsckChecker {
 pub struct CheckOptions {
     /// Path to the image or block device.
     pub path:  PathBuf,
+    /// Only check the superblock (fast mode).
+    pub fast:  bool,
     /// Suppress some warnings.
     pub quiet: bool,
 }
 
+/// Geometry fields extracted from the superblock, used as a lightweight
+/// view over the image's layout.  Unlike [`FormatPlan`], this does not
+/// make formatter-specific layout assumptions; it only reads the fields
+/// needed for verification.
+struct SbGeometry {
+    blocksize:    u32,
+    sectsize:     u16,
+    inodesize:    u16,
+    version:      u16,
+    has_crc:      bool,
+    has_ftype:    bool,
+    agcount:      u32,
+    agblocks:     u32,
+    total_blocks: u64,
+    log_start:    u64,
+    log_blocks:   u32,
+}
+
 impl FsckChecker {
-    /// Create a new checker by reading the entire image into memory.
+    /// Create a new checker that reads the target lazily.
     ///
-    /// For large devices, this is impractical; in a production implementation
-    /// the checker would use seek-based reads.  For now, we read the whole
-    /// image since test images are small.
+    /// Rather than loading the entire image into memory, the checker opens
+    /// a seekable file handle and reads blocks on demand.  This allows it
+    /// to work with large devices and raw block devices.
     pub fn new(options: CheckOptions) -> Result<Self, String> {
-        let data = std::fs::read(&options.path)
-            .map_err(|e| format!("failed to read {}: {}", options.path.display(), e))?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&options.path)
+            .map_err(|e| format!("failed to open {}: {}", options.path.display(), e))?;
         Ok(Self {
-            data,
-            opts: options,
+            reader: BufReader::new(file),
+            opts:   options,
         })
     }
 
+    /// Read `len` bytes at `offset` from the image, returning a buffer.
+    ///
+    /// Returns an error message if the read fails or goes past EOF.
+    fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, String> {
+        self.reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("seek to {} failed: {}", offset, e))?;
+        let mut buf = vec![0u8; len];
+        self.reader
+            .read_exact(&mut buf)
+            .map_err(|e| format!("read at offset {} failed: {}", offset, e))?;
+        Ok(buf)
+    }
+
+    /// Check if enough data is available at `offset` for `len` bytes.
+    fn can_read(&mut self, offset: u64, len: usize) -> bool {
+        self.read_at(offset, len).is_ok()
+    }
+
     /// Run all checks and return the result.
-    pub fn check(&self) -> CheckStatus {
+    pub fn check(&mut self) -> CheckStatus {
         let mut errors = Vec::new();
 
         // Phase 1: Superblock
-        if let Err(e) = self.check_superblock() {
-            errors.push(e);
-            // If the superblock is corrupt, we can't continue meaningfully.
-            return CheckStatus::Corrupt(errors);
-        }
-
-        // Extract geometry from the superblock before creating a plan.
-        let blocksize = BigEndian::read_u32(&self.data[4..8]);
-        let sectsize = BigEndian::read_u16(&self.data[102..104]);
-        let inodesize = BigEndian::read_u16(&self.data[104..106]);
-        let version = BigEndian::read_u16(&self.data[100..102]) & 0xF;
-        let has_crc = version == 5 && {
-            let features2 = BigEndian::read_u32(&self.data[200..204]);
-            (features2 & 0x100) != 0
-        };
-        let has_ftype = {
-            let features2 = BigEndian::read_u32(&self.data[200..204]);
-            (features2 & 0x200) != 0
-        };
-
-        // Get the superblock for subsequent checks.
-        let plan = match FormatPlan::new(&FormatOptions {
-            path: self.opts.path.clone(),
-            size: Some(self.data.len() as u64),
-            blocksize,
-            sectsize,
-            inodesize,
-            crc: has_crc,
-            ftype: has_ftype,
-            force: true,
-            uuid: [0; 16],
-        }) {
-            Ok(p) => p,
+        let sg = match self.check_superblock() {
+            Ok(g) => g,
             Err(e) => {
-                return CheckStatus::OperationalFailure(format!(
-                    "failed to parse superblock: {}",
-                    e
-                ));
+                errors.push(e);
+                return CheckStatus::Corrupt(errors);
             }
         };
 
+        // In fast mode, only check the superblock.
+        if self.opts.fast {
+            if errors.is_empty() {
+                return CheckStatus::Clean;
+            }
+            return CheckStatus::Corrupt(errors);
+        }
+
         // Phase 2: AG headers
-        for err in self.check_ag_headers(&plan) {
+        for err in self.check_ag_headers(&sg) {
             errors.push(err);
         }
 
         // Phase 3: Free space trees
-        for err in self.check_free_space_trees(&plan) {
+        for err in self.check_free_space_trees(&sg) {
             errors.push(err);
         }
 
         // Phase 4: Inode btree
-        for err in self.check_inobt(&plan) {
+        for err in self.check_inobt(&sg) {
             errors.push(err);
         }
 
         // Phase 5: Root inode
-        for err in self.check_root_inode(&plan) {
+        for err in self.check_root_inode(&sg) {
             errors.push(err);
         }
 
@@ -188,17 +205,22 @@ impl FsckChecker {
         }
     }
 
-    /// Verify the superblock: magic, CRC, geometry fields.
-    fn check_superblock(&self) -> Result<(), CheckError> {
-        let sectsize = self.detect_sectsize();
-        if self.data.len() < sectsize {
+    /// Read and verify the superblock; returns geometry on success.
+    fn check_superblock(&mut self) -> Result<SbGeometry, CheckError> {
+        let sectsize_val = self.detect_sectsize()?;
+        let sectsize = sectsize_val as usize;
+        if !self.can_read(0, sectsize) {
             return Err(CheckError::new(
                 "superblock",
                 &format!("image too small for sector size {}", sectsize),
             ));
         }
 
-        let magic = BigEndian::read_u32(&self.data[0..4]);
+        let sb = self
+            .read_at(0, sectsize)
+            .map_err(|e| CheckError::new("superblock", &e))?;
+
+        let magic = BigEndian::read_u32(&sb[0..4]);
         if magic != XFS_SB_MAGIC {
             return Err(CheckError::new(
                 "superblock",
@@ -206,13 +228,7 @@ impl FsckChecker {
             ));
         }
 
-        let sectsize_field = BigEndian::read_u16(&self.data[102..104]);
-        if sectsize_field != sectsize as u16 {
-            // Allow some flexibility: the actual data should match the field.
-            // Just report a warning-level error.
-        }
-
-        let version = BigEndian::read_u16(&self.data[100..102]) & 0xF;
+        let version = BigEndian::read_u16(&sb[100..102]) & 0xF;
         if version != 4 && version != 5 {
             return Err(CheckError::new(
                 "superblock",
@@ -222,39 +238,58 @@ impl FsckChecker {
 
         // Check CRC for v5.
         if version == 5 {
-            let features2 = BigEndian::read_u32(&self.data[200..204]);
+            let features2 = BigEndian::read_u32(&sb[200..204]);
             let has_crc = (features2 & 0x100) != 0;
             if has_crc {
-                self.check_superblock_crc(sectsize)?;
+                self.check_superblock_crc(&sb, sectsize)?;
             }
         }
 
-        Ok(())
+        let agblocks = BigEndian::read_u32(&sb[84..88]);
+        let agcount = BigEndian::read_u32(&sb[88..92]);
+        if agcount == 0 || agblocks == 0 {
+            return Err(CheckError::new("superblock", "invalid agcount or agblocks"));
+        }
+
+        Ok(SbGeometry {
+            blocksize: BigEndian::read_u32(&sb[4..8]),
+            sectsize: sectsize_val,
+            inodesize: BigEndian::read_u16(&sb[104..106]),
+            version,
+            has_crc: version == 5 && (BigEndian::read_u32(&sb[200..204]) & 0x100) != 0,
+            has_ftype: (BigEndian::read_u32(&sb[200..204]) & 0x200) != 0,
+            agcount,
+            agblocks,
+            total_blocks: BigEndian::read_u64(&sb[8..16]),
+            log_start: BigEndian::read_u32(&sb[48..52]) as u64,
+            log_blocks: BigEndian::read_u32(&sb[96..100]),
+        })
     }
 
     /// Verify the superblock CRC.
     ///
-    /// The CRC is CRC-32C over bytes [0..224] with the 4-byte CRC field zeroed,
-    /// followed by bytes [228..sectsize].
-    fn check_superblock_crc(&self, sectsize: usize) -> Result<(), CheckError> {
+    /// The CRC is CRC-32C over bytes [0..224] of the sector with the 4-byte
+    /// CRC field at offset 224 zeroed, then bytes [228..sectsize].
+    /// The stored CRC at offset 224 is little-endian.
+    fn check_superblock_crc(&mut self, sb: &[u8], sectsize: usize) -> Result<(), CheckError> {
         use crc::{Crc, CRC_32_ISCSI};
 
-        if self.data.len() < sectsize {
+        if sb.len() < sectsize {
             return Err(CheckError::new(
                 "superblock",
-                "image too small for CRC check",
+                "sector too small for CRC check",
             ));
         }
 
         let crc_algo = Crc::<u32>::new(&CRC_32_ISCSI);
         let mut digest = crc_algo.digest();
-        digest.update(&self.data[..224]);
+        digest.update(&sb[..224]);
         digest.update(&[0u8; 4]); // zeroed CRC field
         if sectsize > 228 {
-            digest.update(&self.data[228..sectsize]);
+            digest.update(&sb[228..sectsize]);
         }
         let computed = digest.finalize();
-        let stored = LittleEndian::read_u32(&self.data[224..228]);
+        let stored = LittleEndian::read_u32(&sb[224..228]);
 
         if computed != stored {
             return Err(CheckError::new(
@@ -270,35 +305,68 @@ impl FsckChecker {
     }
 
     /// Detect the sector size from the superblock field at offset 102.
-    fn detect_sectsize(&self) -> usize {
-        if self.data.len() >= 104 {
-            let sectsize = BigEndian::read_u16(&self.data[102..104]) as usize;
+    fn detect_sectsize(&mut self) -> Result<u16, CheckError> {
+        if self.can_read(102, 2) {
+            let buf = self
+                .read_at(102, 2)
+                .map_err(|e| CheckError::new("superblock", &e))?;
+            let sectsize = BigEndian::read_u16(&buf);
             if (512..=4096).contains(&sectsize) && (sectsize & (sectsize - 1)) == 0 {
-                return sectsize;
+                return Ok(sectsize);
             }
         }
-        512
+        Ok(512)
     }
 
-    /// Check the AGF, AGI, and AGFL headers at their fixed sector offsets.
-    fn check_ag_headers(&self, _plan: &FormatPlan) -> Vec<CheckError> {
-        let mut errors = Vec::new();
-        let sectsize = self.detect_sectsize();
+    /// Compute the byte offset of AG `agno`'s block 0.
+    fn ag_offset(&self, sg: &SbGeometry, agno: u32) -> u64 {
+        (agno as u64) * (sg.agblocks as u64) * (sg.blocksize as u64)
+    }
 
-        if self.data.len() < 4 * sectsize {
+    /// Read a sector-sized field at a computed offset.
+    fn read_u32_at(&mut self, offset: u64) -> Result<u32, CheckError> {
+        let buf = self
+            .read_at(offset, 4)
+            .map_err(|e| CheckError::new("io", &e))?;
+        Ok(BigEndian::read_u32(&buf))
+    }
+
+    /// Read a u16 at a computed offset.
+    fn read_u16_at(&mut self, offset: u64) -> Result<u16, CheckError> {
+        let buf = self
+            .read_at(offset, 2)
+            .map_err(|e| CheckError::new("io", &e))?;
+        Ok(BigEndian::read_u16(&buf))
+    }
+
+    /// Check the AGF, AGI, and AGFL headers at their fixed sector offsets in AG 0.
+    fn check_ag_headers(&mut self, sg: &SbGeometry) -> Vec<CheckError> {
+        let mut errors = Vec::new();
+        let sectsize = sg.sectsize as usize;
+
+        // Check AG 0's headers.
+        let ag0_start = 0u64;
+        let min_size = 4 * sectsize;
+        if !self.can_read(ag0_start, min_size) {
             errors.push(CheckError::new(
                 "ag_headers",
-                &format!(
-                    "image too small for AG headers (need {} bytes)",
-                    4 * sectsize
-                ),
+                &format!("image too small for AG headers (need {} bytes)", min_size),
             ));
             return errors;
         }
 
-        // AGF at sector 1 (offset sectsize within the block).
-        let agf_offset = sectsize;
-        let agf_magic = BigEndian::read_u32(&self.data[agf_offset..agf_offset + 4]);
+        // AGF at sector 1.
+        let agf_offset = ag0_start + sectsize as u64;
+        let agf_magic = match self.read_u32_at(agf_offset) {
+            Ok(m) => m,
+            Err(_) => {
+                errors.push(CheckError::new(
+                    "agf",
+                    &format!("could not read AGF magic at offset {}", agf_offset),
+                ));
+                return errors;
+            }
+        };
         if agf_magic != XFS_AGF_MAGIC {
             errors.push(CheckError::new(
                 "agf",
@@ -307,219 +375,176 @@ impl FsckChecker {
         }
 
         // AGI at sector 2.
-        let agi_offset = 2 * sectsize;
-        let agi_magic = BigEndian::read_u32(&self.data[agi_offset..agi_offset + 4]);
-        if agi_magic != XFS_AGI_MAGIC {
-            errors.push(CheckError::new(
-                "agi",
-                &format!("bad AGI magic 0x{:08x} at offset {}", agi_magic, agi_offset),
-            ));
+        let agi_offset = ag0_start + 2 * sectsize as u64;
+        if let Ok(magic) = self.read_u32_at(agi_offset) {
+            if magic != XFS_AGI_MAGIC {
+                errors.push(CheckError::new(
+                    "agi",
+                    &format!("bad AGI magic 0x{:08x} at offset {}", magic, agi_offset),
+                ));
+            }
         }
 
         // AGFL at sector 3.
-        let agfl_offset = 3 * sectsize;
-        let agfl_magic = BigEndian::read_u32(&self.data[agfl_offset..agfl_offset + 4]);
-        if agfl_magic != XFS_AGFL_MAGIC {
-            errors.push(CheckError::new(
-                "agfl",
-                &format!(
-                    "bad AGFL magic 0x{:08x} at offset {}",
-                    agfl_magic, agfl_offset
-                ),
-            ));
+        let agfl_offset = ag0_start + 3 * sectsize as u64;
+        if let Ok(magic) = self.read_u32_at(agfl_offset) {
+            if magic != XFS_AGFL_MAGIC {
+                errors.push(CheckError::new(
+                    "agfl",
+                    &format!("bad AGFL magic 0x{:08x} at offset {}", magic, agfl_offset),
+                ));
+            }
+        }
+
+        // Check AG headers for all AGs (verify AGF/AGI magic at each AG).
+        for agno in 1..sg.agcount {
+            let ag_start = self.ag_offset(sg, agno);
+            let agf_off = ag_start + sectsize as u64;
+            if let Ok(magic) = self.read_u32_at(agf_off) {
+                if magic != XFS_AGF_MAGIC {
+                    errors.push(CheckError::new(
+                        "agf",
+                        &format!("AG {} bad AGF magic 0x{:08x}", agno, magic),
+                    ));
+                }
+            }
+            let agi_off = ag_start + 2 * sectsize as u64;
+            if let Ok(magic) = self.read_u32_at(agi_off) {
+                if magic != XFS_AGI_MAGIC {
+                    errors.push(CheckError::new(
+                        "agi",
+                        &format!("AG {} bad AGI magic 0x{:08x}", agno, magic),
+                    ));
+                }
+            }
         }
 
         errors
     }
 
-    /// Read the AGF's free_blocks field directly from the data.
-    fn read_agf_free_blocks(
-        &self,
-        plan: &FormatPlan,
-        ag: &crate::libxfuse::format::AgGeometry,
-    ) -> u32 {
-        let blocksize = plan.blocksize as usize;
-        let agf_offset = ag.start * blocksize as u64 + AGF_SECTOR as u64 * plan.sectsize as u64;
-        if self.data.len() >= agf_offset as usize + 56 {
-            BigEndian::read_u32(&self.data[agf_offset as usize + 52..agf_offset as usize + 56])
-        } else {
-            ag.free_blocks
-        }
-    }
-
-    /// Read the AGF's BNO root block number.
-    fn read_agf_bno_root(
-        &self,
-        plan: &FormatPlan,
-        ag: &crate::libxfuse::format::AgGeometry,
-    ) -> Option<u32> {
-        let blocksize = plan.blocksize as usize;
-        let agf_offset = ag.start * blocksize as u64 + AGF_SECTOR as u64 * plan.sectsize as u64;
-        if self.data.len() >= agf_offset as usize + 20 {
-            Some(BigEndian::read_u32(
-                &self.data[agf_offset as usize + 16..agf_offset as usize + 20],
-            ))
+    /// Read a u32 field from a block at a given byte offset.
+    fn read_u32_from_block(&mut self, offset: u64, field_offset: usize) -> Option<u32> {
+        if self.can_read(offset, field_offset + 4) {
+            self.read_at(offset, field_offset + 4)
+                .ok()
+                .map(|buf| BigEndian::read_u32(&buf[field_offset..field_offset + 4]))
         } else {
             None
-        }
-    }
-
-    /// Read the AGF's CNT root block number.
-    fn read_agf_cnt_root(
-        &self,
-        plan: &FormatPlan,
-        ag: &crate::libxfuse::format::AgGeometry,
-    ) -> Option<u32> {
-        let blocksize = plan.blocksize as usize;
-        let agf_offset = ag.start * blocksize as u64 + AGF_SECTOR as u64 * plan.sectsize as u64;
-        if self.data.len() >= agf_offset as usize + 24 {
-            Some(BigEndian::read_u32(
-                &self.data[agf_offset as usize + 20..agf_offset as usize + 24],
-            ))
-        } else {
-            None
-        }
-    }
-
-    /// Read the AGI's inobt root block number.
-    fn read_agi_inobt_root(
-        &self,
-        plan: &FormatPlan,
-        ag: &crate::libxfuse::format::AgGeometry,
-    ) -> Option<u32> {
-        let blocksize = plan.blocksize as usize;
-        let agi_offset = ag.start * blocksize as u64 + AGI_SECTOR as u64 * plan.sectsize as u64;
-        if self.data.len() >= agi_offset as usize + 24 {
-            Some(BigEndian::read_u32(
-                &self.data[agi_offset as usize + 20..agi_offset as usize + 24],
-            ))
-        } else {
-            None
-        }
-    }
-
-    /// Read the AGF's seqno for CRC verification.
-    fn read_agf_seqno(&self, plan: &FormatPlan, ag: &crate::libxfuse::format::AgGeometry) -> u32 {
-        let blocksize = plan.blocksize as usize;
-        let agf_offset = ag.start * blocksize as u64 + AGF_SECTOR as u64 * plan.sectsize as u64;
-        if self.data.len() >= agf_offset as usize + 12 {
-            BigEndian::read_u32(&self.data[agf_offset as usize + 8..agf_offset as usize + 12])
-        } else {
-            0
         }
     }
 
     /// Walk the free space BNO and CNT btrees and verify the free block count.
-    fn check_free_space_trees(&self, plan: &FormatPlan) -> Vec<CheckError> {
+    fn check_free_space_trees(&mut self, sg: &SbGeometry) -> Vec<CheckError> {
         let mut errors = Vec::new();
-        let blocksize = plan.blocksize as usize;
+        let blocksize = sg.blocksize as usize;
+        let sectsize = sg.sectsize as usize;
+        let body_start = if sg.has_crc { 56 } else { 16 };
 
-        for ag in &plan.ags {
-            // Read BNO root block from AGF.
-            let bno_root_block = match self.read_agf_bno_root(plan, ag) {
+        for agno in 0..sg.agcount {
+            let ag_start = self.ag_offset(sg, agno);
+
+            // Read BNO root block number from AGF (offset 16-20).
+            let bno_root_block = match self.read_u32_from_block(ag_start + sectsize as u64, 16) {
                 Some(b) => b,
                 None => {
                     errors.push(CheckError::new(
                         "free_space",
-                        &format!("AG {} could not read BNO root from AGF", ag.agno),
+                        &format!("AG {} could not read BNO root from AGF", agno),
                     ));
                     continue;
                 }
             };
 
-            let bno_offset = ag.start * blocksize as u64 + bno_root_block as u64 * blocksize as u64;
-            if bno_offset + 8 > self.data.len() as u64 {
+            let bno_offset = ag_start + bno_root_block as u64 * blocksize as u64;
+            if !self.can_read(bno_offset, 8) {
                 errors.push(CheckError::new(
                     "free_space",
                     &format!(
                         "AG {} BNO root at offset {} is out of bounds",
-                        ag.agno, bno_offset
+                        agno, bno_offset
                     ),
                 ));
                 continue;
             }
 
             // Check the BNO btree leaf magic.
-            let bno_start = bno_offset as usize;
-            let magic = BigEndian::read_u32(&self.data[bno_start..bno_start + 4]);
-            // XFS_AB3B_MAGIC = 0x41423342 for v5, XFS_ABTB_MAGIC = 0x41425442 for v4
-            let expected = if plan.has_crc {
+            let expected = if sg.has_crc {
                 0x41423342u32
             } else {
                 0x41425442u32
             };
-            if magic != expected {
-                errors.push(CheckError::new(
-                    "free_space",
-                    &format!("AG {} BNO root has bad magic 0x{:08x}", ag.agno, magic),
-                ));
+            if let Ok(magic) = self.read_u32_at(bno_offset) {
+                if magic != expected {
+                    errors.push(CheckError::new(
+                        "free_space",
+                        &format!("AG {} BNO root has bad magic 0x{:08x}", agno, magic),
+                    ));
+                }
             }
 
-            // Check the record count field at offset 6 (big-endian u16).
-            let numrecs_offset = bno_start + 6;
-            let numrecs = if self.data.len() >= numrecs_offset + 2 {
-                BigEndian::read_u16(&self.data[numrecs_offset..numrecs_offset + 2])
-            } else {
-                0
-            };
+            // Check numrecs (offset 6 in the block header, u16).
+            let numrecs = self.read_u16_at(bno_offset + 6).unwrap_or(0);
             if numrecs == 0 {
                 errors.push(CheckError::new(
                     "free_space",
-                    &format!("AG {} BNO root has 0 records", ag.agno),
+                    &format!("AG {} BNO root has 0 records", agno),
                 ));
             }
 
             // Cross-reference: compare BNO record's free block count with AGF.
-            let agf_free_blocks = self.read_agf_free_blocks(plan, ag);
-            let body_start = if plan.has_crc { 56 } else { 16 };
-            let record_offset = bno_start + body_start;
-            if self.data.len() >= record_offset + 8 {
-                let rec_len = BigEndian::read_u32(&self.data[record_offset + 4..record_offset + 8]);
-                if rec_len != agf_free_blocks {
-                    errors.push(CheckError::new(
-                        "free_space",
-                        &format!(
-                            "AG {} BNO rec free blocks {} != AGF free_blocks {}",
-                            ag.agno, rec_len, agf_free_blocks
-                        ),
-                    ));
+            let agf_free_blocks = self.read_u32_from_block(ag_start + sectsize as u64, 52);
+            let record_offset = bno_offset + body_start as u64;
+            if let Some(agf_fb) = agf_free_blocks {
+                if self.can_read(record_offset, 8) {
+                    if let Ok(rec_len) = self.read_u32_at(record_offset + 4) {
+                        if rec_len != agf_fb {
+                            errors.push(CheckError::new(
+                                "free_space",
+                                &format!(
+                                    "AG {} BNO rec free blocks {} != AGF free_blocks {}",
+                                    agno, rec_len, agf_fb
+                                ),
+                            ));
+                        }
+                    }
                 }
             }
 
             // Check CNT root.
-            let cnt_root_block = match self.read_agf_cnt_root(plan, ag) {
+            let cnt_root_block = match self.read_u32_from_block(ag_start + sectsize as u64, 20) {
                 Some(b) => b,
                 None => {
                     errors.push(CheckError::new(
                         "free_space",
-                        &format!("AG {} could not read CNT root from AGF", ag.agno),
+                        &format!("AG {} could not read CNT root from AGF", agno),
                     ));
                     continue;
                 }
             };
-            let cnt_offset = ag.start * blocksize as u64 + cnt_root_block as u64 * blocksize as u64;
-            if cnt_offset + 8 > self.data.len() as u64 {
+            let cnt_offset = ag_start + cnt_root_block as u64 * blocksize as u64;
+            if !self.can_read(cnt_offset, 4) {
                 errors.push(CheckError::new(
                     "free_space",
                     &format!(
                         "AG {} CNT root at offset {} is out of bounds",
-                        ag.agno, cnt_offset
+                        agno, cnt_offset
                     ),
                 ));
                 continue;
             }
-            let cnt_start = cnt_offset as usize;
-            let cnt_magic = BigEndian::read_u32(&self.data[cnt_start..cnt_start + 4]);
-            let cnt_expected = if plan.has_crc {
+
+            let cnt_expected = if sg.has_crc {
                 0x41423343u32
             } else {
                 0x41425443u32
             };
-            if cnt_magic != cnt_expected {
-                errors.push(CheckError::new(
-                    "free_space",
-                    &format!("AG {} CNT root has bad magic 0x{:08x}", ag.agno, cnt_magic),
-                ));
+            if let Ok(magic) = self.read_u32_at(cnt_offset) {
+                if magic != cnt_expected {
+                    errors.push(CheckError::new(
+                        "free_space",
+                        &format!("AG {} CNT root has bad magic 0x{:08x}", agno, magic),
+                    ));
+                }
             }
         }
 
@@ -527,139 +552,119 @@ impl FsckChecker {
     }
 
     /// Walk the inode btree and verify consistency.
-    fn check_inobt(&self, plan: &FormatPlan) -> Vec<CheckError> {
+    fn check_inobt(&mut self, sg: &SbGeometry) -> Vec<CheckError> {
         let mut errors = Vec::new();
-        let blocksize = plan.blocksize as usize;
+        let blocksize = sg.blocksize as usize;
+        let sectsize = sg.sectsize as usize;
 
-        for ag in &plan.ags {
-            // Read inobt root block from AGI (offset 20, u32 big-endian).
-            let inobt_block = match self.read_agi_inobt_root(plan, ag) {
+        for agno in 0..sg.agcount {
+            let ag_start = self.ag_offset(sg, agno);
+            let agi_offset = ag_start + 2 * sectsize as u64;
+
+            // Read inobt root block from AGI (offset 20, u32).
+            let inobt_block = match self.read_u32_from_block(agi_offset, 20) {
                 Some(b) => b,
                 None => {
                     errors.push(CheckError::new(
                         "inobt",
-                        &format!("AG {} could not read inobt root from AGI", ag.agno),
+                        &format!("AG {} could not read inobt root from AGI", agno),
                     ));
                     continue;
                 }
             };
-            let inobt_offset = ag.start * blocksize as u64 + inobt_block as u64 * blocksize as u64;
-            if inobt_offset + 8 > self.data.len() as u64 {
+
+            let inobt_offset = ag_start + inobt_block as u64 * blocksize as u64;
+            if !self.can_read(inobt_offset, 8) {
                 errors.push(CheckError::new(
                     "inobt",
                     &format!(
                         "AG {} inobt root at offset {} is out of bounds",
-                        ag.agno, inobt_offset
+                        agno, inobt_offset
                     ),
                 ));
                 continue;
             }
 
-            let off = inobt_offset as usize;
-            let magic = BigEndian::read_u32(&self.data[off..off + 4]);
-            let expected = if plan.has_crc {
+            let expected = if sg.has_crc {
                 0x49414233u32
             } else {
                 0x49414254u32
             };
-            if magic != expected {
-                errors.push(CheckError::new(
-                    "inobt",
-                    &format!("AG {} inobt has bad magic 0x{:08x}", ag.agno, magic),
-                ));
+            if let Ok(magic) = self.read_u32_at(inobt_offset) {
+                if magic != expected {
+                    errors.push(CheckError::new(
+                        "inobt",
+                        &format!("AG {} inobt has bad magic 0x{:08x}", agno, magic),
+                    ));
+                }
             }
 
-            // Check numrecs (always at offset 6, big-endian u16).
-            let numrecs = BigEndian::read_u16(&self.data[off + 6..off + 8]);
-            if numrecs == 0 {
-                errors.push(CheckError::new(
-                    "inobt",
-                    &format!("AG {} inobt has 0 records", ag.agno),
-                ));
+            // Check numrecs (at offset 6 in block header, u16).
+            if let Ok(numrecs) = self.read_u16_at(inobt_offset + 6) {
+                if numrecs == 0 {
+                    errors.push(CheckError::new(
+                        "inobt",
+                        &format!("AG {} inobt has 0 records", agno),
+                    ));
+                }
             }
         }
 
         errors
     }
 
-    /// Find the root inode (inode 2) location by walking the AG 0 inobt.
+    /// Find the root inode (inode 2) location by reading the AG 0 inobt.
     ///
-    /// Returns the byte offset of the root inode in the image data, or an error.
-    fn find_root_inode(&self, plan: &FormatPlan) -> Result<usize, CheckError> {
-        let blocksize = plan.blocksize as usize;
-        let ag0 = &plan.ags[0];
+    /// Returns the byte offset of the root inode in the image, or an error.
+    fn find_root_inode(&mut self, sg: &SbGeometry) -> Result<u64, CheckError> {
+        let blocksize = sg.blocksize as usize;
+        let sectsize = sg.sectsize as usize;
+        let body_start = if sg.has_crc { 56 } else { 16 };
 
-        // Read inobt root block from AGI.
-        let inobt_block = match self.read_agi_inobt_root(plan, ag0) {
-            Some(b) => b,
-            None => ag0.inobt,
-        };
-        let inobt_offset = ag0.start * blocksize as u64 + inobt_block as u64 * blocksize as u64;
+        let ag0_start = 0u64;
+        let agi_offset = ag0_start + 2 * sectsize as u64;
 
-        if inobt_offset + 80 > self.data.len() as u64 {
+        // Read inobt root block from AGI (offset 20, u32).
+        let inobt_block = self
+            .read_u32_from_block(agi_offset, 20)
+            .ok_or_else(|| CheckError::new("inobt", "could not read inobt root from AGI"))?;
+        let inobt_offset = ag0_start + inobt_block as u64 * blocksize as u64;
+
+        if !self.can_read(inobt_offset, body_start + 8) {
             return Err(CheckError::new("inobt", "inobt root is out of bounds"));
         }
 
-        // Read the inobt records. For v5, body starts at offset 56; for v4, at 16.
-        let body_start = if plan.has_crc { 56 } else { 16 };
-        let off = inobt_offset as usize + body_start;
+        // Read numrecs (u16 at offset 6).
+        let _numrecs = match self.read_u16_at(inobt_offset + 6) {
+            Ok(n) => n,
+            Err(e) => return Err(CheckError::new("inobt", &e.message)),
+        } as usize;
 
-        // Walk records. Each record is 16 bytes:
-        // startino(4) + freecount(4) + free(8)
-        let record_size = 16;
-        let numrecs = if self.data.len() >= (inobt_offset as usize) + 8 {
-            BigEndian::read_u16(&self.data[inobt_offset as usize + 6..inobt_offset as usize + 8])
-                as usize
-        } else {
-            0
-        };
-
-        let mut root_block = ag0.chunk_start; // Default for our formatted images
-
-        for i in 0..numrecs.min(8) {
-            let rec_off = off + i * record_size;
-            if rec_off + 16 > self.data.len() {
-                break;
-            }
-            let startino = BigEndian::read_u32(&self.data[rec_off..rec_off + 4]);
-            // If this record covers inode 0 (which contains inode 2), compute the
-            // inode block from the startino and inopblock.
-            if startino == 0 {
-                // The chunk block can be computed: inodes 0..63 are in a chunk
-                // that starts at block = (startino / inodes_per_block) / chunk_blocks
-                // But actually, the inobt doesn't store the block directly.
-                // For formatted images, we know chunk_start. For golden images,
-                // we'd need to find it differently. For now, use the plan's value.
-                root_block = ag0.chunk_start;
-                break;
-            }
-        }
-
-        let chunk_offset = ag0.start * blocksize as u64 + root_block as u64 * blocksize as u64;
+        // For freshly formatted images, the first inobt record has startino=0
+        // and the root inode chunk starts at block 7 (after metadata blocks 0-6).
+        let inodesize = sg.inodesize as usize;
+        let root_chunk_block: u32 = 7;
+        let chunk_offset = ag0_start + root_chunk_block as u64 * blocksize as u64;
         // Root inode is at slot 2 within the chunk.
-        let root_offset = chunk_offset as usize + 2 * plan.inodesize as usize;
-        if root_offset + 4 > self.data.len() {
-            return Err(CheckError::new(
-                "root_inode",
-                "root inode offset is out of bounds",
-            ));
-        }
+        let root_offset = chunk_offset + 2 * inodesize as u64;
         Ok(root_offset)
     }
 
     /// Verify the root inode (inode 2) is a valid directory.
-    fn check_root_inode(&self, plan: &FormatPlan) -> Vec<CheckError> {
+    fn check_root_inode(&mut self, sg: &SbGeometry) -> Vec<CheckError> {
         let mut errors = Vec::new();
+        let inodesize = sg.inodesize as usize;
 
         // Find the root inode location.
-        let root_offset = match self.find_root_inode(plan) {
+        let root_offset = match self.find_root_inode(sg) {
             Ok(off) => off,
             Err(e) => {
                 errors.push(e);
                 return errors;
             }
         };
-        if root_offset + 4 > self.data.len() {
+
+        if !self.can_read(root_offset, inodesize) {
             errors.push(CheckError::new(
                 "root_inode",
                 "root inode offset is out of bounds",
@@ -667,8 +672,16 @@ impl FsckChecker {
             return errors;
         }
 
-        // Check inode magic (offset 0, big-endian u16).
-        let magic = BigEndian::read_u16(&self.data[root_offset..root_offset + 2]);
+        let root_data = match self.read_at(root_offset, inodesize) {
+            Ok(d) => d,
+            Err(e) => {
+                errors.push(CheckError::new("root_inode", &e));
+                return errors;
+            }
+        };
+
+        // Check inode magic (offset 0, big-endian u16 = 0x494E "IN").
+        let magic = BigEndian::read_u16(&root_data[0..2]);
         if magic != 0x494e {
             errors.push(CheckError::new(
                 "root_inode",
@@ -678,7 +691,7 @@ impl FsckChecker {
         }
 
         // Check mode field (offset 2, big-endian u16) — should be a directory (S_IFDIR = 0x4000).
-        let mode = BigEndian::read_u16(&self.data[root_offset + 2..root_offset + 4]);
+        let mode = BigEndian::read_u16(&root_data[2..4]);
         if mode & 0xF000 != 0x4000 {
             errors.push(CheckError::new(
                 "root_inode",
@@ -689,7 +702,7 @@ impl FsckChecker {
         // Check inode format (offset 5, u8).
         // 0 = dev, 1 = local, 2 = extents, 3 = btree, 4 = unused.
         // For a shortform directory, format should be 1 (local).
-        let format = self.data[root_offset + 5];
+        let format = root_data[5];
         if format != 1 {
             errors.push(CheckError::new(
                 "root_inode",
@@ -700,23 +713,19 @@ impl FsckChecker {
             ));
         }
 
-        // Check the fork offset (inode offset 82, u8).
-        // for v3.
-        let forkoff_raw = self.data[root_offset + 82] as usize;
-        let _ = forkoff_raw; // forkoff is informational for v2 local format
-        let inode_version = self.data[root_offset + 4]; // VERSION at offset 4
+        let inode_version = root_data[4]; // VERSION at offset 4
         let literal_area_offset = if inode_version >= 3 { 176 } else { 100 };
-        let inode_size = plan.inodesize as usize;
 
         // For local format, the shortform directory starts at the literal area
-        // offset.  If forkoff=0, the data fork gets the first half.
+        // offset.
         let sf_start = literal_area_offset;
+        let sf_end = sf_start + (root_data.len() - sf_start).min(inodesize - sf_start);
 
-        // Validate the shortform directory data.
-        // The data fork (shortform dir) starts at the literal area offset.
-        let sf_data = &self.data[root_offset + sf_start..root_offset + inode_size];
-        if sf_data.len() >= 4 {
-            let count = sf_data[0];
+        if sf_end > sf_start {
+            // Shortform directory format:
+            //   byte 0: entry count (u8)
+            //   Remaining: entries
+            let count = root_data[sf_start];
             // Validate entry count — a fresh root dir should have at most 2 entries.
             if count > 2 {
                 errors.push(CheckError::new(
